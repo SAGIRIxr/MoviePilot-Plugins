@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -199,18 +199,22 @@ class NodeSeekSignin(_PluginBase):
         return last_resp, (candidates[-1] if candidates else self._impersonate), last_err
 
     # ---------------- 登录逻辑 ----------------
-    def __session_login(self, user: str, password: str) -> Optional[str]:
-        """使用账密 + 验证码服务登录，返回新的 Cookie 字符串。"""
+    def __session_login(self, user: str, password: str) -> Tuple[Optional[str], str]:
+        """使用账密 + 验证码服务登录，返回 (新 Cookie, 失败原因)。成功时原因为空字符串。"""
         from curl_cffi import requests as cffi_requests
+        if not self._client_key:
+            return None, "未配置验证码密钥（CLIENTT_KEY）；账密登录必须配验证码服务"
         try:
             if self._solver_type.lower() == "yescaptcha":
-                logger.info("正在使用 YesCaptcha 解决验证码...")
+                logger.info(f"正在使用 YesCaptcha 解决验证码（节点：{self._api_base_url or 'https://api.yescaptcha.com'}）...")
                 solver = YesCaptchaSolver(
                     api_base_url=self._api_base_url or "https://api.yescaptcha.com",
                     client_key=self._client_key,
                 )
             else:
                 logger.info("正在使用 TurnstileSolver 解决验证码...")
+                if not self._api_base_url:
+                    return None, "验证码服务选择了 turnstile 但未填 API_BASE_URL（需自建 CloudFreed）；有 YesCaptcha 密钥请把服务改为 yescaptcha"
                 solver = TurnstileSolver(
                     api_base_url=self._api_base_url,
                     client_key=self._client_key,
@@ -218,13 +222,13 @@ class NodeSeekSignin(_PluginBase):
             token = solver.solve(url=SIGNIN_PAGE, sitekey=SITEKEY, verbose=True)
             if not token:
                 logger.error("验证码解析失败")
-                return None
+                return None, "验证码解析失败（检查服务类型/密钥/余额/节点）"
         except (TurnstileSolverError, YesCaptchaSolverError) as e:
-            logger.error(f"验证码错误: {e}")
-            return None
+            logger.error(f"验证码服务错误: {e}")
+            return None, f"验证码服务错误：{e}"
         except Exception as e:
-            logger.error(f"验证码错误: {e}")
-            return None
+            logger.error(f"验证码服务异常: {e}")
+            return None, f"验证码服务异常：{e}"
 
         proxies = self.__get_proxies()
         initial_impersonate = self._impersonate or "chrome110"
@@ -254,15 +258,19 @@ class NodeSeekSignin(_PluginBase):
         }
         try:
             response = session.post(SIGNIN_API, json=data, headers=headers, proxies=proxies)
-            resp_json = response.json()
+            try:
+                resp_json = response.json()
+            except Exception:
+                snippet = (response.text or "")[:120]
+                return None, f"登录接口返回非 JSON（HTTP {response.status_code}），可能被 Cloudflare 拦截：{snippet}"
             if resp_json.get("success"):
                 cookies = session.cookies.get_dict()
-                return '; '.join([f"{k}={v}" for k, v in cookies.items()])
+                return '; '.join([f"{k}={v}" for k, v in cookies.items()]), ""
             logger.error(f"登录失败: {resp_json.get('message')}")
-            return None
+            return None, f"登录接口拒绝：{resp_json.get('message')}"
         except Exception as e:
             logger.error(f"登录异常: {e}")
-            return None
+            return None, f"登录请求异常：{e}"
 
     # ---------------- 签到逻辑 ----------------
     def __sign(self, ns_cookie: str) -> Tuple[str, str]:
@@ -453,7 +461,7 @@ class NodeSeekSignin(_PluginBase):
                 logger.info(f"账号 {display_user} 签到成功: {msg}")
             elif user and password:
                 logger.info(f"账号 {display_user} Cookie 签到失败({msg})，尝试重新登录...")
-                new_cookie = self.__session_login(user, password)
+                new_cookie, login_reason = self.__session_login(user, password)
                 if new_cookie:
                     logger.info("登录成功，使用新Cookie重新签到...")
                     result, msg = self.__sign(new_cookie)
@@ -465,8 +473,8 @@ class NodeSeekSignin(_PluginBase):
                     else:
                         logger.error(f"账号 {display_user} 重新签到仍然失败: {msg}")
                 else:
-                    logger.error(f"账号 {display_user} 登录失败，无法获取新Cookie")
-                    result, msg = "loginfail", "登录失败，无法获取新Cookie"
+                    logger.error(f"账号 {display_user} 登录失败：{login_reason}")
+                    result, msg = "loginfail", f"登录失败：{login_reason}"
             else:
                 logger.error(f"账号 {display_user} 签到失败且未配置账密: {msg}")
 

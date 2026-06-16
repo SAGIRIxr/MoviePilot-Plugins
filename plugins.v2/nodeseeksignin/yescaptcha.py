@@ -130,15 +130,18 @@ class YesCaptchaSolver:
                     print(f"成功创建任务，ID: {task_id}")
                 return task_id
             else:
+                error_code = result.get('errorCode', '')
                 error_desc = result.get('errorDescription', '未知错误')
                 if verbose:
-                    print(f"创建任务失败: {error_desc}")
-                return None
-                
+                    print(f"创建任务失败: {error_code} {error_desc}")
+                raise YesCaptchaSolverError(f"创建任务失败: {error_code} {error_desc}")
+
+        except YesCaptchaSolverError:
+            raise
         except Exception as e:
             if verbose:
                 print(f"创建任务过程中发生异常: {e}")
-            return None
+            raise YesCaptchaSolverError(f"创建任务请求异常: {e}")
     
     def _get_task_result(self, task_id: str, verbose: bool = False) -> Optional[str]:
         """获取任务结果"""
