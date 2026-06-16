@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -263,10 +263,16 @@ class NodeSeekSignin(_PluginBase):
             except Exception:
                 snippet = (response.text or "")[:120]
                 return None, f"登录接口返回非 JSON（HTTP {response.status_code}），可能被 Cloudflare 拦截：{snippet}"
+            logger.info(f"登录响应：HTTP {response.status_code}，success={resp_json.get('success')}，message={resp_json.get('message')}")
             if resp_json.get("success"):
                 cookies = session.cookies.get_dict()
-                return '; '.join([f"{k}={v}" for k, v in cookies.items()]), ""
-            logger.error(f"登录失败: {resp_json.get('message')}")
+                cookie_string = '; '.join([f"{k}={v}" for k, v in cookies.items()])
+                if not cookie_string:
+                    set_cookie = response.headers.get('Set-Cookie', '') or response.headers.get('set-cookie', '')
+                    logger.warning(f"登录成功但未从会话取得 Cookie；Set-Cookie：{str(set_cookie)[:300]}")
+                    return None, "登录返回成功但未取到 Cookie（响应未写入会话 Cookie，详见日志 Set-Cookie）"
+                logger.info(f"登录成功，获取到 Cookie 字段：{list(cookies.keys())}")
+                return cookie_string, ""
             return None, f"登录接口拒绝：{resp_json.get('message')}"
         except Exception as e:
             logger.error(f"登录异常: {e}")
