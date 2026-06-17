@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1268,10 +1268,13 @@ class NodeSeekSignin(_PluginBase):
                             {'component': 'VCardText', 'content': [
                                 {'component': 'VAlert', 'props': {
                                     'type': 'success', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': '【自动维护 Cookie】填好「账号密码」即可：Cookie 失效时，插件用真实浏览器先注入旧 Cookie 预热（让 NodeSeek 认作可信会话，绕开机房 IP 的邮箱验证），再用账密登录刷新出新 Cookie 自动写回。需 MP 已准备浏览器仿真环境并填写验证码服务密钥；若账密登录仍被要求邮箱验证，会自动回退到下方「邮箱验证码登录」。'}},
+                                    'text': '【Cookie 优先】插件优先用 Cookie 签到，Cookie 有效就一直用、不会重新登录；仅当 Cookie 失效时，才用「账号密码」自动登录刷新出新 Cookie 并写回。需 MP 已准备浏览器仿真环境并填写验证码服务密钥。'}},
+                                {'component': 'VAlert', 'props': {
+                                    'type': 'warning', 'variant': 'tonal', 'class': 'mb-2',
+                                    'text': '【首次必填 Cookie】NodeSeek 对机房 IP 有风控，没有可信会话历史时，账密/邮箱登录会被要求邮箱验证码。请首次务必填入一份有效 Cookie（浏览器登录 nodeseek.com 后复制整段）跑通，让本机 IP 成为可信会话，之后账密登录刷新即可绕开邮箱验证。'}},
                                 {'component': 'VAlert', 'props': {
                                     'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': 'Gmail 的 IMAP 授权码：开启两步验证后在「应用专用密码」生成 16 位密码填入；其它邮箱填对应 IMAP 授权码并改 IMAP 服务器地址。'}},
+                                    'text': 'Gmail 的 IMAP 授权码：开启两步验证后在「应用专用密码」生成 16 位密码填入；其它邮箱填对应 IMAP 授权码并改 IMAP 服务器地址。账密登录始终被邮箱验证拦住时，可配置邮箱验证码登录作为兜底。'}},
                                 {'component': 'VAlert', 'props': {
                                     'type': 'warning', 'variant': 'tonal',
                                     'text': '也可只填 Cookie 手动签到（浏览器登录 nodeseek.com 后复制整段 Cookie，多账号用 & 或换行分隔）。验证码服务：YesCaptcha 填 CLIENTT_KEY 即可；TurnstileSolver 需自建 CloudFreed 并填 API_BASE_URL。'}},
