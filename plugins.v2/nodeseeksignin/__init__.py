@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -199,6 +199,31 @@ class NodeSeekSignin(_PluginBase):
         return last_resp, (candidates[-1] if candidates else self._impersonate), last_err
 
     # ---------------- 登录逻辑 ----------------
+    @staticmethod
+    def __extract_cookies(session, response) -> dict:
+        """尽可能从 curl_cffi 的会话/响应中提取 cookie（兼容不同取法）。"""
+        cookies = {}
+        for obj in (session, response):
+            try:
+                d = obj.cookies.get_dict()
+                if d:
+                    cookies.update(d)
+            except Exception:
+                pass
+        # 遍历底层 cookiejar 兜底
+        try:
+            for c in session.cookies.jar:
+                if getattr(c, "name", None):
+                    cookies.setdefault(c.name, c.value)
+        except Exception:
+            pass
+        try:
+            jar_names = [getattr(c, "name", "?") for c in session.cookies.jar]
+            logger.info(f"会话 cookie jar：{jar_names}")
+        except Exception as e:
+            logger.info(f"读取 cookie jar 失败：{e}；session.cookies={str(session.cookies)[:200]}")
+        return cookies
+
     def __session_login(self, user: str, password: str) -> Tuple[Optional[str], str]:
         """使用账密 + 验证码服务登录，返回 (新 Cookie, 失败原因)。成功时原因为空字符串。"""
         from curl_cffi import requests as cffi_requests
@@ -265,12 +290,12 @@ class NodeSeekSignin(_PluginBase):
                 return None, f"登录接口返回非 JSON（HTTP {response.status_code}），可能被 Cloudflare 拦截：{snippet}"
             logger.info(f"登录响应：HTTP {response.status_code}，success={resp_json.get('success')}，message={resp_json.get('message')}")
             if resp_json.get("success"):
-                cookies = session.cookies.get_dict()
+                cookies = self.__extract_cookies(session, response)
                 cookie_string = '; '.join([f"{k}={v}" for k, v in cookies.items()])
                 if not cookie_string:
                     set_cookie = response.headers.get('Set-Cookie', '') or response.headers.get('set-cookie', '')
-                    logger.warning(f"登录成功但未从会话取得 Cookie；Set-Cookie：{str(set_cookie)[:300]}")
-                    return None, "登录返回成功但未取到 Cookie（响应未写入会话 Cookie，详见日志 Set-Cookie）"
+                    logger.warning(f"登录成功但仍未取到 Cookie；Set-Cookie={str(set_cookie)[:300]}")
+                    return None, "登录返回成功但未取到 Cookie（curl_cffi 未捕获会话 Cookie，建议改用浏览器仿真）"
                 logger.info(f"登录成功，获取到 Cookie 字段：{list(cookies.keys())}")
                 return cookie_string, ""
             return None, f"登录接口拒绝：{resp_json.get('message')}"
