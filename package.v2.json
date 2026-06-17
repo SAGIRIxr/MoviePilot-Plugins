@@ -1,6 +1,6 @@
 {
   "NodeSeekSignin": {
-    "version": "1.0.9",
+    "version": "1.1.0",
     "level": 2,
     "name": "NodeSeek签到",
     "icon": "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png",
@@ -8,6 +8,7 @@
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v1.1.0": "新增「邮箱验证码登录」实现全自动维护 Cookie：真实浏览器发码 → IMAP 自动读取邮箱验证码 → 完成登录并签到，绕开机房 IP 风控；精简配置页（去掉指纹/历史天数/回写/浏览器登录等冗余项，新增 IMAP 设置卡片）。",
       "v1.0.9": "查明 MP 机房 IP 下账密登录被 NodeSeek 风控重定向到邮箱验证（emailSignIn）而拿不到会话；新增风控识别与明确提示，并在登录真正成功（如走干净IP代理）时取出 session Cookie 回写复用。Cookie 签到不受影响、推荐使用。",
       "v1.0.8": "登录后增加完整诊断：打印登录响应体、document.cookie 与浏览器 cookie 仓库，定位 session 鉴权 Cookie 是否下发。",
       "v1.0.7": "修复登录拿不到 x-security-token：与前端一致，登录请求头也带上 x-integrity-token；新增登录响应头清单诊断。",

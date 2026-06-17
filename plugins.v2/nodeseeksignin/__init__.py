@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.9"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -73,6 +73,11 @@ class NodeSeekSignin(_PluginBase):
     _auto_save_cookie = True
     # 账密登录时是否优先使用 MoviePilot 内置 CloakBrowser 真实浏览器（curl_cffi 在 MP 环境取不到登录 Cookie）
     _use_browser_login = True
+    # IMAP 邮箱（用于自动读取 NodeSeek 邮箱验证码完成登录，绕开机房 IP 风控）
+    _imap_email = ""
+    _imap_password = ""
+    _imap_server = "imap.gmail.com"
+    _imap_port = 993
 
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
@@ -115,6 +120,10 @@ class NodeSeekSignin(_PluginBase):
             self._use_proxy = config.get("use_proxy") or False
             self._auto_save_cookie = config.get("auto_save_cookie") if config.get("auto_save_cookie") is not None else True
             self._use_browser_login = config.get("use_browser_login") if config.get("use_browser_login") is not None else True
+            self._imap_email = (config.get("imap_email") or "").strip()
+            self._imap_password = (config.get("imap_password") or "").strip()
+            self._imap_server = (config.get("imap_server") or "imap.gmail.com").strip()
+            self._imap_port = int(config.get("imap_port") or 993)
 
         # 立即运行一次
         if self._onlyonce:
@@ -148,6 +157,10 @@ class NodeSeekSignin(_PluginBase):
             "use_proxy": self._use_proxy,
             "auto_save_cookie": self._auto_save_cookie,
             "use_browser_login": self._use_browser_login,
+            "imap_email": self._imap_email,
+            "imap_password": self._imap_password,
+            "imap_server": self._imap_server,
+            "imap_port": self._imap_port,
         })
 
     # ---------------- 工具方法 ----------------
@@ -435,6 +448,250 @@ class NodeSeekSignin(_PluginBase):
             except Exception:
                 pass
 
+    # ---------------- 邮箱验证码登录（IMAP 自动读码） ----------------
+    def __fetch_email_code(self, since_ts: float) -> Tuple[Optional[str], str]:
+        """轮询 IMAP 邮箱，读取 NodeSeek 发来的最新验证码。since_ts 之前的邮件忽略。"""
+        import imaplib
+        import email as email_lib
+        import re
+        from email.utils import parsedate_to_datetime
+
+        if not self._imap_email or not self._imap_password:
+            return None, "未配置 IMAP 邮箱或授权码"
+        host = self._imap_server or "imap.gmail.com"
+        port = int(self._imap_port or 993)
+
+        def _extract_text(msg) -> str:
+            texts = []
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = part.get_content_type()
+                    if ctype in ("text/plain", "text/html"):
+                        try:
+                            payload = part.get_payload(decode=True)
+                            if payload:
+                                charset = part.get_content_charset() or "utf-8"
+                                texts.append(payload.decode(charset, errors="ignore"))
+                        except Exception:
+                            pass
+            else:
+                try:
+                    payload = msg.get_payload(decode=True)
+                    if payload:
+                        charset = msg.get_content_charset() or "utf-8"
+                        texts.append(payload.decode(charset, errors="ignore"))
+                except Exception:
+                    pass
+            return "\n".join(texts)
+
+        deadline = time.time() + 120
+        last_err = ""
+        logger.info("[邮箱登录] 开始轮询 IMAP 读取验证码...")
+        while time.time() < deadline:
+            try:
+                M = imaplib.IMAP4_SSL(host, port)
+                M.login(self._imap_email, self._imap_password)
+                M.select("INBOX")
+                typ, data = M.search(None, "ALL")
+                ids = data[0].split() if data and data[0] else []
+                code = None
+                for mid in reversed(ids[-15:]):
+                    typ, msgdata = M.fetch(mid, "(RFC822)")
+                    if not msgdata or not msgdata[0]:
+                        continue
+                    msg = email_lib.message_from_bytes(msgdata[0][1])
+                    sender = str(msg.get("From", "")).lower()
+                    subject = str(msg.get("Subject", ""))
+                    if "nodeseek" not in sender and "nodeseek" not in subject.lower():
+                        continue
+                    try:
+                        mdate = parsedate_to_datetime(msg.get("Date"))
+                        if mdate and mdate.timestamp() < since_ts - 90:
+                            continue
+                    except Exception:
+                        pass
+                    body = subject + "\n" + _extract_text(msg)
+                    m = re.search(r"(?<![0-9])([0-9]{6})(?![0-9])", body) or \
+                        re.search(r"(?<![A-Za-z0-9])([A-Za-z0-9]{6})(?![A-Za-z0-9])", body)
+                    if m:
+                        code = m.group(1)
+                        break
+                M.logout()
+                if code:
+                    return code, ""
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"[邮箱登录] IMAP 读取异常：{e}")
+            time.sleep(5)
+        return None, f"未能从邮箱获取验证码（超时）{('：' + last_err) if last_err else ''}"
+
+    def __browser_email_signin(self) -> Tuple[str, str, Optional[dict], Optional[str]]:
+        """邮箱验证码登录（免密）：发码 → IMAP 读码 → 提交登录 → 签到 + 收益统计。
+
+        绕开机房 IP 下密码登录被风控重定向到 emailSignIn 的问题。
+        返回 (结果状态, 消息, 收益统计dict 或 None, 会话Cookie 或 None)。
+        """
+        email = self._imap_email
+        if not email or not self._imap_password:
+            return "loginfail", "未配置 IMAP 邮箱/授权码", None, None
+        token, reason = self.__solve_captcha()
+        if not token:
+            return "loginfail", f"发码验证码失败：{reason}", None, None
+        try:
+            from cloakbrowser import launch_context
+        except Exception as e:
+            return "loginfail", f"未安装 CloakBrowser 浏览器仿真环境：{e}", None, None
+
+        proxy = None
+        try:
+            if self._use_proxy and hasattr(settings, "PROXY_SERVER") and settings.PROXY_SERVER:
+                proxy = settings.PROXY_SERVER
+        except Exception:
+            pass
+
+        context = None
+        page = None
+        try:
+            logger.info("[邮箱登录] 启动 CloakBrowser，发送邮箱验证码...")
+            context = launch_context(headless=True, proxy=proxy)
+            page = context.new_page()
+            page.goto(SIGNIN_PAGE)
+            try:
+                page.wait_for_load_state("networkidle", timeout=60 * 1000)
+            except Exception:
+                pass
+
+            # 1) 发送验证码
+            send_js = r"""
+            async ({email, token}) => {
+                const r = await fetch('/api/email', {
+                    method: 'POST', credentials: 'include',
+                    headers: {'content-type': 'application/json'},
+                    body: JSON.stringify({email: email, mode: 'totp', token: token, source: 'turnstile', version: 'v3'})
+                });
+                let d = null; try { d = await r.json(); } catch (e) {}
+                return {status: r.status, data: d};
+            }
+            """
+            since = time.time()
+            sres = page.evaluate(send_js, {"email": email, "token": token}) or {}
+            sdata = sres.get("data") or {}
+            logger.info(f"[邮箱登录] 发码响应：HTTP {sres.get('status')}，success={sdata.get('success')}，message={sdata.get('message')}")
+            if not sdata.get("success"):
+                return "loginfail", f"发送验证码失败：{sdata.get('message') or ('HTTP ' + str(sres.get('status')))}", None, None
+
+            # 2) IMAP 读取验证码
+            code, cerr = self.__fetch_email_code(since)
+            if not code:
+                return "loginfail", cerr, None, None
+            logger.info(f"[邮箱登录] 已取得验证码：{code}")
+
+            # 3) 提交验证码登录 + 签到 + 收益统计
+            login_js = r"""
+            async ({email, code, statsDays}) => {
+                const out = {phase: 'start'};
+                let preMod = null;
+                async function authHeaders() {
+                    try {
+                        const urls = performance.getEntriesByType('resource').map(e => e.name);
+                        const preUrl = urls.find(u => /\/assets\/preLogin-[^/]*\.js/.test(u));
+                        if (!preMod) preMod = await import(preUrl);
+                        return await preMod.g();
+                    } catch (e) { out.vErr = String(e); return {}; }
+                }
+                let vh = await authHeaders();
+                const lr = await fetch('/api/account/emailSignIn', {
+                    method: 'POST', credentials: 'include',
+                    headers: Object.assign({'content-type': 'application/json'}, vh),
+                    body: JSON.stringify({email: email, code: code})
+                });
+                out.loginStatus = lr.status;
+                try { out.loginBody = await lr.json(); } catch (e) { out.loginBody = null; }
+                if (!out.loginBody || !out.loginBody.success) { out.phase = 'login-fail'; return out; }
+                vh = await authHeaders();
+                out.vKeys = Object.keys(vh);
+                const ar = await fetch('/api/attendance?random=true', {
+                    method: 'POST', credentials: 'include',
+                    headers: Object.assign({'Content-Type': 'application/json'}, vh), body: '{}'
+                });
+                out.attStatus = ar.status;
+                try { out.attBody = await ar.json(); } catch (e) { out.attBody = null; }
+                try {
+                    const minMs = Date.now() - statsDays * 86400 * 1000;
+                    let total = 0, cnt = 0, page = 1, stop = false;
+                    while (page <= 20 && !stop) {
+                        const cr = await fetch('/api/account/credit/page-' + page, {credentials: 'include', headers: vh});
+                        let cb = null; try { cb = await cr.json(); } catch (e) {}
+                        if (!cb || !cb.success || !cb.data || !cb.data.length) break;
+                        for (const rec of cb.data) {
+                            const amt = rec[0], desc = rec[2], ts = rec[3];
+                            const t = new Date(ts).getTime();
+                            if (t < minMs) { stop = true; continue; }
+                            if (typeof desc === 'string' && desc.indexOf('签到收益') >= 0 && desc.indexOf('鸡腿') >= 0) { total += amt; cnt++; }
+                        }
+                        page++;
+                    }
+                    out.stats = {total: total, cnt: cnt};
+                } catch (e) { out.statsErr = String(e); }
+                out.phase = 'done';
+                return out;
+            }
+            """
+            res = page.evaluate(login_js, {"email": email, "code": code,
+                                           "statsDays": int(self._stats_days or 30)}) or {}
+            logger.info(f"[邮箱登录] 登录HTTP={res.get('loginStatus')} 鉴权头={res.get('vKeys')} "
+                        f"vErr={res.get('vErr')} 签到HTTP={res.get('attStatus')}")
+            login_body = res.get("loginBody") or {}
+            if res.get("phase") == "login-fail" or not login_body.get("success"):
+                return "loginfail", f"邮箱验证码登录失败：{login_body.get('message') or ('HTTP ' + str(res.get('loginStatus')))}", None, None
+
+            session_cookie = None
+            try:
+                cks = context.cookies()
+                pairs = {c.get("name"): c.get("value") for c in (cks or [])
+                         if "nodeseek.com" in (c.get("domain") or "") and c.get("name")}
+                if pairs:
+                    session_cookie = "; ".join(f"{k}={v}" for k, v in pairs.items())
+                    logger.info(f"[邮箱登录] 登录成功，取得会话Cookie字段：{list(pairs.keys())}")
+            except Exception:
+                pass
+
+            att = res.get("attBody") or {}
+            amsg = att.get("message") or ""
+            logger.info(f"[邮箱登录] 签到响应：HTTP {res.get('attStatus')}，message={amsg}")
+            if "鸡腿" in amsg or att.get("success"):
+                result = "success"
+            elif "已完成" in amsg or "已经签到" in amsg or "已签到" in amsg:
+                result = "already"
+            else:
+                result = "fail"
+
+            stats = None
+            s = res.get("stats")
+            if isinstance(s, dict):
+                cnt = int(s.get("cnt") or 0)
+                total = s.get("total") or 0
+                period = "今天" if int(self._stats_days or 30) == 1 else f"近{self._stats_days}天"
+                stats = {
+                    "total_amount": total, "average": round(total / cnt, 2) if cnt else 0,
+                    "days_count": cnt, "records": [], "period": period,
+                }
+            return result, (amsg or "签到完成"), stats, session_cookie
+        except Exception as e:
+            logger.error(f"[邮箱登录] 流程异常：{e}")
+            return "error", f"邮箱登录异常：{e}", None, None
+        finally:
+            try:
+                if page:
+                    page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+
     def __session_login(self, user: str, password: str) -> Tuple[Optional[str], str]:
         """[兜底] curl_cffi 账密登录（仅在关闭「浏览器登录」时使用）。返回 (新 Cookie, 失败原因)。
 
@@ -643,19 +900,25 @@ class NodeSeekSignin(_PluginBase):
     # ---------------- 主签到流程 ----------------
     def signin(self):
         """执行 NodeSeek 签到主流程。"""
-        if not self._cookie and not self._accounts:
-            logger.warning("未配置 Cookie 或账密，跳过签到")
+        imap_ready = bool(self._use_browser_login and self._imap_email and self._imap_password)
+        if not self._cookie and not self._accounts and not imap_ready:
+            logger.warning("未配置 Cookie / 账密 / 邮箱(IMAP)，跳过签到")
             return
 
         accounts = self.__parse_accounts()
         cookie_list = self.__parse_cookies()
-        logger.info(f"共发现 {len(accounts)} 个账密配置，{len(cookie_list)} 个现有Cookie")
+        logger.info(f"共发现 {len(accounts)} 个账密配置，{len(cookie_list)} 个现有Cookie，邮箱登录：{'已配置' if imap_ready else '未配置'}")
 
         # 仅有 Cookie、无账密时，为每个 Cookie 补一个空账密占位
         if len(accounts) == 0 and len(cookie_list) > 0:
             accounts = [{"user": "", "password": ""} for _ in cookie_list]
 
         max_count = max(len(accounts), len(cookie_list))
+        # 仅配置了邮箱登录（无 Cookie、无账密）时，补一个空占位让流程跑起来
+        if max_count == 0 and imap_ready:
+            accounts = [{"user": "", "password": ""}]
+            cookie_list = [""]
+            max_count = 1
         while len(accounts) < max_count:
             accounts.append({"user": "", "password": ""})
         while len(cookie_list) < max_count:
@@ -682,6 +945,19 @@ class NodeSeekSignin(_PluginBase):
             used_cookie = cookie
             if result in ["success", "already"]:
                 logger.info(f"账号 {display_user} 签到成功: {msg}")
+            elif imap_ready and i == 0:
+                # 邮箱验证码登录（免密，绕开机房 IP 风控），仅对首个账号执行
+                logger.info(f"账号 {display_user} 使用邮箱验证码登录并签到...")
+                result, msg, stats, new_cookie = self.__browser_email_signin()
+                if new_cookie and "session" in new_cookie:
+                    cookie_list[i] = new_cookie
+                    used_cookie = new_cookie
+                    cookies_updated = True
+                    logger.info(f"账号 {display_user} 已取得并回写会话 Cookie")
+                if result in ["success", "already"]:
+                    logger.info(f"账号 {display_user} 签到成功: {msg}")
+                else:
+                    logger.error(f"账号 {display_user} 邮箱登录签到失败: {msg}")
             elif user and password:
                 if self._use_browser_login:
                     logger.info(f"账号 {display_user} 使用浏览器仿真登录并签到...")
@@ -831,17 +1107,13 @@ class NodeSeekSignin(_PluginBase):
                                         {'component': 'VSwitch', 'props': {'model': 'ns_random', 'label': '随机签到', 'color': 'warning'}}]},
                                 ]},
                                 {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
                                         {'component': 'VSwitch', 'props': {'model': 'use_proxy', 'label': '使用系统代理', 'color': 'warning'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {'model': 'auto_save_cookie', 'label': '回写刷新Cookie', 'color': 'success'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {'model': 'use_browser_login', 'label': '浏览器登录(CloakBrowser)', 'color': 'primary'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
                                         {'component': cron_field_component, 'props': {
                                             'model': 'cron', 'label': '签到周期', 'placeholder': '0 8 * * *',
                                             'prepend-inner-icon': 'mdi-clock-outline'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
                                         {'component': 'VTextField', 'props': {
                                             'model': 'stats_days', 'label': '收益统计周期(天)', 'type': 'number',
                                             'placeholder': '30', 'prepend-inner-icon': 'mdi-chart-line'}}]},
@@ -886,7 +1158,7 @@ class NodeSeekSignin(_PluginBase):
                         'content': [
                             {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
                                 {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-shield-key'},
-                                {'component': 'span', 'text': '验证码 / 指纹设置（账密登录时需要）'}
+                                {'component': 'span', 'text': '验证码服务（登录拿验证码时需要）'}
                             ]},
                             {'component': 'VDivider'},
                             {'component': 'VCardText', 'content': [
@@ -911,16 +1183,37 @@ class NodeSeekSignin(_PluginBase):
                                             'prepend-inner-icon': 'mdi-key', 'type': 'password',
                                             'autocomplete': 'new-password', 'clearable': True}}]},
                                 ]},
+                            ]}
+                        ]
+                    },
+                    # 邮箱验证码登录（IMAP）
+                    {
+                        'component': 'VCard',
+                        'props': {'class': 'mt-3'},
+                        'content': [
+                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
+                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-email-lock'},
+                                {'component': 'span', 'text': '邮箱验证码登录（自动维护 Cookie，推荐）'}
+                            ]},
+                            {'component': 'VDivider'},
+                            {'component': 'VCardText', 'content': [
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
                                         {'component': 'VTextField', 'props': {
-                                            'model': 'impersonate', 'label': 'NS_IMPERSONATE（首选指纹）',
-                                            'placeholder': 'chrome110',
-                                            'prepend-inner-icon': 'mdi-fingerprint', 'clearable': True}}]},
+                                            'model': 'imap_email', 'label': 'NodeSeek 账号邮箱',
+                                            'placeholder': 'you@gmail.com',
+                                            'prepend-inner-icon': 'mdi-email', 'clearable': True}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
                                         {'component': 'VTextField', 'props': {
-                                            'model': 'history_days', 'label': '历史记录保留天数', 'type': 'number',
-                                            'placeholder': '30', 'prepend-inner-icon': 'mdi-calendar-range'}}]},
+                                            'model': 'imap_password', 'label': 'IMAP 授权码 / 应用专用密码',
+                                            'placeholder': '邮箱 IMAP 授权码（非登录密码）',
+                                            'prepend-inner-icon': 'mdi-key', 'type': 'password',
+                                            'autocomplete': 'new-password', 'clearable': True}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                        {'component': 'VTextField', 'props': {
+                                            'model': 'imap_server', 'label': 'IMAP 服务器',
+                                            'placeholder': 'imap.gmail.com',
+                                            'prepend-inner-icon': 'mdi-server', 'clearable': True}}]},
                                 ]},
                             ]}
                         ]
@@ -937,17 +1230,14 @@ class NodeSeekSignin(_PluginBase):
                             {'component': 'VDivider'},
                             {'component': 'VCardText', 'content': [
                                 {'component': 'VAlert', 'props': {
-                                    'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': '推荐填写 Cookie 签到（在浏览器登录 nodeseek.com 后复制 Cookie）。多账号 Cookie 用 & 或换行分隔。'}},
-                                {'component': 'VAlert', 'props': {
-                                    'type': 'warning', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': 'Cookie 失效时，若同时配置了对应的「账号密码」，会自动通过验证码服务登录获取新 Cookie 并回写。账密顺序需与 Cookie 一一对应。'}},
-                                {'component': 'VAlert', 'props': {
                                     'type': 'success', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': '账密登录需配置验证码服务：TurnstileSolver 需自建 CloudFreed 并填写 API_BASE_URL；YesCaptcha 为商业服务，填写 CLIENTT_KEY 即可。'}},
+                                    'text': '【全自动·推荐】配置「邮箱验证码登录」即可自动维护 Cookie：插件用真实浏览器发码 → 通过 IMAP 自动读取邮箱验证码 → 完成登录并签到，绕开机房 IP 风控。需 MP 已准备浏览器仿真环境，并填写验证码服务密钥。'}},
                                 {'component': 'VAlert', 'props': {
-                                    'type': 'error', 'variant': 'tonal',
-                                    'text': '账密自动签到请开启「浏览器登录(CloakBrowser)」：NodeSeek 新版鉴权改为 HTTP 头(x-security-token + 浏览器指纹算出的 x-integrity-token)，只能用 MoviePilot 内置真实浏览器登录并签到（仍需配置验证码服务）。需 MP 已准备好浏览器仿真环境。'}},
+                                    'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
+                                    'text': 'Gmail 的 IMAP 授权码：开启两步验证后在「应用专用密码」生成 16 位密码填入；其它邮箱填对应 IMAP 授权码并改 IMAP 服务器地址。'}},
+                                {'component': 'VAlert', 'props': {
+                                    'type': 'warning', 'variant': 'tonal',
+                                    'text': '也可只填 Cookie 手动签到（浏览器登录 nodeseek.com 后复制整段 Cookie，多账号用 & 或换行分隔）。验证码服务：YesCaptcha 填 CLIENTT_KEY 即可；TurnstileSolver 需自建 CloudFreed 并填 API_BASE_URL。'}},
                             ]}
                         ]
                     }
@@ -959,17 +1249,16 @@ class NodeSeekSignin(_PluginBase):
             "notify": True,
             "ns_random": True,
             "use_proxy": False,
-            "auto_save_cookie": True,
-            "use_browser_login": True,
             "cron": "0 8 * * *",
             "cookie": "",
             "accounts": "",
-            "solver_type": "turnstile",
+            "solver_type": "yescaptcha",
             "api_base_url": "",
             "client_key": "",
-            "impersonate": "chrome110",
             "stats_days": 30,
-            "history_days": 30,
+            "imap_email": "",
+            "imap_password": "",
+            "imap_server": "imap.gmail.com",
         }
 
     def get_page(self) -> List[dict]:
