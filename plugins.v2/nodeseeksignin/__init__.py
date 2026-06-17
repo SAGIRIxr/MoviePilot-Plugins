@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -256,24 +256,24 @@ class NodeSeekSignin(_PluginBase):
         except Exception as e:
             return None, f"验证码服务异常：{e}"
 
-    def __browser_signin(self, user: str, password: str) -> Tuple[str, str, Optional[dict]]:
+    def __browser_signin(self, user: str, password: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
         """账密 → 浏览器仿真：登录 + 签到 + 收益统计，全程在 CloakBrowser 内完成。
 
-        NodeSeek 新版鉴权为 HTTP 头（x-security-token 由登录响应头下发，x-integrity-token 由
-        浏览器指纹算出），取不到、也用不上 Cookie，因此登录后直接在浏览器内带正确鉴权头调用
-        签到 / 收益接口。返回 (结果状态, 消息, 收益统计dict 或 None)。
+        返回 (结果状态, 消息, 收益统计dict 或 None, 登录成功取得的会话Cookie 或 None)。
+        说明：MP 机房 IP 多被 NodeSeek 风控，登录会被重定向到邮箱验证（emailSignIn）而拿不到
+        会话；若走干净 IP/代理，登录真正成功时会下发 session Cookie，此时回传以便回写复用。
         """
         token, reason = self.__solve_captcha()
         if not token:
-            return "loginfail", f"登录失败：{reason}", None
+            return "loginfail", f"登录失败：{reason}", None, None
         return self.__run_browser_flow(user, password, token)
 
-    def __run_browser_flow(self, user: str, password: str, token: str) -> Tuple[str, str, Optional[dict]]:
+    def __run_browser_flow(self, user: str, password: str, token: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
         """在 CloakBrowser 内执行：登录 → 写入 localStorage 令牌 → 构造鉴权头 → 签到 + 收益统计。"""
         try:
             from cloakbrowser import launch_context
         except Exception as e:
-            return "loginfail", f"登录失败：未安装 CloakBrowser 浏览器仿真环境：{e}", None
+            return "loginfail", f"登录失败：未安装 CloakBrowser 浏览器仿真环境：{e}", None, None
 
         proxy = None
         try:
@@ -374,7 +374,27 @@ class NodeSeekSignin(_PluginBase):
             login_body = res.get("loginBody") or {}
             if res.get("phase") == "login-fail" or not login_body.get("success"):
                 msg = login_body.get("message") or f"HTTP {res.get('loginStatus')}"
-                return "loginfail", f"登录失败：{msg}", None
+                return "loginfail", f"登录失败：{msg}", None, None
+
+            # 风控：登录被重定向到邮箱验证 → 拿不到会话，给出明确提示
+            redirect = str(login_body.get("redirect") or "")
+            if "emailSignIn" in redirect or "email" in redirect.lower():
+                logger.warning(f"[浏览器仿真] 登录被风控要求邮箱验证：redirect={redirect}")
+                return ("loginfail",
+                        "登录被风控拦截：NodeSeek 要求邮箱验证码（常因 MP 机房 IP 触发）。"
+                        "请改用现成 Cookie 签到，或为登录配置干净IP代理后重试。", None, None)
+
+            # 登录真正成功：从浏览器 cookie 仓库取出会话 Cookie（供回写复用）
+            session_cookie = None
+            try:
+                cks = context.cookies()
+                pairs = {c.get("name"): c.get("value") for c in (cks or [])
+                         if "nodeseek.com" in (c.get("domain") or "") and c.get("name")}
+                if pairs:
+                    session_cookie = "; ".join(f"{k}={v}" for k, v in pairs.items())
+                    logger.info(f"[浏览器仿真] 登录成功，取得会话Cookie字段：{list(pairs.keys())}")
+            except Exception:
+                pass
 
             att = res.get("attBody") or {}
             amsg = att.get("message") or ""
@@ -399,10 +419,10 @@ class NodeSeekSignin(_PluginBase):
                     "records": [],
                     "period": period,
                 }
-            return result, (amsg or "签到完成"), stats
+            return result, (amsg or "签到完成"), stats, session_cookie
         except Exception as e:
             logger.error(f"[浏览器仿真] 流程异常：{e}")
-            return "error", f"浏览器流程异常：{e}", None
+            return "error", f"浏览器流程异常：{e}", None, None
         finally:
             try:
                 if page:
@@ -665,7 +685,12 @@ class NodeSeekSignin(_PluginBase):
             elif user and password:
                 if self._use_browser_login:
                     logger.info(f"账号 {display_user} 使用浏览器仿真登录并签到...")
-                    result, msg, stats = self.__browser_signin(user, password)
+                    result, msg, stats, new_cookie = self.__browser_signin(user, password)
+                    if new_cookie and "session" in new_cookie:
+                        cookie_list[i] = new_cookie
+                        used_cookie = new_cookie
+                        cookies_updated = True
+                        logger.info(f"账号 {display_user} 已取得并回写会话 Cookie")
                     if result in ["success", "already"]:
                         logger.info(f"账号 {display_user} 签到成功: {msg}")
                     else:
