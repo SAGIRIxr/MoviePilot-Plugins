@@ -1,6 +1,6 @@
 {
   "NodeSeekSignin": {
-    "version": "1.0.3",
+    "version": "1.0.4",
     "level": 2,
     "name": "NodeSeek签到",
     "icon": "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png",
@@ -8,6 +8,7 @@
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v1.0.4": "新增「浏览器登录(CloakBrowser)」：账密登录改用 MoviePilot 内置真实浏览器，从浏览器 cookie 仓库取回会话 Cookie，解决 curl_cffi 在 MP 环境登录成功却取不到 Cookie、无法自动续期的问题。",
       "v1.0.3": "登录后改用多种方式（会话/响应/底层 cookiejar）提取 Cookie，并打印 jar 中的 cookie 名，解决 curl_cffi 取不到登录 Cookie 的问题。",
       "v1.0.2": "打印登录响应详情（状态码/success/message/Set-Cookie），并处理“登录成功但未取到 Cookie”的情况，便于定位。",
       "v1.0.1": "账密登录失败时显示具体原因（验证码/接口/拦截）到签到结果与日志；验证码服务未配置时给出明确提示。",

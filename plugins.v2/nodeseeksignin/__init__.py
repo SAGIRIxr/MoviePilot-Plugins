@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.0.4"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -71,6 +71,8 @@ class NodeSeekSignin(_PluginBase):
     _use_proxy = False
     # 登录成功后是否把新 Cookie 写回插件配置
     _auto_save_cookie = True
+    # 账密登录时是否优先使用 MoviePilot 内置 CloakBrowser 真实浏览器（curl_cffi 在 MP 环境取不到登录 Cookie）
+    _use_browser_login = True
 
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
@@ -112,6 +114,7 @@ class NodeSeekSignin(_PluginBase):
             self._history_days = int(config.get("history_days") or 30)
             self._use_proxy = config.get("use_proxy") or False
             self._auto_save_cookie = config.get("auto_save_cookie") if config.get("auto_save_cookie") is not None else True
+            self._use_browser_login = config.get("use_browser_login") if config.get("use_browser_login") is not None else True
 
         # 立即运行一次
         if self._onlyonce:
@@ -144,6 +147,7 @@ class NodeSeekSignin(_PluginBase):
             "history_days": self._history_days,
             "use_proxy": self._use_proxy,
             "auto_save_cookie": self._auto_save_cookie,
+            "use_browser_login": self._use_browser_login,
         })
 
     # ---------------- 工具方法 ----------------
@@ -224,6 +228,95 @@ class NodeSeekSignin(_PluginBase):
             logger.info(f"读取 cookie jar 失败：{e}；session.cookies={str(session.cookies)[:200]}")
         return cookies
 
+    def __browser_login(self, user: str, password: str, token: str) -> Tuple[Optional[str], str]:
+        """使用 MoviePilot 内置 CloakBrowser 真实浏览器登录。
+
+        浏览器打开登录页（自动通过 Cloudflare），随后在页面内同源 fetch 登录接口，
+        浏览器会自动把返回的会话 Cookie 存进自己的 cookie 仓库，最后用 context.cookies() 读出。
+        这样可绕开 curl_cffi 在 MP 环境取不到登录 Cookie 的问题。
+        返回 (新 Cookie, 失败原因)，成功时原因为空字符串。
+        """
+        try:
+            from cloakbrowser import launch_context
+        except Exception as e:
+            return None, f"未安装 CloakBrowser 浏览器仿真环境：{e}"
+
+        proxy = None
+        try:
+            if self._use_proxy and hasattr(settings, "PROXY_SERVER") and settings.PROXY_SERVER:
+                proxy = settings.PROXY_SERVER
+        except Exception:
+            pass
+
+        context = None
+        page = None
+        try:
+            logger.info("[浏览器仿真] 启动 CloakBrowser 登录 NodeSeek...")
+            context = launch_context(headless=True, proxy=proxy)
+            page = context.new_page()
+            # 先打开登录页，让浏览器通过 Cloudflare 并建立站点上下文（cf_clearance 等）
+            page.goto(SIGNIN_PAGE)
+            try:
+                page.wait_for_load_state("networkidle", timeout=60 * 1000)
+            except Exception:
+                pass
+            # 在浏览器内（同源）调用登录接口，浏览器自动保存返回的会话 Cookie
+            js = """
+            async ({token, username, password}) => {
+                const resp = await fetch('https://www.nodeseek.com/api/account/signIn', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-captcha-token': token,
+                        'x-captcha-source': 'turnstile'
+                    },
+                    body: JSON.stringify({username: username, password: password})
+                });
+                let data = null;
+                try { data = await resp.json(); } catch (e) {}
+                return {status: resp.status, data: data};
+            }
+            """
+            result = page.evaluate(js, {"token": token, "username": user, "password": password})
+            result = result or {}
+            status = result.get("status")
+            data = result.get("data") or {}
+            logger.info(f"[浏览器仿真] 登录响应：HTTP {status}，success={data.get('success')}，message={data.get('message')}")
+            if not data.get("success"):
+                if status and status != 200:
+                    return None, f"登录接口返回 HTTP {status}（可能被 Cloudflare 拦截或验证码无效）"
+                return None, f"登录接口拒绝：{data.get('message')}"
+            # 从浏览器 cookie 仓库读取站点会话 Cookie
+            try:
+                all_cookies = context.cookies()
+            except Exception as e:
+                return None, f"读取浏览器 Cookie 失败：{e}"
+            wanted = {}
+            for c in all_cookies or []:
+                domain = (c.get("domain") or "")
+                if "nodeseek.com" in domain and c.get("name"):
+                    wanted[c.get("name")] = c.get("value")
+            if not wanted:
+                return None, "浏览器登录成功但未取到站点 Cookie"
+            cookie_string = '; '.join([f"{k}={v}" for k, v in wanted.items()])
+            logger.info(f"[浏览器仿真] 登录成功，获取到 Cookie 字段：{list(wanted.keys())}")
+            return cookie_string, ""
+        except Exception as e:
+            logger.error(f"[浏览器仿真] 登录异常：{e}")
+            return None, f"浏览器登录异常：{e}"
+        finally:
+            try:
+                if page:
+                    page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+
     def __session_login(self, user: str, password: str) -> Tuple[Optional[str], str]:
         """使用账密 + 验证码服务登录，返回 (新 Cookie, 失败原因)。成功时原因为空字符串。"""
         from curl_cffi import requests as cffi_requests
@@ -254,6 +347,17 @@ class NodeSeekSignin(_PluginBase):
         except Exception as e:
             logger.error(f"验证码服务异常: {e}")
             return None, f"验证码服务异常：{e}"
+
+        # 优先用 MoviePilot 内置 CloakBrowser 真实浏览器登录
+        # （curl_cffi 在 MP 环境登录成功但取不到会话 Cookie，jar 为空）
+        if self._use_browser_login:
+            cookie, reason = self.__browser_login(user, password, token)
+            if cookie:
+                return cookie, ""
+            if reason and reason.startswith("未安装 CloakBrowser"):
+                logger.warning(f"{reason}；回退到 curl_cffi 登录（该环境可能仍取不到 Cookie）")
+            else:
+                return None, reason
 
         proxies = self.__get_proxies()
         initial_impersonate = self._impersonate or "chrome110"
@@ -632,6 +736,8 @@ class NodeSeekSignin(_PluginBase):
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                                         {'component': 'VSwitch', 'props': {'model': 'auto_save_cookie', 'label': '回写刷新Cookie', 'color': 'success'}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VSwitch', 'props': {'model': 'use_browser_login', 'label': '浏览器登录(CloakBrowser)', 'color': 'primary'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                                         {'component': cron_field_component, 'props': {
                                             'model': 'cron', 'label': '签到周期', 'placeholder': '0 8 * * *',
                                             'prepend-inner-icon': 'mdi-clock-outline'}}]},
@@ -737,8 +843,11 @@ class NodeSeekSignin(_PluginBase):
                                     'type': 'warning', 'variant': 'tonal', 'class': 'mb-2',
                                     'text': 'Cookie 失效时，若同时配置了对应的「账号密码」，会自动通过验证码服务登录获取新 Cookie 并回写。账密顺序需与 Cookie 一一对应。'}},
                                 {'component': 'VAlert', 'props': {
-                                    'type': 'success', 'variant': 'tonal',
+                                    'type': 'success', 'variant': 'tonal', 'class': 'mb-2',
                                     'text': '账密登录需配置验证码服务：TurnstileSolver 需自建 CloudFreed 并填写 API_BASE_URL；YesCaptcha 为商业服务，填写 CLIENTT_KEY 即可。'}},
+                                {'component': 'VAlert', 'props': {
+                                    'type': 'error', 'variant': 'tonal',
+                                    'text': '建议开启「浏览器登录(CloakBrowser)」：MoviePilot 环境下 curl_cffi 登录虽成功但取不到 Cookie，需用内置真实浏览器登录才能拿到会话 Cookie 实现自动续期（仍需配置验证码服务获取登录令牌）。'}},
                             ]}
                         ]
                     }
@@ -751,6 +860,7 @@ class NodeSeekSignin(_PluginBase):
             "ns_random": True,
             "use_proxy": False,
             "auto_save_cookie": True,
+            "use_browser_login": True,
             "cron": "0 8 * * *",
             "cookie": "",
             "accounts": "",
