@@ -1,13 +1,14 @@
 {
   "NodeSeekSignin": {
-    "version": "1.2.1",
+    "version": "1.2.2",
     "level": 2,
     "name": "NodeSeek签到",
-    "icon": "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png",
+    "icon": "Nodeseek_A.png",
     "description": "NodeSeek 论坛自动签到，支持多账号 Cookie / 账密登录、随机签到、收益统计与通知。",
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v1.2.2": "更换插件专属图标。",
       "v1.2.1": "说明改为 Cookie 优先、失效才登录刷新；提示首次需填一份有效 Cookie 以绕开邮箱验证。",
       "v1.2.0": "账密登录前注入旧 Cookie 预热，绕开邮箱验证直接刷新 Cookie；新增随机延迟设置。",
       "v1.1.0": "新增邮箱验证码登录（IMAP 自动读码），实现自动维护 Cookie；精简配置页。",
