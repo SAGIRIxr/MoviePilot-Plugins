@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.5"
+    plugin_version = "1.0.6"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -228,145 +228,8 @@ class NodeSeekSignin(_PluginBase):
             logger.info(f"读取 cookie jar 失败：{e}；session.cookies={str(session.cookies)[:200]}")
         return cookies
 
-    @staticmethod
-    def __read_browser_cookies(context, tag: str) -> dict:
-        """读取并打印浏览器 cookie 仓库中所有 nodeseek 站点 Cookie，返回 {name: value}。"""
-        try:
-            cks = context.cookies()
-        except Exception as e:
-            logger.warning(f"[浏览器仿真] 读取 Cookie 失败({tag})：{e}")
-            return {}
-        desc = [f"{c.get('name')}@{c.get('domain')}{'(HttpOnly)' if c.get('httpOnly') else ''}"
-                for c in (cks or [])]
-        logger.info(f"[浏览器仿真] {tag} 浏览器 Cookie：{desc}")
-        collected = {}
-        for c in cks or []:
-            if "nodeseek.com" in (c.get("domain") or "") and c.get("name"):
-                collected[c.get("name")] = c.get("value")
-        return collected
-
-    def __browser_login(self, user: str, password: str, token: str) -> Tuple[Optional[str], str]:
-        """使用 MoviePilot 内置 CloakBrowser 真实浏览器登录。
-
-        浏览器打开登录页（自动通过 Cloudflare），随后在页面内同源 fetch 登录接口，
-        浏览器会自动把返回的会话 Cookie 存进自己的 cookie 仓库，最后用 context.cookies() 读出。
-        这样可绕开 curl_cffi 在 MP 环境取不到登录 Cookie 的问题。
-        返回 (新 Cookie, 失败原因)，成功时原因为空字符串。
-        """
-        try:
-            from cloakbrowser import launch_context
-        except Exception as e:
-            return None, f"未安装 CloakBrowser 浏览器仿真环境：{e}"
-
-        proxy = None
-        try:
-            if self._use_proxy and hasattr(settings, "PROXY_SERVER") and settings.PROXY_SERVER:
-                proxy = settings.PROXY_SERVER
-        except Exception:
-            pass
-
-        context = None
-        page = None
-        try:
-            logger.info("[浏览器仿真] 启动 CloakBrowser 登录 NodeSeek...")
-            context = launch_context(headless=True, proxy=proxy)
-            page = context.new_page()
-            # 先打开登录页，让浏览器通过 Cloudflare 并建立站点上下文（cf_clearance 等）
-            page.goto(SIGNIN_PAGE)
-            try:
-                page.wait_for_load_state("networkidle", timeout=60 * 1000)
-            except Exception:
-                pass
-            # 在浏览器内（同源）调用登录接口，浏览器自动保存返回的会话 Cookie
-            js = """
-            async ({token, username, password}) => {
-                const resp = await fetch('https://www.nodeseek.com/api/account/signIn', {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-captcha-token': token,
-                        'x-captcha-source': 'turnstile'
-                    },
-                    body: JSON.stringify({username: username, password: password})
-                });
-                let data = null;
-                try { data = await resp.json(); } catch (e) {}
-                return {status: resp.status, data: data};
-            }
-            """
-            result = page.evaluate(js, {"token": token, "username": user, "password": password})
-            result = result or {}
-            status = result.get("status")
-            data = result.get("data") or {}
-            logger.info(f"[浏览器仿真] 登录响应：HTTP {status}，success={data.get('success')}，message={data.get('message')}")
-            if not data.get("success"):
-                if status and status != 200:
-                    return None, f"登录接口返回 HTTP {status}（可能被 Cloudflare 拦截或验证码无效）"
-                return None, f"登录接口拒绝：{data.get('message')}"
-
-            # 诊断：登录 fetch 后（导航前）的 cookie 仓库
-            self.__read_browser_cookies(context, "登录后(导航前)")
-            try:
-                doc_cookie = page.evaluate("() => document.cookie")
-                logger.info(f"[浏览器仿真] document.cookie：{doc_cookie}")
-            except Exception:
-                pass
-
-            # 以登录态导航一次，促使会话 Cookie 落入浏览器 cookie 仓库
-            try:
-                page.goto("https://www.nodeseek.com/board")
-                try:
-                    page.wait_for_load_state("networkidle", timeout=60 * 1000)
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning(f"[浏览器仿真] 登录后导航异常：{e}")
-
-            # 诊断：在浏览器内（同源、自动带 Cookie）直接签到，验证浏览器会话是否真的有效
-            try:
-                sign_js = """
-                async () => {
-                    const r = await fetch('https://www.nodeseek.com/api/attendance?random=true', {
-                        method: 'POST', credentials: 'include',
-                        headers: {'Content-Type': 'application/json'}, body: '{}'
-                    });
-                    let d = null; try { d = await r.json(); } catch (e) {}
-                    return {status: r.status, data: d};
-                }
-                """
-                sr = page.evaluate(sign_js) or {}
-                logger.info(f"[浏览器仿真] 浏览器内签到测试：HTTP {sr.get('status')}，message={(sr.get('data') or {}).get('message')}")
-            except Exception as e:
-                logger.warning(f"[浏览器仿真] 浏览器内签到测试异常：{e}")
-
-            # 提取全部站点 Cookie（导航/签到后再取一次）
-            wanted = self.__read_browser_cookies(context, "最终")
-            if not wanted:
-                return None, "浏览器登录成功但未取到站点 Cookie"
-            if "session" not in wanted:
-                logger.warning("[浏览器仿真] 警告：未捕获到鉴权 Cookie(session)，curl_cffi 签到可能仍失败")
-            cookie_string = '; '.join([f"{k}={v}" for k, v in wanted.items()])
-            logger.info(f"[浏览器仿真] 最终获取到 Cookie 字段：{list(wanted.keys())}")
-            return cookie_string, ""
-        except Exception as e:
-            logger.error(f"[浏览器仿真] 登录异常：{e}")
-            return None, f"浏览器登录异常：{e}"
-        finally:
-            try:
-                if page:
-                    page.close()
-            except Exception:
-                pass
-            try:
-                if context:
-                    context.close()
-            except Exception:
-                pass
-
-    def __session_login(self, user: str, password: str) -> Tuple[Optional[str], str]:
-        """使用账密 + 验证码服务登录，返回 (新 Cookie, 失败原因)。成功时原因为空字符串。"""
-        from curl_cffi import requests as cffi_requests
+    def __solve_captcha(self) -> Tuple[Optional[str], str]:
+        """调用验证码服务解出 Turnstile 令牌，返回 (token, 失败原因)。成功时原因为空。"""
         if not self._client_key:
             return None, "未配置验证码密钥（CLIENTT_KEY）；账密登录必须配验证码服务"
         try:
@@ -386,25 +249,169 @@ class NodeSeekSignin(_PluginBase):
                 )
             token = solver.solve(url=SIGNIN_PAGE, sitekey=SITEKEY, verbose=True)
             if not token:
-                logger.error("验证码解析失败")
                 return None, "验证码解析失败（检查服务类型/密钥/余额/节点）"
+            return token, ""
         except (TurnstileSolverError, YesCaptchaSolverError) as e:
-            logger.error(f"验证码服务错误: {e}")
             return None, f"验证码服务错误：{e}"
         except Exception as e:
-            logger.error(f"验证码服务异常: {e}")
             return None, f"验证码服务异常：{e}"
 
-        # 优先用 MoviePilot 内置 CloakBrowser 真实浏览器登录
-        # （curl_cffi 在 MP 环境登录成功但取不到会话 Cookie，jar 为空）
-        if self._use_browser_login:
-            cookie, reason = self.__browser_login(user, password, token)
-            if cookie:
-                return cookie, ""
-            if reason and reason.startswith("未安装 CloakBrowser"):
-                logger.warning(f"{reason}；回退到 curl_cffi 登录（该环境可能仍取不到 Cookie）")
+    def __browser_signin(self, user: str, password: str) -> Tuple[str, str, Optional[dict]]:
+        """账密 → 浏览器仿真：登录 + 签到 + 收益统计，全程在 CloakBrowser 内完成。
+
+        NodeSeek 新版鉴权为 HTTP 头（x-security-token 由登录响应头下发，x-integrity-token 由
+        浏览器指纹算出），取不到、也用不上 Cookie，因此登录后直接在浏览器内带正确鉴权头调用
+        签到 / 收益接口。返回 (结果状态, 消息, 收益统计dict 或 None)。
+        """
+        token, reason = self.__solve_captcha()
+        if not token:
+            return "loginfail", f"登录失败：{reason}", None
+        return self.__run_browser_flow(user, password, token)
+
+    def __run_browser_flow(self, user: str, password: str, token: str) -> Tuple[str, str, Optional[dict]]:
+        """在 CloakBrowser 内执行：登录 → 写入 localStorage 令牌 → 构造鉴权头 → 签到 + 收益统计。"""
+        try:
+            from cloakbrowser import launch_context
+        except Exception as e:
+            return "loginfail", f"登录失败：未安装 CloakBrowser 浏览器仿真环境：{e}", None
+
+        proxy = None
+        try:
+            if self._use_proxy and hasattr(settings, "PROXY_SERVER") and settings.PROXY_SERVER:
+                proxy = settings.PROXY_SERVER
+        except Exception:
+            pass
+
+        context = None
+        page = None
+        try:
+            logger.info("[浏览器仿真] 启动 CloakBrowser 登录并签到...")
+            context = launch_context(headless=True, proxy=proxy)
+            page = context.new_page()
+            page.goto(SIGNIN_PAGE)
+            try:
+                page.wait_for_load_state("networkidle", timeout=60 * 1000)
+            except Exception:
+                pass
+
+            js = r"""
+            async ({token, username, password, statsDays}) => {
+                const out = {phase: 'start'};
+                // 1) 登录
+                const lr = await fetch('/api/account/signIn', {
+                    method: 'POST', credentials: 'include',
+                    headers: {'Content-Type': 'application/json', 'x-captcha-token': token, 'x-captcha-source': 'turnstile'},
+                    body: JSON.stringify({username: username, password: password})
+                });
+                out.loginStatus = lr.status;
+                const sec = lr.headers.get('x-security-token');
+                const csrf = lr.headers.get('x-csrf-token');
+                out.hasSec = !!sec;
+                try { out.loginBody = await lr.json(); } catch (e) { out.loginBody = null; }
+                if (!out.loginBody || !out.loginBody.success) { out.phase = 'login-fail'; return out; }
+                // 2) 像前端 postLogin 一样把令牌写入 localStorage
+                try { if (sec) localStorage.setItem('security_token', sec); } catch (e) {}
+                try { if (csrf) localStorage.setItem('csrf_token', csrf); } catch (e) {}
+                // 3) 用前端 preLogin 模块构造鉴权头（含指纹算出的 x-integrity-token）
+                let vh = {};
+                try {
+                    const urls = performance.getEntriesByType('resource').map(e => e.name);
+                    const preUrl = urls.find(u => /\/assets\/preLogin-[^/]*\.js/.test(u));
+                    const pre = await import(preUrl);
+                    vh = await pre.g();
+                    out.vKeys = Object.keys(vh);
+                } catch (e) {
+                    out.vErr = String(e);
+                    if (sec) vh = {'x-security-token': sec};
+                }
+                // 4) 签到
+                const ar = await fetch('/api/attendance?random=true', {
+                    method: 'POST', credentials: 'include',
+                    headers: Object.assign({'Content-Type': 'application/json'}, vh), body: '{}'
+                });
+                out.attStatus = ar.status;
+                try { out.attBody = await ar.json(); } catch (e) { out.attBody = null; }
+                // 5) 收益统计（积分流水分页）
+                try {
+                    const minMs = Date.now() - statsDays * 86400 * 1000;
+                    let total = 0, cnt = 0, page = 1, stop = false;
+                    while (page <= 20 && !stop) {
+                        const cr = await fetch('/api/account/credit/page-' + page, {credentials: 'include', headers: vh});
+                        let cb = null; try { cb = await cr.json(); } catch (e) {}
+                        if (!cb || !cb.success || !cb.data || !cb.data.length) break;
+                        for (const rec of cb.data) {
+                            const amt = rec[0], desc = rec[2], ts = rec[3];
+                            const t = new Date(ts).getTime();
+                            if (t < minMs) { stop = true; continue; }
+                            if (typeof desc === 'string' && desc.indexOf('签到收益') >= 0 && desc.indexOf('鸡腿') >= 0) { total += amt; cnt++; }
+                        }
+                        page++;
+                    }
+                    out.stats = {total: total, cnt: cnt};
+                } catch (e) { out.statsErr = String(e); }
+                out.phase = 'done';
+                return out;
+            }
+            """
+            res = page.evaluate(js, {"token": token, "username": user, "password": password,
+                                     "statsDays": int(self._stats_days or 30)}) or {}
+            logger.info(f"[浏览器仿真] 登录HTTP={res.get('loginStatus')} hasSecToken={res.get('hasSec')} "
+                        f"鉴权头={res.get('vKeys')} vErr={res.get('vErr')} 签到HTTP={res.get('attStatus')}")
+
+            login_body = res.get("loginBody") or {}
+            if res.get("phase") == "login-fail" or not login_body.get("success"):
+                msg = login_body.get("message") or f"HTTP {res.get('loginStatus')}"
+                return "loginfail", f"登录失败：{msg}", None
+
+            att = res.get("attBody") or {}
+            amsg = att.get("message") or ""
+            logger.info(f"[浏览器仿真] 签到响应：HTTP {res.get('attStatus')}，message={amsg}")
+            if "鸡腿" in amsg or att.get("success"):
+                result = "success"
+            elif "已完成" in amsg or "已经签到" in amsg or "已签到" in amsg:
+                result = "already"
             else:
-                return None, reason
+                result = "fail"
+
+            stats = None
+            s = res.get("stats")
+            if isinstance(s, dict):
+                cnt = int(s.get("cnt") or 0)
+                total = s.get("total") or 0
+                period = "今天" if int(self._stats_days or 30) == 1 else f"近{self._stats_days}天"
+                stats = {
+                    "total_amount": total,
+                    "average": round(total / cnt, 2) if cnt else 0,
+                    "days_count": cnt,
+                    "records": [],
+                    "period": period,
+                }
+            return result, (amsg or "签到完成"), stats
+        except Exception as e:
+            logger.error(f"[浏览器仿真] 流程异常：{e}")
+            return "error", f"浏览器流程异常：{e}", None
+        finally:
+            try:
+                if page:
+                    page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+
+    def __session_login(self, user: str, password: str) -> Tuple[Optional[str], str]:
+        """[兜底] curl_cffi 账密登录（仅在关闭「浏览器登录」时使用）。返回 (新 Cookie, 失败原因)。
+
+        注意：NodeSeek 新版鉴权已改为 HTTP 头（x-security-token + x-integrity-token），
+        curl_cffi 在 MoviePilot 环境登录虽成功但取不到鉴权信息，此路径多半无效，仅作保留。
+        """
+        from curl_cffi import requests as cffi_requests
+        token, reason = self.__solve_captcha()
+        if not token:
+            return None, reason
 
         proxies = self.__get_proxies()
         initial_impersonate = self._impersonate or "chrome110"
@@ -633,6 +640,7 @@ class NodeSeekSignin(_PluginBase):
             display_user = user if user else f"账号{account_index}"
             logger.info(f"==== 账号 {display_user} 开始签到 ====")
 
+            stats = None
             if cookie:
                 result, msg = self.__sign(cookie)
             else:
@@ -642,27 +650,34 @@ class NodeSeekSignin(_PluginBase):
             if result in ["success", "already"]:
                 logger.info(f"账号 {display_user} 签到成功: {msg}")
             elif user and password:
-                logger.info(f"账号 {display_user} Cookie 签到失败({msg})，尝试重新登录...")
-                new_cookie, login_reason = self.__session_login(user, password)
-                if new_cookie:
-                    logger.info("登录成功，使用新Cookie重新签到...")
-                    result, msg = self.__sign(new_cookie)
+                if self._use_browser_login:
+                    logger.info(f"账号 {display_user} 使用浏览器仿真登录并签到...")
+                    result, msg, stats = self.__browser_signin(user, password)
                     if result in ["success", "already"]:
-                        cookie_list[i] = new_cookie
-                        used_cookie = new_cookie
-                        cookies_updated = True
                         logger.info(f"账号 {display_user} 签到成功: {msg}")
                     else:
-                        logger.error(f"账号 {display_user} 重新签到仍然失败: {msg}")
+                        logger.error(f"账号 {display_user} 浏览器签到失败: {msg}")
                 else:
-                    logger.error(f"账号 {display_user} 登录失败：{login_reason}")
-                    result, msg = "loginfail", f"登录失败：{login_reason}"
+                    logger.info(f"账号 {display_user} Cookie 签到失败({msg})，尝试 curl 重新登录...")
+                    new_cookie, login_reason = self.__session_login(user, password)
+                    if new_cookie:
+                        logger.info("登录成功，使用新Cookie重新签到...")
+                        result, msg = self.__sign(new_cookie)
+                        if result in ["success", "already"]:
+                            cookie_list[i] = new_cookie
+                            used_cookie = new_cookie
+                            cookies_updated = True
+                            logger.info(f"账号 {display_user} 签到成功: {msg}")
+                        else:
+                            logger.error(f"账号 {display_user} 重新签到仍然失败: {msg}")
+                    else:
+                        logger.error(f"账号 {display_user} 登录失败：{login_reason}")
+                        result, msg = "loginfail", f"登录失败：{login_reason}"
             else:
                 logger.error(f"账号 {display_user} 签到失败且未配置账密: {msg}")
 
-            # 收益统计
-            stats = None
-            if result in ["success", "already"] and used_cookie:
+            # 收益统计（浏览器路径已带回 stats；cookie 路径在此查询）
+            if stats is None and result in ["success", "already"] and used_cookie:
                 stats, stats_msg = self.__get_signin_stats(used_cookie, self._stats_days)
                 if not stats:
                     logger.warning(f"统计查询失败: {stats_msg}")
@@ -894,7 +909,7 @@ class NodeSeekSignin(_PluginBase):
                                     'text': '账密登录需配置验证码服务：TurnstileSolver 需自建 CloudFreed 并填写 API_BASE_URL；YesCaptcha 为商业服务，填写 CLIENTT_KEY 即可。'}},
                                 {'component': 'VAlert', 'props': {
                                     'type': 'error', 'variant': 'tonal',
-                                    'text': '建议开启「浏览器登录(CloakBrowser)」：MoviePilot 环境下 curl_cffi 登录虽成功但取不到 Cookie，需用内置真实浏览器登录才能拿到会话 Cookie 实现自动续期（仍需配置验证码服务获取登录令牌）。'}},
+                                    'text': '账密自动签到请开启「浏览器登录(CloakBrowser)」：NodeSeek 新版鉴权改为 HTTP 头(x-security-token + 浏览器指纹算出的 x-integrity-token)，只能用 MoviePilot 内置真实浏览器登录并签到（仍需配置验证码服务）。需 MP 已准备好浏览器仿真环境。'}},
                             ]}
                         ]
                     }
