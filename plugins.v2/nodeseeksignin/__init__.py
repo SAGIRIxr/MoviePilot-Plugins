@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.7"
+    plugin_version = "1.0.8"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -325,6 +325,7 @@ class NodeSeekSignin(_PluginBase):
                 // 2) 像前端 postLogin 一样把令牌写入 localStorage
                 try { if (sec) localStorage.setItem('security_token', sec); } catch (e) {}
                 try { if (csrf) localStorage.setItem('csrf_token', csrf); } catch (e) {}
+                try { out.docCookieAfterLogin = document.cookie; } catch (e) {}
                 // 3) 重新构造鉴权头（此时含 x-security-token + x-integrity-token）
                 vh = await authHeaders();
                 out.vKeys = Object.keys(vh);
@@ -362,6 +363,13 @@ class NodeSeekSignin(_PluginBase):
             logger.info(f"[浏览器仿真] 登录HTTP={res.get('loginStatus')} hasSecToken={res.get('hasSec')} "
                         f"登录头={res.get('vKeysLogin')} 鉴权头={res.get('vKeys')} vErr={res.get('vErr')} 签到HTTP={res.get('attStatus')}")
             logger.info(f"[浏览器仿真] 登录响应头清单：{res.get('loginHeaderKeys')}")
+            logger.info(f"[浏览器仿真] 登录响应体：{res.get('loginBody')}")
+            logger.info(f"[浏览器仿真] 登录后 document.cookie：{res.get('docCookieAfterLogin')}")
+            try:
+                cks = context.cookies()
+                logger.info(f"[浏览器仿真] 登录后浏览器Cookie仓库：{[(c.get('name'), c.get('domain'), 'HttpOnly' if c.get('httpOnly') else '') for c in (cks or [])]}")
+            except Exception as e:
+                logger.warning(f"[浏览器仿真] 读取浏览器Cookie失败：{e}")
 
             login_body = res.get("loginBody") or {}
             if res.get("phase") == "login-fail" or not login_body.get("success"):
