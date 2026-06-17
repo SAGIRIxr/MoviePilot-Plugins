@@ -1,6 +1,6 @@
 {
   "NodeSeekSignin": {
-    "version": "1.1.0",
+    "version": "1.2.0",
     "level": 2,
     "name": "NodeSeek签到",
     "icon": "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png",
@@ -8,6 +8,7 @@
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v1.2.0": "账密登录前注入旧 Cookie 预热，绕开邮箱验证直接刷新 Cookie；新增随机延迟设置。",
       "v1.1.0": "新增邮箱验证码登录（IMAP 自动读码），实现自动维护 Cookie；精简配置页。",
       "v1.0.6": "账密登录改用内置浏览器(CloakBrowser)完成登录与签到。",
       "v1.0.0": "首个版本：由 NodeSeek-Signin 脚本移植为 MoviePilot 插件。"

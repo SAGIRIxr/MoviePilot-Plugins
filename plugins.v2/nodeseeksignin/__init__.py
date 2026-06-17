@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -55,6 +55,8 @@ class NodeSeekSignin(_PluginBase):
     _accounts = ""
     # NS_RANDOM
     _ns_random = True
+    # 随机延迟（分钟）：定时触发时先随机延迟 0~N 分钟再签到，0 为关闭
+    _random_delay = 0
     # SOLVER_TYPE：turnstile / yescaptcha
     _solver_type = "turnstile"
     # API_BASE_URL（CloudFreed 地址 / YesCaptcha 节点）
@@ -111,6 +113,7 @@ class NodeSeekSignin(_PluginBase):
             self._cookie = config.get("cookie") or ""
             self._accounts = config.get("accounts") or ""
             self._ns_random = config.get("ns_random") if config.get("ns_random") is not None else True
+            self._random_delay = int(config.get("random_delay") or 0)
             self._solver_type = (config.get("solver_type") or "turnstile").strip()
             self._api_base_url = (config.get("api_base_url") or "").strip()
             self._client_key = (config.get("client_key") or "").strip()
@@ -131,7 +134,7 @@ class NodeSeekSignin(_PluginBase):
             logger.info("NodeSeek签到服务启动，立即运行一次")
             self._scheduler.add_job(func=self.signin, trigger='date',
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                    name="NodeSeek签到")
+                                    name="NodeSeek签到", kwargs={"manual": True})
             self._onlyonce = False
             self.__update_config()
             if self._scheduler.get_jobs():
@@ -148,6 +151,7 @@ class NodeSeekSignin(_PluginBase):
             "cookie": self._cookie,
             "accounts": self._accounts,
             "ns_random": self._ns_random,
+            "random_delay": self._random_delay,
             "solver_type": self._solver_type,
             "api_base_url": self._api_base_url,
             "client_key": self._client_key,
@@ -269,20 +273,36 @@ class NodeSeekSignin(_PluginBase):
         except Exception as e:
             return None, f"验证码服务异常：{e}"
 
-    def __browser_signin(self, user: str, password: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
+    @staticmethod
+    def __cookie_to_browser_pairs(cookie_str: str) -> List[dict]:
+        """把 'k=v; k2=v2' 形式的 Cookie 串转成 CloakBrowser/Playwright 的 add_cookies 入参。"""
+        pairs = []
+        for part in (cookie_str or "").split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name, value = name.strip(), value.strip()
+            if name:
+                pairs.append({"name": name, "value": value, "domain": ".nodeseek.com", "path": "/"})
+        return pairs
+
+    def __browser_signin(self, user: str, password: str,
+                         old_cookie: Optional[str] = None) -> Tuple[str, str, Optional[dict], Optional[str]]:
         """账密 → 浏览器仿真：登录 + 签到 + 收益统计，全程在 CloakBrowser 内完成。
 
         返回 (结果状态, 消息, 收益统计dict 或 None, 登录成功取得的会话Cookie 或 None)。
-        说明：MP 机房 IP 多被 NodeSeek 风控，登录会被重定向到邮箱验证（emailSignIn）而拿不到
-        会话；若走干净 IP/代理，登录真正成功时会下发 session Cookie，此时回传以便回写复用。
+        关键：登录前把旧 Cookie 注入浏览器预热——NodeSeek 会认这是可信会话，机房 IP 下账密
+        登录便不再被重定向到邮箱验证（emailSignIn），从而能直接刷新拿到新 session Cookie。
         """
         token, reason = self.__solve_captcha()
         if not token:
             return "loginfail", f"登录失败：{reason}", None, None
-        return self.__run_browser_flow(user, password, token)
+        return self.__run_browser_flow(user, password, token, old_cookie)
 
-    def __run_browser_flow(self, user: str, password: str, token: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
-        """在 CloakBrowser 内执行：登录 → 写入 localStorage 令牌 → 构造鉴权头 → 签到 + 收益统计。"""
+    def __run_browser_flow(self, user: str, password: str, token: str,
+                           old_cookie: Optional[str] = None) -> Tuple[str, str, Optional[dict], Optional[str]]:
+        """在 CloakBrowser 内执行：注入旧 Cookie 预热 → 登录 → 写入 localStorage 令牌 → 构造鉴权头 → 签到 + 收益统计。"""
         try:
             from cloakbrowser import launch_context
         except Exception as e:
@@ -300,6 +320,15 @@ class NodeSeekSignin(_PluginBase):
         try:
             logger.info("[浏览器仿真] 启动 CloakBrowser 登录并签到...")
             context = launch_context(headless=True, proxy=proxy)
+            # 注入旧 Cookie 预热：让 NodeSeek 视为可信会话，规避机房 IP 下的邮箱验证重定向
+            if old_cookie:
+                try:
+                    ck_pairs = self.__cookie_to_browser_pairs(old_cookie)
+                    if ck_pairs:
+                        context.add_cookies(ck_pairs)
+                        logger.info(f"[浏览器仿真] 已注入旧 Cookie 预热（{len(ck_pairs)} 项），规避邮箱验证")
+                except Exception as e:
+                    logger.warning(f"[浏览器仿真] 注入旧 Cookie 失败：{e}")
             page = context.new_page()
             page.goto(SIGNIN_PAGE)
             try:
@@ -898,8 +927,16 @@ class NodeSeekSignin(_PluginBase):
         return accounts
 
     # ---------------- 主签到流程 ----------------
-    def signin(self):
-        """执行 NodeSeek 签到主流程。"""
+    def signin(self, manual: bool = False):
+        """执行 NodeSeek 签到主流程。manual=True 为手动「立即运行」，不做随机延迟。"""
+        # 随机延迟：定时触发时在 0~N 分钟内浮动，避免每天固定时刻签到
+        if not manual and self._random_delay and self._random_delay > 0:
+            import random
+            delay = random.randint(0, int(self._random_delay) * 60)
+            if delay > 0:
+                logger.info(f"随机延迟 {delay} 秒（{round(delay / 60, 1)} 分钟）后开始签到...")
+                time.sleep(delay)
+
         imap_ready = bool(self._use_browser_login and self._imap_email and self._imap_password)
         if not self._cookie and not self._accounts and not imap_ready:
             logger.warning("未配置 Cookie / 账密 / 邮箱(IMAP)，跳过签到")
@@ -945,10 +982,36 @@ class NodeSeekSignin(_PluginBase):
             used_cookie = cookie
             if result in ["success", "already"]:
                 logger.info(f"账号 {display_user} 签到成功: {msg}")
-            elif imap_ready and i == 0:
-                # 邮箱验证码登录（免密，绕开机房 IP 风控），仅对首个账号执行
-                logger.info(f"账号 {display_user} 使用邮箱验证码登录并签到...")
-                result, msg, stats, new_cookie = self.__browser_email_signin()
+            else:
+                # Cookie 失效/无 Cookie → 重新登录刷新
+                new_cookie = None
+                if user and password and self._use_browser_login:
+                    # 账密登录刷新（登录前注入旧 Cookie 预热，绕开机房 IP 的邮箱验证）
+                    logger.info(f"账号 {display_user} 使用浏览器账密登录刷新 Cookie...")
+                    result, msg, stats, new_cookie = self.__browser_signin(user, password, old_cookie=cookie)
+                    # 账密仍被风控要求邮箱验证 → 回退邮箱验证码登录（仅首个账号）
+                    if result not in ["success", "already"] and imap_ready and i == 0:
+                        logger.info(f"账号 {display_user} 账密登录未通过，改用邮箱验证码登录...")
+                        result, msg, stats, new_cookie = self.__browser_email_signin()
+                elif imap_ready and i == 0:
+                    # 仅配置邮箱：邮箱验证码登录（免密，绕开机房 IP 风控）
+                    logger.info(f"账号 {display_user} 使用邮箱验证码登录并签到...")
+                    result, msg, stats, new_cookie = self.__browser_email_signin()
+                elif user and password:
+                    # 兜底：curl 账密登录（已关闭浏览器登录时）
+                    logger.info(f"账号 {display_user} Cookie 签到失败({msg})，尝试 curl 重新登录...")
+                    cc, login_reason = self.__session_login(user, password)
+                    if cc:
+                        logger.info("登录成功，使用新Cookie重新签到...")
+                        result, msg = self.__sign(cc)
+                        if result in ["success", "already"]:
+                            new_cookie = cc
+                    else:
+                        result, msg = "loginfail", f"登录失败：{login_reason}"
+                else:
+                    logger.error(f"账号 {display_user} 签到失败且未配置账密/邮箱: {msg}")
+
+                # 统一回写刷新后的会话 Cookie
                 if new_cookie and "session" in new_cookie:
                     cookie_list[i] = new_cookie
                     used_cookie = new_cookie
@@ -957,38 +1020,7 @@ class NodeSeekSignin(_PluginBase):
                 if result in ["success", "already"]:
                     logger.info(f"账号 {display_user} 签到成功: {msg}")
                 else:
-                    logger.error(f"账号 {display_user} 邮箱登录签到失败: {msg}")
-            elif user and password:
-                if self._use_browser_login:
-                    logger.info(f"账号 {display_user} 使用浏览器仿真登录并签到...")
-                    result, msg, stats, new_cookie = self.__browser_signin(user, password)
-                    if new_cookie and "session" in new_cookie:
-                        cookie_list[i] = new_cookie
-                        used_cookie = new_cookie
-                        cookies_updated = True
-                        logger.info(f"账号 {display_user} 已取得并回写会话 Cookie")
-                    if result in ["success", "already"]:
-                        logger.info(f"账号 {display_user} 签到成功: {msg}")
-                    else:
-                        logger.error(f"账号 {display_user} 浏览器签到失败: {msg}")
-                else:
-                    logger.info(f"账号 {display_user} Cookie 签到失败({msg})，尝试 curl 重新登录...")
-                    new_cookie, login_reason = self.__session_login(user, password)
-                    if new_cookie:
-                        logger.info("登录成功，使用新Cookie重新签到...")
-                        result, msg = self.__sign(new_cookie)
-                        if result in ["success", "already"]:
-                            cookie_list[i] = new_cookie
-                            used_cookie = new_cookie
-                            cookies_updated = True
-                            logger.info(f"账号 {display_user} 签到成功: {msg}")
-                        else:
-                            logger.error(f"账号 {display_user} 重新签到仍然失败: {msg}")
-                    else:
-                        logger.error(f"账号 {display_user} 登录失败：{login_reason}")
-                        result, msg = "loginfail", f"登录失败：{login_reason}"
-            else:
-                logger.error(f"账号 {display_user} 签到失败且未配置账密: {msg}")
+                    logger.error(f"账号 {display_user} 重新登录签到失败: {msg}")
 
             # 收益统计（浏览器路径已带回 stats；cookie 路径在此查询）
             if stats is None and result in ["success", "already"] and used_cookie:
@@ -1107,13 +1139,18 @@ class NodeSeekSignin(_PluginBase):
                                         {'component': 'VSwitch', 'props': {'model': 'ns_random', 'label': '随机签到', 'color': 'warning'}}]},
                                 ]},
                                 {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                                         {'component': 'VSwitch', 'props': {'model': 'use_proxy', 'label': '使用系统代理', 'color': 'warning'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                                         {'component': cron_field_component, 'props': {
                                             'model': 'cron', 'label': '签到周期', 'placeholder': '0 8 * * *',
                                             'prepend-inner-icon': 'mdi-clock-outline'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VTextField', 'props': {
+                                            'model': 'random_delay', 'label': '随机延迟(分钟)', 'type': 'number',
+                                            'placeholder': '0=关闭', 'prepend-inner-icon': 'mdi-timer-sand',
+                                            'hint': '定时触发后在 0~N 分钟内随机延迟', 'persistent-hint': True}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                                         {'component': 'VTextField', 'props': {
                                             'model': 'stats_days', 'label': '收益统计周期(天)', 'type': 'number',
                                             'placeholder': '30', 'prepend-inner-icon': 'mdi-chart-line'}}]},
@@ -1231,7 +1268,7 @@ class NodeSeekSignin(_PluginBase):
                             {'component': 'VCardText', 'content': [
                                 {'component': 'VAlert', 'props': {
                                     'type': 'success', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': '【全自动·推荐】配置「邮箱验证码登录」即可自动维护 Cookie：插件用真实浏览器发码 → 通过 IMAP 自动读取邮箱验证码 → 完成登录并签到，绕开机房 IP 风控。需 MP 已准备浏览器仿真环境，并填写验证码服务密钥。'}},
+                                    'text': '【自动维护 Cookie】填好「账号密码」即可：Cookie 失效时，插件用真实浏览器先注入旧 Cookie 预热（让 NodeSeek 认作可信会话，绕开机房 IP 的邮箱验证），再用账密登录刷新出新 Cookie 自动写回。需 MP 已准备浏览器仿真环境并填写验证码服务密钥；若账密登录仍被要求邮箱验证，会自动回退到下方「邮箱验证码登录」。'}},
                                 {'component': 'VAlert', 'props': {
                                     'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
                                     'text': 'Gmail 的 IMAP 授权码：开启两步验证后在「应用专用密码」生成 16 位密码填入；其它邮箱填对应 IMAP 授权码并改 IMAP 服务器地址。'}},
@@ -1248,6 +1285,7 @@ class NodeSeekSignin(_PluginBase):
             "onlyonce": False,
             "notify": True,
             "ns_random": True,
+            "random_delay": 0,
             "use_proxy": False,
             "cron": "0 8 * * *",
             "cookie": "",
