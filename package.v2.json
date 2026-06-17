@@ -1,6 +1,6 @@
 {
   "NodeSeekSignin": {
-    "version": "1.0.6",
+    "version": "1.0.7",
     "level": 2,
     "name": "NodeSeek签到",
     "icon": "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png",
@@ -8,6 +8,7 @@
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v1.0.7": "修复登录拿不到 x-security-token：与前端一致，登录请求头也带上 x-integrity-token；新增登录响应头清单诊断。",
       "v1.0.6": "重构账密签到：查明 NodeSeek 新版改为 HTTP 头鉴权(x-security-token + 浏览器指纹算出的 x-integrity-token)，故登录+签到+收益统计全程在 CloakBrowser 内完成——浏览器登录、写入 localStorage 令牌、复用前端模块构造鉴权头后调接口；放弃 curl_cffi 指纹回退路径。",
       "v1.0.5": "浏览器登录增强：登录后导航到已登录页促使会话 Cookie 落库，新增完整 Cookie 诊断与浏览器内签到自检，定位/修复只抓到 cf_clearance 而未取到 session 鉴权 Cookie 的问题。",
       "v1.0.4": "新增「浏览器登录(CloakBrowser)」：账密登录改用 MoviePilot 内置真实浏览器，从浏览器 cookie 仓库取回会话 Cookie，解决 curl_cffi 在 MP 环境登录成功却取不到 Cookie、无法自动续期的问题。",

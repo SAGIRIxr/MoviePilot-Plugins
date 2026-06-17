@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.6"
+    plugin_version = "1.0.7"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -297,13 +297,26 @@ class NodeSeekSignin(_PluginBase):
             js = r"""
             async ({token, username, password, statsDays}) => {
                 const out = {phase: 'start'};
-                // 1) 登录
+                // 复用前端 preLogin 模块构造鉴权头（首次只有指纹算出的 x-integrity-token）
+                let preMod = null;
+                async function authHeaders() {
+                    try {
+                        const urls = performance.getEntriesByType('resource').map(e => e.name);
+                        const preUrl = urls.find(u => /\/assets\/preLogin-[^/]*\.js/.test(u));
+                        if (!preMod) preMod = await import(preUrl);
+                        return await preMod.g();
+                    } catch (e) { out.vErr = String(e); return {}; }
+                }
+                // 1) 登录（与前端一致：请求头带上 x-integrity-token）
+                let vh = await authHeaders();
+                out.vKeysLogin = Object.keys(vh);
                 const lr = await fetch('/api/account/signIn', {
                     method: 'POST', credentials: 'include',
-                    headers: {'Content-Type': 'application/json', 'x-captcha-token': token, 'x-captcha-source': 'turnstile'},
+                    headers: Object.assign({'Content-Type': 'application/json', 'x-captcha-token': token, 'x-captcha-source': 'turnstile'}, vh),
                     body: JSON.stringify({username: username, password: password})
                 });
                 out.loginStatus = lr.status;
+                try { out.loginHeaderKeys = [...lr.headers.keys()]; } catch (e) {}
                 const sec = lr.headers.get('x-security-token');
                 const csrf = lr.headers.get('x-csrf-token');
                 out.hasSec = !!sec;
@@ -312,18 +325,9 @@ class NodeSeekSignin(_PluginBase):
                 // 2) 像前端 postLogin 一样把令牌写入 localStorage
                 try { if (sec) localStorage.setItem('security_token', sec); } catch (e) {}
                 try { if (csrf) localStorage.setItem('csrf_token', csrf); } catch (e) {}
-                // 3) 用前端 preLogin 模块构造鉴权头（含指纹算出的 x-integrity-token）
-                let vh = {};
-                try {
-                    const urls = performance.getEntriesByType('resource').map(e => e.name);
-                    const preUrl = urls.find(u => /\/assets\/preLogin-[^/]*\.js/.test(u));
-                    const pre = await import(preUrl);
-                    vh = await pre.g();
-                    out.vKeys = Object.keys(vh);
-                } catch (e) {
-                    out.vErr = String(e);
-                    if (sec) vh = {'x-security-token': sec};
-                }
+                // 3) 重新构造鉴权头（此时含 x-security-token + x-integrity-token）
+                vh = await authHeaders();
+                out.vKeys = Object.keys(vh);
                 // 4) 签到
                 const ar = await fetch('/api/attendance?random=true', {
                     method: 'POST', credentials: 'include',
@@ -356,7 +360,8 @@ class NodeSeekSignin(_PluginBase):
             res = page.evaluate(js, {"token": token, "username": user, "password": password,
                                      "statsDays": int(self._stats_days or 30)}) or {}
             logger.info(f"[浏览器仿真] 登录HTTP={res.get('loginStatus')} hasSecToken={res.get('hasSec')} "
-                        f"鉴权头={res.get('vKeys')} vErr={res.get('vErr')} 签到HTTP={res.get('attStatus')}")
+                        f"登录头={res.get('vKeysLogin')} 鉴权头={res.get('vKeys')} vErr={res.get('vErr')} 签到HTTP={res.get('attStatus')}")
+            logger.info(f"[浏览器仿真] 登录响应头清单：{res.get('loginHeaderKeys')}")
 
             login_body = res.get("loginBody") or {}
             if res.get("phase") == "login-fail" or not login_body.get("success"):
