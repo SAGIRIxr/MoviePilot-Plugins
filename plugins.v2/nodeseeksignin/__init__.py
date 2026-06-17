@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://www.nodeseek.com/static/image/favicon/favicon-32x32.png"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -228,6 +228,23 @@ class NodeSeekSignin(_PluginBase):
             logger.info(f"读取 cookie jar 失败：{e}；session.cookies={str(session.cookies)[:200]}")
         return cookies
 
+    @staticmethod
+    def __read_browser_cookies(context, tag: str) -> dict:
+        """读取并打印浏览器 cookie 仓库中所有 nodeseek 站点 Cookie，返回 {name: value}。"""
+        try:
+            cks = context.cookies()
+        except Exception as e:
+            logger.warning(f"[浏览器仿真] 读取 Cookie 失败({tag})：{e}")
+            return {}
+        desc = [f"{c.get('name')}@{c.get('domain')}{'(HttpOnly)' if c.get('httpOnly') else ''}"
+                for c in (cks or [])]
+        logger.info(f"[浏览器仿真] {tag} 浏览器 Cookie：{desc}")
+        collected = {}
+        for c in cks or []:
+            if "nodeseek.com" in (c.get("domain") or "") and c.get("name"):
+                collected[c.get("name")] = c.get("value")
+        return collected
+
     def __browser_login(self, user: str, password: str, token: str) -> Tuple[Optional[str], str]:
         """使用 MoviePilot 内置 CloakBrowser 真实浏览器登录。
 
@@ -287,20 +304,50 @@ class NodeSeekSignin(_PluginBase):
                 if status and status != 200:
                     return None, f"登录接口返回 HTTP {status}（可能被 Cloudflare 拦截或验证码无效）"
                 return None, f"登录接口拒绝：{data.get('message')}"
-            # 从浏览器 cookie 仓库读取站点会话 Cookie
+
+            # 诊断：登录 fetch 后（导航前）的 cookie 仓库
+            self.__read_browser_cookies(context, "登录后(导航前)")
             try:
-                all_cookies = context.cookies()
+                doc_cookie = page.evaluate("() => document.cookie")
+                logger.info(f"[浏览器仿真] document.cookie：{doc_cookie}")
+            except Exception:
+                pass
+
+            # 以登录态导航一次，促使会话 Cookie 落入浏览器 cookie 仓库
+            try:
+                page.goto("https://www.nodeseek.com/board")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=60 * 1000)
+                except Exception:
+                    pass
             except Exception as e:
-                return None, f"读取浏览器 Cookie 失败：{e}"
-            wanted = {}
-            for c in all_cookies or []:
-                domain = (c.get("domain") or "")
-                if "nodeseek.com" in domain and c.get("name"):
-                    wanted[c.get("name")] = c.get("value")
+                logger.warning(f"[浏览器仿真] 登录后导航异常：{e}")
+
+            # 诊断：在浏览器内（同源、自动带 Cookie）直接签到，验证浏览器会话是否真的有效
+            try:
+                sign_js = """
+                async () => {
+                    const r = await fetch('https://www.nodeseek.com/api/attendance?random=true', {
+                        method: 'POST', credentials: 'include',
+                        headers: {'Content-Type': 'application/json'}, body: '{}'
+                    });
+                    let d = null; try { d = await r.json(); } catch (e) {}
+                    return {status: r.status, data: d};
+                }
+                """
+                sr = page.evaluate(sign_js) or {}
+                logger.info(f"[浏览器仿真] 浏览器内签到测试：HTTP {sr.get('status')}，message={(sr.get('data') or {}).get('message')}")
+            except Exception as e:
+                logger.warning(f"[浏览器仿真] 浏览器内签到测试异常：{e}")
+
+            # 提取全部站点 Cookie（导航/签到后再取一次）
+            wanted = self.__read_browser_cookies(context, "最终")
             if not wanted:
                 return None, "浏览器登录成功但未取到站点 Cookie"
+            if "session" not in wanted:
+                logger.warning("[浏览器仿真] 警告：未捕获到鉴权 Cookie(session)，curl_cffi 签到可能仍失败")
             cookie_string = '; '.join([f"{k}={v}" for k, v in wanted.items()])
-            logger.info(f"[浏览器仿真] 登录成功，获取到 Cookie 字段：{list(wanted.keys())}")
+            logger.info(f"[浏览器仿真] 最终获取到 Cookie 字段：{list(wanted.keys())}")
             return cookie_string, ""
         except Exception as e:
             logger.error(f"[浏览器仿真] 登录异常：{e}")
