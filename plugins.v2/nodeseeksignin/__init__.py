@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "Nodeseek_A.png"
     # 插件版本
-    plugin_version = "1.2.2"
+    plugin_version = "1.2.3"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1043,6 +1043,7 @@ class NodeSeekSignin(_PluginBase):
                 "message": msg,
                 "total_amount": (stats or {}).get("total_amount", 0),
                 "days_count": (stats or {}).get("days_count", 0),
+                "average": (stats or {}).get("average", 0),
             })
 
         # 回写刷新后的 Cookie
@@ -1340,6 +1341,7 @@ class NodeSeekSignin(_PluginBase):
                     {'component': 'td', 'text': str(h.get("message", ""))},
                     {'component': 'td', 'text': str(h.get("total_amount", 0))},
                     {'component': 'td', 'text': str(h.get("days_count", 0))},
+                    {'component': 'td', 'text': str(h.get("average", 0))},
                 ]
             })
 
@@ -1364,6 +1366,7 @@ class NodeSeekSignin(_PluginBase):
                                     {'component': 'th', 'props': {'class': 'text-start'}, 'text': '消息'},
                                     {'component': 'th', 'props': {'class': 'text-start'}, 'text': f'近{self._stats_days}天鸡腿'},
                                     {'component': 'th', 'props': {'class': 'text-start'}, 'text': '签到天数'},
+                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '日均鸡腿'},
                                 ]}
                             ]},
                             {'component': 'tbody', 'content': rows}
