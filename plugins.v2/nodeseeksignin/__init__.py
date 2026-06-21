@@ -30,9 +30,9 @@ class NodeSeekSignin(_PluginBase):
     # 插件描述
     plugin_desc = "NodeSeek 论坛自动签到，支持多账号 Cookie / 账密登录、随机签到、收益统计与通知。"
     # 插件图标
-    plugin_icon = "Nodeseek_A.png"
+    plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png"
     # 插件版本
-    plugin_version = "1.2.3"
+    plugin_version = "1.2.4"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页

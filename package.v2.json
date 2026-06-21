@@ -1,13 +1,14 @@
 {
   "NodeSeekSignin": {
-    "version": "1.2.3",
+    "version": "1.2.4",
     "level": 2,
     "name": "NodeSeek签到",
-    "icon": "Nodeseek_A.png",
+    "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png",
     "description": "NodeSeek 论坛自动签到，支持多账号 Cookie / 账密登录、随机签到、收益统计与通知。",
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v1.2.4": "修复图标不显示：改用指向本仓库的完整图标 URL。",
       "v1.2.3": "签到历史表新增「日均鸡腿」列。",
       "v1.2.2": "更换插件专属图标。",
       "v1.2.1": "说明改为 Cookie 优先、失效才登录刷新；提示首次需填一份有效 Cookie 以绕开邮箱验证。",
