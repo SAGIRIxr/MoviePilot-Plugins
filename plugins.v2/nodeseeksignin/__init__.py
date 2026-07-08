@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png"
     # 插件版本
-    plugin_version = "1.2.4"
+    plugin_version = "1.2.5"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1137,7 +1137,9 @@ class NodeSeekSignin(_PluginBase):
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                                         {'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次', 'color': 'success'}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {'model': 'ns_random', 'label': '随机签到', 'color': 'warning'}}]},
+                                        {'component': 'VSwitch', 'props': {
+                                            'model': 'ns_random', 'label': '随机鸡腿奖励', 'color': 'warning',
+                                            'hint': '开=随机1~11个鸡腿，关=固定5个', 'persistent-hint': True}}]},
                                 ]},
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
@@ -1148,9 +1150,9 @@ class NodeSeekSignin(_PluginBase):
                                             'prepend-inner-icon': 'mdi-clock-outline'}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                                         {'component': 'VTextField', 'props': {
-                                            'model': 'random_delay', 'label': '随机延迟(分钟)', 'type': 'number',
+                                            'model': 'random_delay', 'label': '签到时间随机延迟(分钟)', 'type': 'number',
                                             'placeholder': '0=关闭', 'prepend-inner-icon': 'mdi-timer-sand',
-                                            'hint': '定时触发后在 0~N 分钟内随机延迟', 'persistent-hint': True}}]},
+                                            'hint': '定时触发后随机延迟0~N分钟再签到，时间不固定', 'persistent-hint': True}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
                                         {'component': 'VTextField', 'props': {
                                             'model': 'stats_days', 'label': '收益统计周期(天)', 'type': 'number',
