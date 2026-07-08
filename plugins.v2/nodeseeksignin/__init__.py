@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png"
     # 插件版本
-    plugin_version = "1.2.5"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -256,10 +256,18 @@ class NodeSeekSignin(_PluginBase):
                     api_base_url=self._api_base_url or "https://api.yescaptcha.com",
                     client_key=self._client_key,
                 )
+            elif self._solver_type.lower() in ("2captcha", "twocaptcha"):
+                # 2Captcha 新版 API 与 YesCaptcha 同为 anti-captcha 协议，复用同一解决器
+                logger.info(f"正在使用 2Captcha 解决验证码（节点：{self._api_base_url or 'https://api.2captcha.com'}）...")
+                solver = YesCaptchaSolver(
+                    api_base_url=self._api_base_url or "https://api.2captcha.com",
+                    client_key=self._client_key,
+                    soft_id=None,
+                )
             else:
                 logger.info("正在使用 TurnstileSolver 解决验证码...")
                 if not self._api_base_url:
-                    return None, "验证码服务选择了 turnstile 但未填 API_BASE_URL（需自建 CloudFreed）；有 YesCaptcha 密钥请把服务改为 yescaptcha"
+                    return None, "验证码服务选择了 turnstile 但未填 API_BASE_URL（需自建 CloudFreed）；有 YesCaptcha / 2Captcha 密钥请把服务改为对应平台"
                 solver = TurnstileSolver(
                     api_base_url=self._api_base_url,
                     client_key=self._client_key,
@@ -1210,11 +1218,12 @@ class NodeSeekSignin(_PluginBase):
                                             'items': [
                                                 {'title': 'TurnstileSolver（CloudFreed 自建/免费）', 'value': 'turnstile'},
                                                 {'title': 'YesCaptcha（商业）', 'value': 'yescaptcha'},
+                                                {'title': '2Captcha（商业）', 'value': '2captcha'},
                                             ]}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
                                         {'component': 'VTextField', 'props': {
                                             'model': 'api_base_url', 'label': 'API_BASE_URL',
-                                            'placeholder': 'CloudFreed 地址，YesCaptcha 可留空',
+                                            'placeholder': 'CloudFreed 地址，YesCaptcha/2Captcha 可留空',
                                             'prepend-inner-icon': 'mdi-link', 'clearable': True}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
                                         {'component': 'VTextField', 'props': {
@@ -1280,7 +1289,7 @@ class NodeSeekSignin(_PluginBase):
                                     'text': 'Gmail 的 IMAP 授权码：开启两步验证后在「应用专用密码」生成 16 位密码填入；其它邮箱填对应 IMAP 授权码并改 IMAP 服务器地址。账密登录始终被邮箱验证拦住时，可配置邮箱验证码登录作为兜底。'}},
                                 {'component': 'VAlert', 'props': {
                                     'type': 'warning', 'variant': 'tonal',
-                                    'text': '也可只填 Cookie 手动签到（浏览器登录 nodeseek.com 后复制整段 Cookie，多账号用 & 或换行分隔）。验证码服务：YesCaptcha 填 CLIENTT_KEY 即可；TurnstileSolver 需自建 CloudFreed 并填 API_BASE_URL。'}},
+                                    'text': '也可只填 Cookie 手动签到（浏览器登录 nodeseek.com 后复制整段 Cookie，多账号用 & 或换行分隔）。验证码服务：YesCaptcha / 2Captcha 填 CLIENTT_KEY 即可；TurnstileSolver 需自建 CloudFreed 并填 API_BASE_URL。'}},
                             ]}
                         ]
                     }

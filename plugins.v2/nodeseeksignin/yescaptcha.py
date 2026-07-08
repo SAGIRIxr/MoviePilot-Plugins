@@ -9,24 +9,27 @@ class YesCaptchaSolverError(Exception):
 
 class YesCaptchaSolver:
     """
-    YesCaptcha 验证码解决工具
-    
-    使用 YesCaptcha API 解决 Turnstile 验证码，获取验证令牌
+    YesCaptcha / 2Captcha 验证码解决工具
+
+    使用 anti-captcha 风格 API（createTask/getTaskResult）解决 Turnstile 验证码，获取验证令牌。
+    YesCaptcha 与 2Captcha 新版 API 协议一致，均可使用本类。
     参考文档: https://yescaptcha.atlassian.net/wiki/spaces/YESCAPTCHA/overview
+             https://2captcha.com/api-docs
     """
-    
+
     def __init__(
-        self, 
+        self,
         api_base_url: str = "https://api.yescaptcha.com",
         client_key: str = "",
         max_retries: int = 20,
         retry_interval: int = 3,
         timeout: int = 60,
-        advanced: bool = False
+        advanced: bool = False,
+        soft_id: Optional[str] = "62709"
     ):
         """
-        初始化 YesCaptcha 验证码解决器
-        
+        初始化验证码解决器
+
         参数:
             api_base_url: API 基础 URL，默认为 YesCaptcha 国际节点
             client_key: API 客户端密钥
@@ -34,6 +37,7 @@ class YesCaptchaSolver:
             retry_interval: 重试间隔(秒)
             timeout: 请求超时时间(秒)
             advanced: 是否使用高级解析模式(M1)
+            soft_id: YesCaptcha 软件ID（2Captcha 等其它平台传 None 省略该字段）
         """
         self.api_base_url = api_base_url
         self.create_task_url = f"{api_base_url}/createTask"
@@ -43,6 +47,7 @@ class YesCaptchaSolver:
         self.retry_interval = retry_interval
         self.timeout = timeout
         self.advanced = advanced
+        self.soft_id = soft_id
     
     def solve(
         self,
@@ -102,8 +107,9 @@ class YesCaptchaSolver:
                 "websiteURL": url,
                 "websiteKey": sitekey
             },
-            "softID": "62709",
         }
+        if self.soft_id:
+            data["softID"] = self.soft_id
         
         # 如果需要添加用户代理
         if user_agent:

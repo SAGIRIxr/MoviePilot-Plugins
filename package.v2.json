@@ -1,6 +1,6 @@
 {
   "NodeSeekSignin": {
-    "version": "1.2.5",
+    "version": "1.3.0",
     "level": 2,
     "name": "NodeSeek签到",
     "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png",
@@ -8,6 +8,7 @@
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v1.3.0": "新增 2Captcha 验证码服务支持。",
       "v1.2.5": "「随机签到」更名为「随机鸡腿奖励」，与「签到时间随机延迟」区分，消除歧义。",
       "v1.2.4": "修复图标不显示：改用指向本仓库的完整图标 URL。",
       "v1.2.3": "签到历史表新增「日均鸡腿」列。",
