@@ -1,6 +1,6 @@
 {
   "DiscordMsgForward": {
-    "version": "4.0.1",
+    "version": "4.1.0",
     "level": 1,
     "name": "Discord消息转发",
     "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/DiscordForward_A.png",
@@ -9,6 +9,7 @@
     "authorUrl": "https://github.com/SAGIRIxr",
     "system_version": ">=2.12.0",
     "history": {
+      "v4.1.0": "补齐更多消息形态：贴纸、投票消息可提取转发；限流(429)给出明确提示；规则弹窗支持手动添加频道ID（线程/论坛帖子等下拉列表没有的频道）。",
       "v4.0.1": "修复 Discord「转发（Forward）」类消息不转发的问题：正文/Embed/图片改为同时从 message_snapshots 提取；无内容与被过滤的消息补充日志。",
       "v4.0.0": "全新 Vue 卡片界面：转发规则改为卡片式管理（添加/编辑/删除/独立启停），每条规则独立配置监听频道、转发渠道、过滤、模板与免打扰时段；详情页新增运行状态、立即检查与历史管理；同频道多规则只拉取一次消息。",
       "v3.0.0": "通用化重构：监听频道支持自动拉取+下拉多选（保存 Token 后自动加载），保留手动/高级规则；新增屏蔽词黑名单、作者白/黑名单、免打扰时段（暂存后汇总推送）、连续失败告警；通知附带跳转链接直达 Discord 原消息；配置页重组更易上手。",

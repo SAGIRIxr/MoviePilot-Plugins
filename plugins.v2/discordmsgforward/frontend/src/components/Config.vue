@@ -59,6 +59,21 @@ const editRule = ref(defaultRule())
 const deleteDialog = ref(false)
 const deleteIndex = ref(-1)
 
+// 手动添加频道 ID
+const manualChannel = ref('')
+
+function addManualChannel() {
+  const cid = manualChannel.value.trim()
+  if (!/^\d{5,}$/.test(cid)) {
+    showMessage('频道 ID 应为纯数字', 'error')
+    return
+  }
+  if (!editRule.value.channels.includes(cid)) {
+    editRule.value.channels.push(cid)
+  }
+  manualChannel.value = ''
+}
+
 const channelNameMap = computed(() => {
   const map = {}
   channelOptions.value.forEach(o => { map[o.value] = o.title })
@@ -349,6 +364,18 @@ onMounted(() => {
                 density="compact" variant="outlined" prepend-inner-icon="mdi-pound"
                 :loading="loadingChannels"
                 no-data-text="暂无频道：请先在全局设置填写 Token 并保存，或点击「刷新频道列表」"
+              />
+            </v-col>
+          </v-row>
+          <v-row dense>
+            <v-col cols="12">
+              <v-text-field
+                v-model="manualChannel" label="手动添加频道 ID（可选）"
+                placeholder="下拉列表没有的频道（如线程/论坛帖子）填 ID 后点 + 添加"
+                density="compact" variant="outlined" prepend-inner-icon="mdi-pound-box"
+                append-inner-icon="mdi-plus-circle" hide-details
+                @click:append-inner="addManualChannel"
+                @keyup.enter="addManualChannel"
               />
             </v-col>
           </v-row>

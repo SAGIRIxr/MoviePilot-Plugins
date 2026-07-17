@@ -59,7 +59,7 @@ class DiscordMsgForward(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/DiscordForward_A.png"
     # 插件版本
-    plugin_version = "4.0.1"
+    plugin_version = "4.1.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -206,6 +206,19 @@ class DiscordMsgForward(_PluginBase):
             url = att.get("url")
             if url and not DiscordMsgForward.__is_image_attachment(att):
                 parts.append(f"[附件] {url}")
+        # 贴纸消息
+        for sticker in msg.get("sticker_items") or []:
+            name = (sticker.get("name") or "").strip()
+            if name:
+                parts.append(f"[贴纸] {name}")
+        # 投票消息
+        poll = msg.get("poll") or {}
+        question = ((poll.get("question") or {}).get("text") or "").strip()
+        if question:
+            answers = [((a.get("poll_media") or {}).get("text") or "").strip()
+                       for a in poll.get("answers") or []]
+            answers = [a for a in answers if a]
+            parts.append(f"[投票] {question}" + (f"\n选项：{' / '.join(answers)}" if answers else ""))
         # Discord「转发」消息：正文/Embed/附件在 message_snapshots 里
         for snap in msg.get("message_snapshots") or []:
             sub = DiscordMsgForward.__extract_text(snap.get("message") or {})
@@ -480,6 +493,7 @@ class DiscordMsgForward(_PluginBase):
             401: "Token 无效，请检查 Bot Token",
             403: "Bot 无权限访问该频道（需要「查看频道」和「阅读消息历史」权限）",
             404: "频道不存在，请检查频道 ID",
+            429: "请求过于频繁被 Discord 限流，可适当调大轮询间隔，下次轮询会自动重试",
         }
         hint = hints.get(resp.status_code, resp.text[:200] if resp.text else "")
         error = f"频道 [{cname}]({cid}) API 请求失败: HTTP {resp.status_code} {hint}"
