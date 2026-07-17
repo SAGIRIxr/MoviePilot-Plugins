@@ -1,4 +1,17 @@
 {
+  "DiscordMsgForward": {
+    "version": "1.0.0",
+    "level": 1,
+    "name": "Discord消息转发",
+    "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/DiscordForward_A.png",
+    "description": "轮询 Discord 频道新消息并通过 MoviePilot 通知渠道转发（微信/TG等），支持关键词过滤与兑换码提取，适合游戏礼包码频道。",
+    "author": "SAGIRIxr",
+    "authorUrl": "https://github.com/SAGIRIxr",
+    "history": {
+      "v1.0.0": "首个版本：Bot Token 轮询多频道新消息，转发到 MP 通知渠道；支持关键词过滤、兑换码正则提取、系统代理与转发历史。"
+    },
+    "labels": "通知"
+  },
   "NodeSeekSignin": {
     "version": "1.4.0",
     "level": 2,
