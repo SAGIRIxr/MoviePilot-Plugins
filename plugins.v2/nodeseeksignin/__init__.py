@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import random
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -31,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -56,6 +57,8 @@ class NodeSeekSignin(_PluginBase):
     _ns_random = True
     # 随机延迟（分钟）：定时触发时先随机延迟 0~N 分钟再签到，0 为关闭
     _random_delay = 0
+    # 多账号随机间隔（秒）：每个账号签完后随机等待 1~N 秒再签下一个，0 为关闭
+    _account_delay = 0
     # SOLVER_TYPE：yescaptcha / 2captcha
     _solver_type = "yescaptcha"
     # API_BASE_URL（自定义验证码服务节点，留空用官方）
@@ -108,6 +111,7 @@ class NodeSeekSignin(_PluginBase):
             self._accounts = config.get("accounts") or ""
             self._ns_random = config.get("ns_random") if config.get("ns_random") is not None else True
             self._random_delay = int(config.get("random_delay") or 0)
+            self._account_delay = int(config.get("account_delay") or 0)
             self._solver_type = (config.get("solver_type") or "yescaptcha").strip()
             self._api_base_url = (config.get("api_base_url") or "").strip()
             self._client_key = (config.get("client_key") or "").strip()
@@ -142,6 +146,7 @@ class NodeSeekSignin(_PluginBase):
             "accounts": self._accounts,
             "ns_random": self._ns_random,
             "random_delay": self._random_delay,
+            "account_delay": self._account_delay,
             "solver_type": self._solver_type,
             "api_base_url": self._api_base_url,
             "client_key": self._client_key,
@@ -683,7 +688,6 @@ class NodeSeekSignin(_PluginBase):
         """执行 NodeSeek 签到主流程。manual=True 为手动「立即运行」，不做随机延迟。"""
         # 随机延迟：定时触发时在 0~N 分钟内浮动，避免每天固定时刻签到
         if not manual and self._random_delay and self._random_delay > 0:
-            import random
             delay = random.randint(0, int(self._random_delay) * 60)
             if delay > 0:
                 logger.info(f"随机延迟 {delay} 秒（{round(delay / 60, 1)} 分钟）后开始签到...")
@@ -717,6 +721,13 @@ class NodeSeekSignin(_PluginBase):
             password = accounts[i]["password"]
             cookie = cookie_list[i]
             display_user = user if user else f"账号{account_index}"
+
+            # 多账号随机间隔：签完上一个账号后随机等待 1~N 秒再签下一个
+            if i > 0 and self._account_delay and self._account_delay > 0:
+                gap = random.randint(1, int(self._account_delay))
+                logger.info(f"多账号随机间隔，等待 {gap} 秒后签下一个账号...")
+                time.sleep(gap)
+
             logger.info(f"==== 账号 {display_user} 开始签到 ====")
 
             stats = None
@@ -896,6 +907,13 @@ class NodeSeekSignin(_PluginBase):
                                             'model': 'stats_days', 'label': '收益统计周期(天)', 'type': 'number',
                                             'placeholder': '30', 'prepend-inner-icon': 'mdi-chart-line'}}]},
                                 ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VTextField', 'props': {
+                                            'model': 'account_delay', 'label': '多账号随机间隔(秒)', 'type': 'number',
+                                            'placeholder': '0=关闭', 'prepend-inner-icon': 'mdi-account-clock',
+                                            'hint': '签完一个账号后随机等1~N秒再签下一个', 'persistent-hint': True}}]},
+                                ]},
                             ]}
                         ]
                     },
@@ -1006,6 +1024,7 @@ class NodeSeekSignin(_PluginBase):
             "notify": True,
             "ns_random": True,
             "random_delay": 0,
+            "account_delay": 0,
             "use_proxy": False,
             "cron": "0 8 * * *",
             "cookie": "",

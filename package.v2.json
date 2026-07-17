@@ -17,7 +17,7 @@
     "labels": "通知"
   },
   "NodeSeekSignin": {
-    "version": "1.4.1",
+    "version": "1.5.0",
     "system_version": ">=2.12.0",
     "level": 2,
     "name": "NodeSeek签到",
@@ -26,6 +26,7 @@
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v1.5.0": "新增多账号随机间隔：每签完一个账号随机等待 1~N 秒再签下一个。",
       "v1.4.1": "限定 MoviePilot ≥ 2.12.0；精简说明页，突出首次 Cookie 提醒并加 YesCaptcha 领取入口。",
       "v1.4.0": "移除邮箱验证码登录与 CloudFreed 支持；验证码 API 支持系统代理。",
       "v1.3.0": "新增 2Captcha 验证码服务支持。",
