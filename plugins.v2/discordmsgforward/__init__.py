@@ -59,7 +59,7 @@ class DiscordMsgForward(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/DiscordForward_A.png"
     # 插件版本
-    plugin_version = "4.0.0"
+    plugin_version = "4.0.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -206,6 +206,11 @@ class DiscordMsgForward(_PluginBase):
             url = att.get("url")
             if url and not DiscordMsgForward.__is_image_attachment(att):
                 parts.append(f"[附件] {url}")
+        # Discord「转发」消息：正文/Embed/附件在 message_snapshots 里
+        for snap in msg.get("message_snapshots") or []:
+            sub = DiscordMsgForward.__extract_text(snap.get("message") or {})
+            if sub:
+                parts.append(sub)
         return "\n".join(parts)
 
     @staticmethod
@@ -226,6 +231,11 @@ class DiscordMsgForward(_PluginBase):
                 url = (embed.get(key) or {}).get("url")
                 if url:
                     return url
+        # Discord「转发」消息：图片在 message_snapshots 里
+        for snap in msg.get("message_snapshots") or []:
+            url = DiscordMsgForward.__extract_image(snap.get("message") or {})
+            if url:
+                return url
         return None
 
     def __pass_filters(self, rule: dict, text: str, author: str) -> bool:
@@ -388,6 +398,7 @@ class DiscordMsgForward(_PluginBase):
                     text = self.__extract_text(msg)
                     image = self.__extract_image(msg)
                     if not text and not image:
+                        logger.info(f"频道 [{cname}] 消息 {msg.get('id')} 无可提取内容（type={msg.get('type')}），跳过")
                         continue
                     raw_items.append({
                         "text": text or "[图片]",
@@ -404,6 +415,7 @@ class DiscordMsgForward(_PluginBase):
                     items = []
                     for raw in raw_items:
                         if not self.__pass_filters(rule, raw["text"], raw["author"]):
+                            logger.info(f"规则 [{rule.get('name')}] 频道 [{cname}] 消息被过滤规则拦截，跳过")
                             continue
                         items.append({
                             **raw,
