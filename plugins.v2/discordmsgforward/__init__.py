@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import re
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Tuple, Optional
 
@@ -30,16 +31,35 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 # 连续失败多少次后告警
 FAIL_ALERT_THRESHOLD = 3
 
+# 规则默认值
+RULE_DEFAULTS = {
+    "id": "",
+    "name": "",
+    "enabled": True,
+    "channels": [],           # 监听频道 ID 列表
+    "notify_channels": [],    # 转发渠道，空=全部
+    "keywords": "",
+    "blocked_keywords": "",
+    "author_include": "",
+    "author_exclude": "",
+    "code_regex": "",
+    "aggregate": True,
+    "forward_image": True,
+    "quiet_hours": "",
+    "title_template": "",
+    "text_template": "",
+}
+
 
 class DiscordMsgForward(_PluginBase):
     # 插件名称
     plugin_name = "Discord消息转发"
     # 插件描述
-    plugin_desc = "将 Discord 频道新消息转发到指定通知渠道（可多选），支持频道下拉选择、关键词/作者/屏蔽词过滤、图片转发、消息聚合、免打扰时段、自定义模板与失败告警。"
+    plugin_desc = "将 Discord 频道新消息按规则转发到指定通知渠道：规则卡片式管理，每条规则独立配置频道、渠道、过滤、模板与免打扰时段。"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/DiscordForward_A.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "4.0.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -53,45 +73,20 @@ class DiscordMsgForward(_PluginBase):
 
     # ---------------- 私有属性 ----------------
     _enabled = False
-    _onlyonce = False
     # Bot Token
     _token = ""
-    # 下拉选择的频道 ID 列表
-    _channel_ids: List[str] = []
-    # 手动/高级频道规则：每行 频道ID#备注#关键词#转发渠道
-    _channels = ""
     # 轮询间隔（分钟）
     _interval = 5
-    # 全局转发渠道（多选，空=全部启用的渠道）
-    _notify_channels: List[str] = []
-    # 全局关键词过滤（白名单）：多个用逗号分隔，留空转发全部
-    _keywords = ""
-    # 屏蔽词（黑名单）：命中任一屏蔽词不转发
-    _blocked_keywords = ""
-    # 只转发这些作者（留空不限制）
-    _author_include = ""
-    # 屏蔽这些作者
-    _author_exclude = ""
-    # 内容提取正则（如礼包码，可选）
-    _code_regex = ""
     # 通知类型
     _msgtype = "Plugin"
-    # 消息聚合：一次轮询的多条消息合并为一条通知
-    _aggregate = True
-    # 图片转发
-    _forward_image = True
     # 失败告警
     _fail_alert = True
-    # 免打扰时段，如 23:00-08:00，留空不启用
-    _quiet_hours = ""
-    # 通知标题模板
-    _title_template = DEFAULT_TITLE_TEMPLATE
-    # 通知内容模板
-    _text_template = DEFAULT_TEXT_TEMPLATE
     # 是否使用系统代理
     _use_proxy = True
     # 历史记录保留天数
     _history_days = 30
+    # 转发规则列表
+    _rules: List[dict] = []
 
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
@@ -102,70 +97,29 @@ class DiscordMsgForward(_PluginBase):
 
         if config:
             self._enabled = config.get("enabled") or False
-            self._onlyonce = config.get("onlyonce") or False
             self._token = (config.get("token") or "").strip()
-            self._channel_ids = config.get("channel_ids") or []
-            self._channels = config.get("channels") or ""
             self._interval = int(config.get("interval") or 5)
-            self._notify_channels = config.get("notify_channels") or []
-            self._keywords = (config.get("keywords") or "").strip()
-            self._blocked_keywords = (config.get("blocked_keywords") or "").strip()
-            self._author_include = (config.get("author_include") or "").strip()
-            self._author_exclude = (config.get("author_exclude") or "").strip()
-            self._code_regex = (config.get("code_regex") or "").strip()
             self._msgtype = config.get("msgtype") or "Plugin"
-            self._aggregate = config.get("aggregate") if config.get("aggregate") is not None else True
-            self._forward_image = config.get("forward_image") if config.get("forward_image") is not None else True
             self._fail_alert = config.get("fail_alert") if config.get("fail_alert") is not None else True
-            self._quiet_hours = (config.get("quiet_hours") or "").strip()
-            self._title_template = config.get("title_template") or DEFAULT_TITLE_TEMPLATE
-            self._text_template = config.get("text_template") or DEFAULT_TEXT_TEMPLATE
             self._use_proxy = config.get("use_proxy") if config.get("use_proxy") is not None else True
             self._history_days = int(config.get("history_days") or 30)
+            self._rules = [self.__norm_rule(r) for r in (config.get("rules") or [])]
 
-        # 保存配置后：后台刷新频道列表；如勾选则立即运行一次
-        if self._token or self._onlyonce:
+        # 保存配置后：后台刷新频道列表缓存
+        if self._token:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            now = datetime.now(tz=pytz.timezone(settings.TZ))
-            if self._token:
-                self._scheduler.add_job(func=self.refresh_channel_options, trigger='date',
-                                        run_date=now + timedelta(seconds=3),
-                                        name="刷新Discord频道列表")
-            if self._onlyonce:
-                logger.info("Discord消息转发服务启动，立即运行一次")
-                self._scheduler.add_job(func=self.check_messages, trigger='date',
-                                        run_date=now + timedelta(seconds=8),
-                                        name="Discord消息转发")
-                self._onlyonce = False
-                self.__update_config()
-            if self._scheduler.get_jobs():
-                self._scheduler.start()
+            self._scheduler.add_job(func=self.refresh_channel_options, trigger='date',
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                    name="刷新Discord频道列表")
+            self._scheduler.start()
 
-    def __update_config(self):
-        """将当前配置写回插件配置（用于重置 onlyonce）"""
-        self.update_config({
-            "enabled": self._enabled,
-            "onlyonce": self._onlyonce,
-            "token": self._token,
-            "channel_ids": self._channel_ids,
-            "channels": self._channels,
-            "interval": self._interval,
-            "notify_channels": self._notify_channels,
-            "keywords": self._keywords,
-            "blocked_keywords": self._blocked_keywords,
-            "author_include": self._author_include,
-            "author_exclude": self._author_exclude,
-            "code_regex": self._code_regex,
-            "msgtype": self._msgtype,
-            "aggregate": self._aggregate,
-            "forward_image": self._forward_image,
-            "fail_alert": self._fail_alert,
-            "quiet_hours": self._quiet_hours,
-            "title_template": self._title_template,
-            "text_template": self._text_template,
-            "use_proxy": self._use_proxy,
-            "history_days": self._history_days,
-        })
+    @staticmethod
+    def __norm_rule(rule: dict) -> dict:
+        """补齐规则默认字段"""
+        merged = {**RULE_DEFAULTS, **(rule or {})}
+        if not merged.get("id"):
+            merged["id"] = uuid.uuid4().hex[:8]
+        return merged
 
     # ---------------- 工具方法 ----------------
     def __get_proxies(self):
@@ -192,7 +146,7 @@ class DiscordMsgForward(_PluginBase):
             f"{DISCORD_API}{path}",
             headers={
                 "Authorization": f"Bot {self._token}",
-                "User-Agent": "DiscordBot (MoviePilot-Plugin-DiscordMsgForward, 3.0)",
+                "User-Agent": "DiscordBot (MoviePilot-Plugin-DiscordMsgForward, 4.0)",
             },
             params=params,
             proxies=self.__get_proxies(),
@@ -200,15 +154,15 @@ class DiscordMsgForward(_PluginBase):
         )
         return resp
 
-    def refresh_channel_options(self):
-        """拉取 Bot 可见的服务器与频道，缓存供配置页下拉选择"""
+    def refresh_channel_options(self) -> List[dict]:
+        """拉取 Bot 可见的服务器与频道，缓存供前端下拉选择"""
         if not self._token:
-            return
+            return []
         try:
             resp = self.__api_get("/users/@me/guilds")
             if resp.status_code != 200:
                 logger.error(f"获取 Discord 服务器列表失败: HTTP {resp.status_code}")
-                return
+                return self.get_data("channel_options") or []
             options = []
             meta: Dict[str, dict] = self.get_data("channel_meta") or {}
             for guild in resp.json():
@@ -225,40 +179,11 @@ class DiscordMsgForward(_PluginBase):
                         meta[ch.get("id")] = {"guild_id": gid, "name": name}
             self.save_data("channel_options", options)
             self.save_data("channel_meta", meta)
-            logger.info(f"已刷新 Discord 频道列表，共 {len(options)} 个文字/公告频道，重新打开配置页即可选择")
+            logger.info(f"已刷新 Discord 频道列表，共 {len(options)} 个文字/公告频道")
+            return options
         except Exception as e:
             logger.error(f"刷新 Discord 频道列表异常: {e}")
-
-    def __parse_channels(self) -> List[dict]:
-        """
-        合并「下拉选择的频道」与「手动/高级规则」。
-        手动行格式：频道ID#备注#关键词#转发渠道（后三段可省略，多值用 | 分隔）；
-        同一频道 ID 手动行的规则优先。
-        """
-        meta: Dict[str, dict] = self.get_data("channel_meta") or {}
-        channels: Dict[str, dict] = {}
-        for cid in self._channel_ids or []:
-            channels[cid] = {
-                "id": cid,
-                "name": (meta.get(cid) or {}).get("name") or cid,
-                "keywords": None,
-                "notify_channels": None,
-            }
-        for line in (self._channels or "").splitlines():
-            line = line.strip()
-            if not line or line.startswith("//"):
-                continue
-            parts = [p.strip() for p in line.split("#")]
-            cid = parts[0]
-            if not cid:
-                continue
-            channels[cid] = {
-                "id": cid,
-                "name": (parts[1] if len(parts) > 1 else "") or (meta.get(cid) or {}).get("name") or cid,
-                "keywords": self.__split_multi(parts[2]) if len(parts) > 2 else None,
-                "notify_channels": self.__split_multi(parts[3]) if len(parts) > 3 else None,
-            }
-        return list(channels.values())
+            return self.get_data("channel_options") or []
 
     @staticmethod
     def __extract_text(msg: dict) -> str:
@@ -303,30 +228,30 @@ class DiscordMsgForward(_PluginBase):
                     return url
         return None
 
-    def __pass_filters(self, text: str, author: str, keywords: Optional[List[str]]) -> bool:
+    def __pass_filters(self, rule: dict, text: str, author: str) -> bool:
         """按顺序检查：作者白名单 → 作者黑名单 → 屏蔽词 → 关键词白名单"""
-        include_authors = [a.lower() for a in self.__split_multi(self._author_include)]
+        include_authors = [a.lower() for a in self.__split_multi(rule.get("author_include"))]
         if include_authors and author.lower() not in include_authors:
             return False
-        exclude_authors = [a.lower() for a in self.__split_multi(self._author_exclude)]
+        exclude_authors = [a.lower() for a in self.__split_multi(rule.get("author_exclude"))]
         if exclude_authors and author.lower() in exclude_authors:
             return False
         text_lower = text.lower()
-        for blocked in self.__split_multi(self._blocked_keywords):
+        for blocked in self.__split_multi(rule.get("blocked_keywords")):
             if blocked.lower() in text_lower:
                 return False
-        if keywords is None:
-            keywords = self.__split_multi(self._keywords)
+        keywords = self.__split_multi(rule.get("keywords"))
         if keywords and not any(kw.lower() in text_lower for kw in keywords):
             return False
         return True
 
-    def __extract_codes(self, text: str) -> List[str]:
-        """按配置的正则提取内容（如礼包码）"""
-        if not self._code_regex or not text:
+    @staticmethod
+    def __extract_codes(regex: str, text: str) -> List[str]:
+        """按规则正则提取内容（如礼包码）"""
+        if not regex or not text:
             return []
         try:
-            codes = re.findall(self._code_regex, text)
+            codes = re.findall(regex, text)
             # 正则含分组时 findall 返回元组
             result = []
             for c in codes:
@@ -347,7 +272,8 @@ class DiscordMsgForward(_PluginBase):
         except Exception:
             return iso_time or ""
 
-    def __render_template(self, template: str, variables: Dict[str, Any]) -> str:
+    @staticmethod
+    def __render_template(template: str, variables: Dict[str, Any]) -> str:
         """
         渲染消息模板。支持变量：{channel} {author} {content} {codes} {time} {count}
         提取内容为空时自动去掉包含 {codes} 的整行；{content} 最后替换，避免正文里的花括号被二次替换。
@@ -361,13 +287,14 @@ class DiscordMsgForward(_PluginBase):
         # 清理多余空行
         return re.sub(r"\n{3,}", "\n\n", template).strip()
 
-    def __in_quiet_hours(self) -> bool:
+    @staticmethod
+    def __in_quiet_hours(quiet_hours: str) -> bool:
         """判断当前是否处于免打扰时段（支持跨零点，如 23:00-08:00）"""
-        if not self._quiet_hours:
+        if not quiet_hours:
             return False
-        m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", self._quiet_hours)
+        m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", quiet_hours.strip())
         if not m:
-            logger.warning(f"免打扰时段格式无效（应为 23:00-08:00）：{self._quiet_hours}")
+            logger.warning(f"免打扰时段格式无效（应为 23:00-08:00）：{quiet_hours}")
             return False
         now = datetime.now(tz=pytz.timezone(settings.TZ)).time()
         start = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
@@ -394,20 +321,27 @@ class DiscordMsgForward(_PluginBase):
 
     # ---------------- 核心逻辑 ----------------
     def check_messages(self):
-        """轮询所有配置频道的新消息并转发"""
+        """轮询所有规则涉及的频道，按规则分发转发"""
         if not self._token:
             logger.error("未配置 Discord Bot Token")
             return
-        channels = self.__parse_channels()
-        if not channels:
-            logger.error("未配置 Discord 频道")
+        rules = [r for r in self._rules if r.get("enabled")]
+        if not rules:
+            logger.info("没有启用中的转发规则")
             return
 
-        quiet = self.__in_quiet_hours()
+        # 收集所有频道及监听它们的规则（同频道只拉取一次）
+        channel_rules: Dict[str, List[dict]] = {}
+        for rule in rules:
+            for cid in rule.get("channels") or []:
+                channel_rules.setdefault(cid, []).append(rule)
+        if not channel_rules:
+            logger.info("启用中的规则均未配置频道")
+            return
+
         history_items: List[dict] = []
-        # 免打扰时段结束后先冲刷暂存消息
-        if not quiet:
-            history_items.extend(self.__flush_pending())
+        # 先冲刷已结束免打扰时段的暂存消息
+        history_items.extend(self.__flush_pending())
 
         last_ids: Dict[str, str] = self.get_data("last_ids") or {}
         meta: Dict[str, dict] = self.get_data("channel_meta") or {}
@@ -416,12 +350,12 @@ class DiscordMsgForward(_PluginBase):
         fail_count = 0
         last_error = ""
 
-        for channel in channels:
-            cid, cname = channel["id"], channel["name"]
+        for cid, watchers in channel_rules.items():
+            cname = (meta.get(cid) or {}).get("name") or cid
             try:
                 last_id = last_ids.get(cid)
                 if not last_id:
-                    # 首次运行：只记录基线，不转发历史消息
+                    # 首次监听该频道：只记录基线，不转发历史消息
                     resp = self.__api_get(f"/channels/{cid}/messages", params={"limit": 1})
                     if resp.status_code != 200:
                         fail_count += 1
@@ -430,7 +364,7 @@ class DiscordMsgForward(_PluginBase):
                     msgs = resp.json()
                     last_ids[cid] = msgs[0]["id"] if msgs else "0"
                     success_count += 1
-                    logger.info(f"频道 [{cname}] 首次运行，已记录基线消息ID：{last_ids[cid]}，此后的新消息才会转发")
+                    logger.info(f"频道 [{cname}] 首次监听，已记录基线消息ID：{last_ids[cid]}，此后的新消息才会转发")
                     continue
 
                 resp = self.__api_get(f"/channels/{cid}/messages",
@@ -448,43 +382,46 @@ class DiscordMsgForward(_PluginBase):
                 last_ids[cid] = msgs[-1]["id"]
                 guild_id = self.__get_guild_id(cid, meta)
 
-                # 提取并过滤
-                items = []
+                # 预提取消息内容，再按各规则分发
+                raw_items = []
                 for msg in msgs:
                     text = self.__extract_text(msg)
-                    image = self.__extract_image(msg) if self._forward_image else None
+                    image = self.__extract_image(msg)
                     if not text and not image:
                         continue
-                    author = (msg.get("author") or {}).get("username") or "未知"
-                    if not self.__pass_filters(text, author, channel["keywords"]):
-                        logger.info(f"频道 [{cname}] 消息被过滤规则拦截，跳过")
-                        continue
-                    link = (f"https://discord.com/channels/{guild_id}/{cid}/{msg['id']}"
-                            if guild_id else None)
-                    items.append({
+                    raw_items.append({
                         "text": text or "[图片]",
-                        "author": author,
+                        "author": (msg.get("author") or {}).get("username") or "未知",
                         "time": self.__format_time(msg.get("timestamp")),
                         "image": image,
-                        "codes": self.__extract_codes(text),
-                        "link": link,
+                        "link": (f"https://discord.com/channels/{guild_id}/{cid}/{msg['id']}"
+                                 if guild_id else None),
                     })
-                if not items:
+                if not raw_items:
                     continue
 
-                targets = channel["notify_channels"] or self._notify_channels
-                if quiet:
-                    # 免打扰时段：暂存，时段结束后汇总推送
-                    for item in items:
-                        pending.append({**item, "cname": cname, "targets": targets})
-                    logger.info(f"频道 [{cname}] 处于免打扰时段，{len(items)} 条消息已暂存")
-                    continue
-
-                batches = [items] if self._aggregate else [[item] for item in items]
-                for batch in batches:
-                    record = self.__send_batch(cname, batch, targets)
-                    if record:
-                        history_items.append(record)
+                for rule in watchers:
+                    items = []
+                    for raw in raw_items:
+                        if not self.__pass_filters(rule, raw["text"], raw["author"]):
+                            continue
+                        items.append({
+                            **raw,
+                            "image": raw["image"] if rule.get("forward_image") else None,
+                            "codes": self.__extract_codes(rule.get("code_regex"), raw["text"]),
+                        })
+                    if not items:
+                        continue
+                    if self.__in_quiet_hours(rule.get("quiet_hours")):
+                        for item in items:
+                            pending.append({**item, "cname": cname, "rule_id": rule["id"]})
+                        logger.info(f"规则 [{rule.get('name')}] 处于免打扰时段，{len(items)} 条消息已暂存")
+                        continue
+                    batches = [items] if rule.get("aggregate") else [[item] for item in items]
+                    for batch in batches:
+                        record = self.__send_batch(rule, cname, batch)
+                        if record:
+                            history_items.append(record)
             except Exception as e:
                 fail_count += 1
                 last_error = str(e)
@@ -498,20 +435,31 @@ class DiscordMsgForward(_PluginBase):
         self.__update_fail_state(success_count, fail_count, last_error)
 
     def __flush_pending(self) -> List[dict]:
-        """冲刷免打扰时段暂存的消息，按频道汇总推送，返回历史记录项"""
+        """冲刷免打扰时段暂存的消息（仅时段已结束的规则），按规则+频道汇总推送"""
         pending: List[dict] = self.get_data("pending") or []
         if not pending:
             return []
+        rule_map = {r["id"]: r for r in self._rules}
         records = []
-        groups: Dict[str, List[dict]] = {}
+        keep = []
+        groups: Dict[tuple, List[dict]] = {}
         for item in pending:
-            groups.setdefault(item.get("cname") or "未知频道", []).append(item)
-        for cname, items in groups.items():
-            record = self.__send_batch(cname, items, items[-1].get("targets"))
+            rule = rule_map.get(item.get("rule_id"))
+            if not rule or not rule.get("enabled"):
+                # 规则已删除/停用，丢弃暂存
+                continue
+            if self.__in_quiet_hours(rule.get("quiet_hours")):
+                keep.append(item)
+                continue
+            groups.setdefault((item["rule_id"], item.get("cname") or "未知频道"), []).append(item)
+        for (rule_id, cname), items in groups.items():
+            record = self.__send_batch(rule_map[rule_id], cname, items)
             if record:
                 records.append(record)
-        self.save_data("pending", [])
-        logger.info(f"免打扰时段结束，已汇总推送暂存的 {len(pending)} 条消息")
+        if groups:
+            flushed = sum(len(v) for v in groups.values())
+            logger.info(f"免打扰时段结束，已汇总推送暂存的 {flushed} 条消息")
+        self.save_data("pending", keep)
         return records
 
     @staticmethod
@@ -526,8 +474,8 @@ class DiscordMsgForward(_PluginBase):
         logger.error(error)
         return error
 
-    def __send_batch(self, cname: str, items: List[dict], targets: Optional[List[str]]) -> Optional[dict]:
-        """将一批消息渲染为一条通知并发送到目标渠道，返回历史记录项"""
+    def __send_batch(self, rule: dict, cname: str, items: List[dict]) -> Optional[dict]:
+        """将一批消息渲染为一条通知并发送到规则指定的渠道，返回历史记录项"""
         if not items:
             return None
 
@@ -555,9 +503,10 @@ class DiscordMsgForward(_PluginBase):
             "time": items[-1]["time"],
             "count": len(items),
         }
-        title = self.__render_template(self._title_template, variables)
-        text = self.__render_template(self._text_template, variables)
+        title = self.__render_template(rule.get("title_template") or DEFAULT_TITLE_TEMPLATE, variables)
+        text = self.__render_template(rule.get("text_template") or DEFAULT_TEXT_TEMPLATE, variables)
 
+        targets = rule.get("notify_channels") or []
         mtype = getattr(NotificationType, self._msgtype, None) or NotificationType.Plugin
         if targets:
             for target in targets:
@@ -565,10 +514,11 @@ class DiscordMsgForward(_PluginBase):
                                   link=link, source=target)
         else:
             self.post_message(mtype=mtype, title=title, text=text, image=image, link=link)
-        logger.info(f"频道 [{cname}] {len(items)} 条消息已转发到 "
+        logger.info(f"规则 [{rule.get('name')}] 频道 [{cname}] {len(items)} 条消息已转发到 "
                     f"{targets or '全部渠道'}" + (f"，提取内容: {codes}" if codes else ""))
         return {
             "date": datetime.now(tz=pytz.timezone(settings.TZ)).strftime('%Y-%m-%d %H:%M:%S'),
+            "rule": rule.get("name") or rule.get("id"),
             "channel": cname,
             "author": variables["author"],
             "content": content if len(content) <= 200 else content[:200] + "…",
@@ -581,21 +531,20 @@ class DiscordMsgForward(_PluginBase):
         state = self.get_data("fail_state") or {"streak": 0, "alerted": False}
         if fail_count > 0 and success_count == 0:
             state["streak"] = int(state.get("streak") or 0) + 1
+            state["last_error"] = (last_error or "")[:200]
             if self._fail_alert and state["streak"] >= FAIL_ALERT_THRESHOLD and not state.get("alerted"):
                 mtype = getattr(NotificationType, self._msgtype, None) or NotificationType.Plugin
-                title = "【Discord消息转发告警】"
-                text = (f"已连续 {state['streak']} 次轮询全部失败，插件可能无法正常工作。\n"
-                        f"请检查 Bot Token、系统代理和频道配置。\n"
-                        f"最近错误：{(last_error or '未知')[:200]}")
-                if self._notify_channels:
-                    for target in self._notify_channels:
-                        self.post_message(mtype=mtype, title=title, text=text, source=target)
-                else:
-                    self.post_message(mtype=mtype, title=title, text=text)
+                self.post_message(
+                    mtype=mtype,
+                    title="【Discord消息转发告警】",
+                    text=(f"已连续 {state['streak']} 次轮询全部失败，插件可能无法正常工作。\n"
+                          f"请检查 Bot Token、系统代理和频道配置。\n"
+                          f"最近错误：{(last_error or '未知')[:200]}"),
+                )
                 state["alerted"] = True
                 logger.warning("已发送连续失败告警通知")
         else:
-            state = {"streak": 0, "alerted": False}
+            state = {"streak": 0, "alerted": False, "last_error": ""}
         self.save_data("fail_state", state)
 
     def __save_history(self, items: List[dict]):
@@ -626,6 +575,71 @@ class DiscordMsgForward(_PluginBase):
         logger.info("收到远程命令，立即检查 Discord 新消息")
         self.check_messages()
 
+    # ---------------- 插件 API ----------------
+    def api_get_channels(self, refresh: bool = False) -> dict:
+        """获取频道选项（refresh=true 时强制从 Discord 拉取）"""
+        if refresh:
+            options = self.refresh_channel_options()
+        else:
+            options = self.get_data("channel_options") or []
+            if not options and self._token:
+                options = self.refresh_channel_options()
+        return {"options": options}
+
+    @staticmethod
+    def api_get_notifiers() -> dict:
+        """获取已启用的通知渠道选项"""
+        try:
+            options = [{"title": conf.name, "value": conf.name}
+                       for conf in NotificationHelper().get_configs().values()]
+        except Exception as e:
+            logger.error(f"获取通知渠道列表出错: {e}")
+            options = []
+        return {"options": options}
+
+    @staticmethod
+    def api_get_msgtypes() -> dict:
+        """获取通知类型选项"""
+        return {"options": [{"title": item.value, "value": item.name} for item in NotificationType]}
+
+    def api_get_history(self) -> dict:
+        """获取转发历史"""
+        history = self.get_data("history") or []
+        if not isinstance(history, list):
+            history = [history]
+        history = sorted(history, key=lambda x: x.get("date") or "", reverse=True)
+        return {"history": history}
+
+    def api_clear_history(self) -> dict:
+        """清空转发历史"""
+        self.save_data("history", [])
+        return {"message": "已清空"}
+
+    def api_get_status(self) -> dict:
+        """获取运行状态"""
+        fail_state = self.get_data("fail_state") or {}
+        pending = self.get_data("pending") or []
+        return {
+            "enabled": self._enabled,
+            "token_set": bool(self._token),
+            "rules_total": len(self._rules),
+            "rules_enabled": len([r for r in self._rules if r.get("enabled")]),
+            "fail_streak": int(fail_state.get("streak") or 0),
+            "last_error": fail_state.get("last_error") or "",
+            "pending_count": len(pending),
+        }
+
+    def api_check_now(self) -> dict:
+        """立即执行一次检查（后台运行）"""
+        if not self._token:
+            return {"message": "未配置 Bot Token"}
+        scheduler = BackgroundScheduler(timezone=settings.TZ)
+        scheduler.add_job(func=self.check_messages, trigger='date',
+                          run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=1),
+                          name="Discord消息转发-手动检查")
+        scheduler.start()
+        return {"message": "已触发检查，稍后查看历史记录"}
+
     # ---------------- MoviePilot 接口 ----------------
     def get_state(self) -> bool:
         return self._enabled
@@ -641,11 +655,27 @@ class DiscordMsgForward(_PluginBase):
         }]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return [
+            {"path": "/channels", "endpoint": self.api_get_channels, "methods": ["GET"],
+             "auth": "bear", "summary": "获取Discord频道选项"},
+            {"path": "/notifiers", "endpoint": self.api_get_notifiers, "methods": ["GET"],
+             "auth": "bear", "summary": "获取通知渠道选项"},
+            {"path": "/msgtypes", "endpoint": self.api_get_msgtypes, "methods": ["GET"],
+             "auth": "bear", "summary": "获取通知类型选项"},
+            {"path": "/history", "endpoint": self.api_get_history, "methods": ["GET"],
+             "auth": "bear", "summary": "获取转发历史"},
+            {"path": "/history", "endpoint": self.api_clear_history, "methods": ["DELETE"],
+             "auth": "bear", "summary": "清空转发历史"},
+            {"path": "/status", "endpoint": self.api_get_status, "methods": ["GET"],
+             "auth": "bear", "summary": "获取运行状态"},
+            {"path": "/check", "endpoint": self.api_check_now, "methods": ["POST"],
+             "auth": "bear", "summary": "立即检查一次"},
+        ]
 
     def get_service(self) -> List[Dict[str, Any]]:
         """注册定时轮询服务"""
-        if self._enabled and self._token and (self._channel_ids or self._channels):
+        if self._enabled and self._token and any(
+                r.get("enabled") and r.get("channels") for r in self._rules):
             return [{
                 "id": "DiscordMsgForward",
                 "name": "Discord消息转发服务",
@@ -656,350 +686,26 @@ class DiscordMsgForward(_PluginBase):
         return []
 
     @staticmethod
-    def __notify_channel_options() -> List[dict]:
-        """获取已启用的通知渠道选项"""
-        try:
-            return [{'title': f"{conf.name}", 'value': conf.name}
-                    for conf in NotificationHelper().get_configs().values()]
-        except Exception as e:
-            logger.error(f"获取通知渠道列表出错: {e}")
-            return []
+    def get_render_mode() -> Tuple[str, str]:
+        """Vue 联邦组件渲染模式"""
+        return "vue", "dist/assets"
 
-    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """拼装插件配置页面：返回 (页面配置, 默认数据结构)"""
-        msgtype_options = [{'title': item.value, 'value': item.name} for item in NotificationType]
-        channel_options = self.get_data("channel_options") or []
-        return [
-            {
-                'component': 'VForm',
-                'content': [
-                    # 基础设置
-                    {
-                        'component': 'VCard',
-                        'props': {'class': 'mt-0'},
-                        'content': [
-                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
-                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-cog'},
-                                {'component': 'span', 'text': '基础设置'}
-                            ]},
-                            {'component': 'VDivider'},
-                            {'component': 'VCardText', 'content': [
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件', 'color': 'primary'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次', 'color': 'success'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {
-                                            'model': 'use_proxy', 'label': '使用系统代理', 'color': 'warning',
-                                            'hint': '国内环境访问 Discord 必须开启', 'persistent-hint': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'interval', 'label': '轮询间隔(分钟)', 'type': 'number',
-                                            'placeholder': '5', 'prepend-inner-icon': 'mdi-timer-outline'}}]},
-                                ]},
-                            ]}
-                        ]
-                    },
-                    # Discord 设置
-                    {
-                        'component': 'VCard',
-                        'props': {'class': 'mt-3'},
-                        'content': [
-                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
-                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-robot'},
-                                {'component': 'span', 'text': 'Discord 设置'}
-                            ]},
-                            {'component': 'VDivider'},
-                            {'component': 'VCardText', 'content': [
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'token', 'label': 'Bot Token',
-                                            'placeholder': 'Discord 开发者平台创建的 Bot Token',
-                                            'prepend-inner-icon': 'mdi-key', 'type': 'password',
-                                            'autocomplete': 'new-password', 'clearable': True,
-                                            'hint': '保存后会自动拉取 Bot 可见的频道列表，重新打开本页即可在下方直接勾选',
-                                            'persistent-hint': True}}]},
-                                ]},
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                        {'component': 'VSelect', 'props': {
-                                            'model': 'channel_ids', 'label': '监听频道（下拉选择）',
-                                            'prepend-inner-icon': 'mdi-pound',
-                                            'multiple': True, 'chips': True, 'clearable': True,
-                                            'items': channel_options,
-                                            'no-data-text': '暂无频道数据：请先填写 Token 并保存，稍等几秒后重新打开本页',
-                                            'hint': '列表为 Bot 所在服务器的文字/公告频道；也可在下方手动填写',
-                                            'persistent-hint': True}}]},
-                                ]},
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                        {'component': 'VTextarea', 'props': {
-                                            'model': 'channels', 'label': '手动频道 / 高级规则（可选）',
-                                            'placeholder': '每行一个频道：频道ID#备注#关键词#转发渠道（后三段可省略）\n'
-                                                           '例：1234567890123456789#礼包码#code|gift#微信\n'
-                                                           '同一频道在这里配置的规则优先于全局配置',
-                                            'prepend-inner-icon': 'mdi-format-list-text', 'rows': 3,
-                                            'persistent-placeholder': True, 'clearable': True}}]},
-                                ]},
-                            ]}
-                        ]
-                    },
-                    # 转发设置
-                    {
-                        'component': 'VCard',
-                        'props': {'class': 'mt-3'},
-                        'content': [
-                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
-                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-send'},
-                                {'component': 'span', 'text': '转发设置'}
-                            ]},
-                            {'component': 'VDivider'},
-                            {'component': 'VCardText', 'content': [
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [
-                                        {'component': 'VSelect', 'props': {
-                                            'model': 'notify_channels', 'label': '转发渠道（可多选）',
-                                            'prepend-inner-icon': 'mdi-send-circle',
-                                            'multiple': True, 'chips': True, 'clearable': True,
-                                            'items': self.__notify_channel_options(),
-                                            'hint': '留空 = 发送到全部启用的通知渠道',
-                                            'persistent-hint': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [
-                                        {'component': 'VSelect', 'props': {
-                                            'model': 'msgtype', 'label': '通知类型',
-                                            'prepend-inner-icon': 'mdi-bell-outline',
-                                            'items': msgtype_options,
-                                            'hint': '需在 设定→通知 中开启所选渠道对应类型的开关',
-                                            'persistent-hint': True}}]},
-                                ]},
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {
-                                            'model': 'aggregate', 'label': '消息聚合', 'color': 'info',
-                                            'hint': '多条新消息合并为一条通知', 'persistent-hint': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {
-                                            'model': 'forward_image', 'label': '图片转发', 'color': 'info',
-                                            'hint': '消息中的图片作为通知图片推送', 'persistent-hint': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VSwitch', 'props': {
-                                            'model': 'fail_alert', 'label': '失败告警', 'color': 'error',
-                                            'hint': f'连续{FAIL_ALERT_THRESHOLD}次轮询失败时推送提醒', 'persistent-hint': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'quiet_hours', 'label': '免打扰时段',
-                                            'placeholder': '23:00-08:00，留空不启用',
-                                            'prepend-inner-icon': 'mdi-sleep',
-                                            'hint': '时段内消息暂存，结束后汇总推送', 'persistent-hint': True,
-                                            'clearable': True}}]},
-                                ]},
-                            ]}
-                        ]
-                    },
-                    # 过滤规则
-                    {
-                        'component': 'VCard',
-                        'props': {'class': 'mt-3'},
-                        'content': [
-                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
-                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-filter'},
-                                {'component': 'span', 'text': '过滤规则（可选，留空全部转发）'}
-                            ]},
-                            {'component': 'VDivider'},
-                            {'component': 'VCardText', 'content': [
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'keywords', 'label': '关键词（白名单）',
-                                            'placeholder': '含任一关键词才转发，逗号或 | 分隔',
-                                            'prepend-inner-icon': 'mdi-text-search', 'clearable': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'blocked_keywords', 'label': '屏蔽词（黑名单）',
-                                            'placeholder': '含任一屏蔽词不转发，逗号或 | 分隔',
-                                            'prepend-inner-icon': 'mdi-text-box-remove', 'clearable': True}}]},
-                                ]},
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'author_include', 'label': '只转发这些作者',
-                                            'placeholder': '按用户名精确匹配（不分大小写），逗号或 | 分隔',
-                                            'prepend-inner-icon': 'mdi-account-check', 'clearable': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'author_exclude', 'label': '屏蔽这些作者',
-                                            'placeholder': '按用户名精确匹配（不分大小写），逗号或 | 分隔',
-                                            'prepend-inner-icon': 'mdi-account-cancel', 'clearable': True}}]},
-                                ]},
-                            ]}
-                        ]
-                    },
-                    # 高级选项
-                    {
-                        'component': 'VCard',
-                        'props': {'class': 'mt-3'},
-                        'content': [
-                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
-                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-tune'},
-                                {'component': 'span', 'text': '高级选项（可选，默认即可）'}
-                            ]},
-                            {'component': 'VDivider'},
-                            {'component': 'VCardText', 'content': [
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'code_regex', 'label': '内容提取正则（如礼包码）',
-                                            'placeholder': '如：[A-Za-z0-9]{6,20}，留空不提取',
-                                            'prepend-inner-icon': 'mdi-regex',
-                                            'hint': '命中内容会在通知中单独列出，对应模板变量 {codes}',
-                                            'persistent-hint': True, 'clearable': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'history_days', 'label': '历史记录保留天数', 'type': 'number',
-                                            'placeholder': '30', 'prepend-inner-icon': 'mdi-history'}}]},
-                                ]},
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
-                                        {'component': 'VTextField', 'props': {
-                                            'model': 'title_template', 'label': '标题模板',
-                                            'placeholder': DEFAULT_TITLE_TEMPLATE,
-                                            'prepend-inner-icon': 'mdi-format-title', 'clearable': True}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 8}, 'content': [
-                                        {'component': 'VTextarea', 'props': {
-                                            'model': 'text_template', 'label': '内容模板',
-                                            'placeholder': DEFAULT_TEXT_TEMPLATE.replace("\n", "\\n"),
-                                            'prepend-inner-icon': 'mdi-text', 'rows': 3,
-                                            'hint': '变量：{channel} 频道、{author} 作者、{content} 正文、{codes} 提取内容、{time} 时间、{count} 条数；提取内容为空时含 {codes} 的行自动隐藏',
-                                            'persistent-hint': True, 'clearable': True}}]},
-                                ]},
-                            ]}
-                        ]
-                    },
-                    # 使用说明
-                    {
-                        'component': 'VCard',
-                        'props': {'class': 'mt-3'},
-                        'content': [
-                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
-                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-information'},
-                                {'component': 'span', 'text': '使用说明'}
-                            ]},
-                            {'component': 'VDivider'},
-                            {'component': 'VCardText', 'content': [
-                                {'component': 'VAlert', 'props': {
-                                    'type': 'success', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': '【三步上手】① 填 Bot Token 保存 → ② 重新打开本页，下拉勾选要监听的频道 → ③ 选转发渠道（留空发全部），启用即可。'}},
-                                {'component': 'VAlert', 'props': {
-                                    'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': '【Bot 准备】Discord 开发者平台创建 Bot 并开启 MESSAGE CONTENT INTENT，用 OAuth2 URL（勾 View Channels + Read Message History）拉进自己的服务器。'
-                                            '别人服务器的公告频道可先「关注」到自己服务器再监听。'}},
-                                {'component': 'VAlert', 'props': {
-                                    'type': 'info', 'variant': 'tonal',
-                                    'text': '首次运行只记录基线、不转发历史消息；通知自带跳转链接，点开直达 Discord 原消息；交互渠道发送 /discord_check 可手动触发检查。'}},
-                            ]}
-                        ]
-                    }
-                ]
-            }
-        ], {
+    def get_form(self) -> Tuple[Optional[List[dict]], Dict[str, Any]]:
+        """Vue 模式下返回默认配置模型"""
+        return None, {
             "enabled": False,
-            "onlyonce": False,
+            "token": "",
             "use_proxy": True,
             "interval": 5,
-            "channel_ids": [],
-            "notify_channels": [],
             "msgtype": "Plugin",
-            "aggregate": True,
-            "forward_image": True,
             "fail_alert": True,
-            "quiet_hours": "",
-            "title_template": DEFAULT_TITLE_TEMPLATE,
-            "text_template": DEFAULT_TEXT_TEMPLATE,
             "history_days": 30,
-            "token": "",
-            "channels": "",
-            "keywords": "",
-            "blocked_keywords": "",
-            "author_include": "",
-            "author_exclude": "",
-            "code_regex": "",
+            "rules": [],
         }
 
-    def get_page(self) -> List[dict]:
-        """转发历史记录页面"""
-        historys = self.get_data('history')
-        if not historys:
-            return [
-                {
-                    'component': 'VCard',
-                    'props': {'variant': 'flat', 'class': 'mb-4'},
-                    'content': [
-                        {'component': 'VCardItem', 'props': {'class': 'pa-6'}, 'content': [
-                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center text-h6'}, 'content': [
-                                {'component': 'VIcon', 'props': {'color': 'primary', 'class': 'mr-3'}, 'text': 'mdi-database-remove'},
-                                {'component': 'span', 'text': '暂无转发记录'}
-                            ]}
-                        ]}
-                    ]
-                }
-            ]
-        if not isinstance(historys, list):
-            historys = [historys]
-        historys = sorted(historys, key=lambda x: x.get("date") or "", reverse=True)
-
-        rows = []
-        for h in historys:
-            if h.get("codes"):
-                codes_td = {'component': 'td', 'content': [
-                    {'component': 'VChip', 'props': {
-                        'color': 'success', 'size': 'small', 'variant': 'tonal'},
-                     'text': h.get("codes")}
-                ]}
-            else:
-                codes_td = {'component': 'td', 'text': '-'}
-            rows.append({
-                'component': 'tr',
-                'content': [
-                    {'component': 'td', 'text': h.get("date", "")},
-                    {'component': 'td', 'text': h.get("channel", "")},
-                    {'component': 'td', 'text': h.get("author", "")},
-                    {'component': 'td', 'text': h.get("content", "")},
-                    {'component': 'td', 'text': str(h.get("count", 1))},
-                    codes_td,
-                ]
-            })
-
-        return [
-            {
-                'component': 'VCard',
-                'props': {'variant': 'flat', 'class': 'mb-4'},
-                'content': [
-                    {'component': 'VCardItem', 'props': {'class': 'pa-4'}, 'content': [
-                        {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center text-h6'}, 'content': [
-                            {'component': 'VIcon', 'props': {'color': 'primary', 'class': 'mr-3'}, 'text': 'mdi-history'},
-                            {'component': 'span', 'text': '转发历史记录'}
-                        ]}
-                    ]},
-                    {'component': 'VCardText', 'content': [
-                        {'component': 'VTable', 'props': {'hover': True}, 'content': [
-                            {'component': 'thead', 'content': [
-                                {'component': 'tr', 'content': [
-                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '时间'},
-                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '频道'},
-                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '发送者'},
-                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '内容'},
-                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '条数'},
-                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '提取内容'},
-                                ]}
-                            ]},
-                            {'component': 'tbody', 'content': rows}
-                        ]}
-                    ]}
-                ]
-            }
-        ]
+    def get_page(self) -> Optional[List[dict]]:
+        """Vue 模式下详情页由前端组件渲染"""
+        return None
 
     def stop_service(self):
         """退出插件"""

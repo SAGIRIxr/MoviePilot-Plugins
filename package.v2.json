@@ -1,13 +1,15 @@
 {
   "DiscordMsgForward": {
-    "version": "3.0.0",
+    "version": "4.0.0",
     "level": 1,
     "name": "Discord消息转发",
     "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/DiscordForward_A.png",
-    "description": "将 Discord 频道新消息转发到指定通知渠道（可多选），支持频道下拉选择、关键词/作者/屏蔽词过滤、图片转发、消息聚合、免打扰时段、自定义模板与失败告警。",
+    "description": "将 Discord 频道新消息按规则转发到指定通知渠道：规则卡片式管理，每条规则独立配置频道、渠道、过滤、模板与免打扰时段。",
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
+    "system_version": ">=2.12.0",
     "history": {
+      "v4.0.0": "全新 Vue 卡片界面：转发规则改为卡片式管理（添加/编辑/删除/独立启停），每条规则独立配置监听频道、转发渠道、过滤、模板与免打扰时段；详情页新增运行状态、立即检查与历史管理；同频道多规则只拉取一次消息。",
       "v3.0.0": "通用化重构：监听频道支持自动拉取+下拉多选（保存 Token 后自动加载），保留手动/高级规则；新增屏蔽词黑名单、作者白/黑名单、免打扰时段（暂存后汇总推送）、连续失败告警；通知附带跳转链接直达 Discord 原消息；配置页重组更易上手。",
       "v2.0.0": "转发渠道可多选（留空发全部）；频道行支持 频道ID#备注#关键词#转发渠道 独立规则；新增图片转发、消息聚合、自定义标题/内容模板与 /discord_check 远程命令；更换新图标。",
       "v1.0.0": "首个版本：Bot Token 轮询多频道新消息，转发到 MP 通知渠道；支持关键词过滤、兑换码正则提取、系统代理与转发历史。"
