@@ -25,7 +25,8 @@ class YesCaptchaSolver:
         retry_interval: int = 3,
         timeout: int = 60,
         advanced: bool = False,
-        soft_id: Optional[str] = "62709"
+        soft_id: Optional[str] = "62709",
+        proxies: Optional[Dict[str, str]] = None
     ):
         """
         初始化验证码解决器
@@ -38,6 +39,7 @@ class YesCaptchaSolver:
             timeout: 请求超时时间(秒)
             advanced: 是否使用高级解析模式(M1)
             soft_id: YesCaptcha 软件ID（2Captcha 等其它平台传 None 省略该字段）
+            proxies: 请求代理（requests 风格字典），None 为直连
         """
         self.api_base_url = api_base_url
         self.create_task_url = f"{api_base_url}/createTask"
@@ -48,6 +50,7 @@ class YesCaptchaSolver:
         self.timeout = timeout
         self.advanced = advanced
         self.soft_id = soft_id
+        self.proxies = proxies
     
     def solve(
         self,
@@ -120,10 +123,11 @@ class YesCaptchaSolver:
             #    print(f"发送创建任务请求: {data}")
                 
             response = requests.post(
-                self.create_task_url, 
+                self.create_task_url,
                 json=data,
                 timeout=self.timeout,
-                impersonate="chrome110"
+                impersonate="chrome110",
+                proxies=self.proxies
             )
             result = response.json()
             
@@ -166,7 +170,8 @@ class YesCaptchaSolver:
                     self.get_result_url,
                     json=data,
                     timeout=self.timeout,
-                    impersonate="chrome110"
+                    impersonate="chrome110",
+                    proxies=self.proxies
                 )
                 result = response.json()
                 
