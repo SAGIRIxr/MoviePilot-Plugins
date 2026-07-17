@@ -31,7 +31,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -976,14 +976,25 @@ class NodeSeekSignin(_PluginBase):
                             {'component': 'VDivider'},
                             {'component': 'VCardText', 'content': [
                                 {'component': 'VAlert', 'props': {
+                                    'type': 'error', 'variant': 'elevated', 'prominent': True,
+                                    'icon': 'mdi-alert-decagram', 'class': 'mb-3',
+                                    'title': '⚠️ 首次务必填入一份有效 Cookie',
+                                    'text': 'NodeSeek 对机房 IP 有风控：无可信会话历史时，账密登录会被要求邮箱验证码而失败。请首次浏览器登录 nodeseek.com 后复制整段 Cookie 填入，让本机 IP 成为可信会话，之后账密登录刷新才能绕开邮箱验证。'}},
+                                {'component': 'VAlert', 'props': {
                                     'type': 'success', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': '【Cookie 优先】插件优先用 Cookie 签到，Cookie 有效就一直用、不会重新登录；仅当 Cookie 失效时，才用「账号密码」自动登录刷新出新 Cookie 并写回。需 MP 已准备浏览器仿真环境并填写验证码服务密钥。'}},
+                                    'text': '【用法】优先用 Cookie 签到，有效就一直用；Cookie 失效时才用「账号密码」自动登录刷新并写回。多账号用 & 或换行分隔，账密顺序与 Cookie 一一对应。'}},
                                 {'component': 'VAlert', 'props': {
-                                    'type': 'warning', 'variant': 'tonal', 'class': 'mb-2',
-                                    'text': '【首次必填 Cookie】NodeSeek 对机房 IP 有风控，没有可信会话历史时，账密登录会被要求邮箱验证码。请首次务必填入一份有效 Cookie（浏览器登录 nodeseek.com 后复制整段）跑通，让本机 IP 成为可信会话，之后账密登录刷新即可绕开邮箱验证。'}},
-                                {'component': 'VAlert', 'props': {
-                                    'type': 'info', 'variant': 'tonal',
-                                    'text': '也可只填 Cookie 手动签到（多账号用 & 或换行分隔）。验证码服务：YesCaptcha / 2Captcha 填 CLIENTT_KEY 即可，API_BASE_URL 留空用官方节点；开启「使用系统代理」后，验证码 API 请求也会走代理。'}},
+                                    'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
+                                    'text': '验证码服务：YesCaptcha / 2Captcha 填 CLIENTT_KEY 即可，API_BASE_URL 留空用官方节点；开启「使用系统代理」后验证码 API 也走代理。'}},
+                                {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
+                                    {'component': 'span', 'props': {'class': 'text-caption text-medium-emphasis mr-3'},
+                                     'text': 'YesCaptcha 新人注册后联系客服可领免费额度：'},
+                                    {'component': 'VBtn', 'props': {
+                                        'color': 'primary', 'variant': 'flat', 'size': 'small',
+                                        'prepend-icon': 'mdi-gift-outline',
+                                        'href': 'https://yescaptcha.com/i/OYvdts', 'target': '_blank',
+                                        'text': '领取 YesCaptcha 免费额度'}},
+                                ]},
                             ]}
                         ]
                     }
