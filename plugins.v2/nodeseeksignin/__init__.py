@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -65,8 +65,6 @@ class NodeSeekSignin(_PluginBase):
     _api_base_url = ""
     # CLIENTT_KEY
     _client_key = ""
-    # NS_IMPERSONATE 首选指纹
-    _impersonate = "chrome110"
     # 收益统计周期（天）
     _stats_days = 30
     # 历史记录保留天数
@@ -75,28 +73,9 @@ class NodeSeekSignin(_PluginBase):
     _use_proxy = False
     # 登录成功后是否把新 Cookie 写回插件配置
     _auto_save_cookie = True
-    # 账密登录时是否优先使用 MoviePilot 内置 CloakBrowser 真实浏览器（curl_cffi 在 MP 环境取不到登录 Cookie）
-    _use_browser_login = True
 
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
-
-    # 指纹候选列表（与原脚本一致）
-    _impersonate_defaults = [
-        # Chrome (Desktop)
-        "chrome99", "chrome100", "chrome101", "chrome104", "chrome107",
-        "chrome110", "chrome116", "chrome119", "chrome120", "chrome123",
-        "chrome124", "chrome131", "chrome133a", "chrome136",
-        # Chrome (Android)
-        "chrome99_android", "chrome131_android",
-        # Edge
-        "edge99", "edge101",
-        # Safari
-        "safari153", "safari155", "safari170", "safari172_ios", "safari180",
-        "safari180_ios", "safari184", "safari184_ios", "safari260", "safari260_ios",
-        # Firefox / Tor
-        "firefox133", "tor145",
-    ]
 
     def init_plugin(self, config: dict = None):
         # 停止现有任务
@@ -115,12 +94,10 @@ class NodeSeekSignin(_PluginBase):
             self._solver_type = (config.get("solver_type") or "yescaptcha").strip()
             self._api_base_url = (config.get("api_base_url") or "").strip()
             self._client_key = (config.get("client_key") or "").strip()
-            self._impersonate = (config.get("impersonate") or "chrome110").strip()
             self._stats_days = int(config.get("stats_days") or 30)
             self._history_days = int(config.get("history_days") or 30)
             self._use_proxy = config.get("use_proxy") or False
             self._auto_save_cookie = config.get("auto_save_cookie") if config.get("auto_save_cookie") is not None else True
-            self._use_browser_login = config.get("use_browser_login") if config.get("use_browser_login") is not None else True
 
         # 立即运行一次
         if self._onlyonce:
@@ -150,12 +127,10 @@ class NodeSeekSignin(_PluginBase):
             "solver_type": self._solver_type,
             "api_base_url": self._api_base_url,
             "client_key": self._client_key,
-            "impersonate": self._impersonate,
             "stats_days": self._stats_days,
             "history_days": self._history_days,
             "use_proxy": self._use_proxy,
             "auto_save_cookie": self._auto_save_cookie,
-            "use_browser_login": self._use_browser_login,
         })
 
     # ---------------- 工具方法 ----------------
@@ -170,14 +145,6 @@ class NodeSeekSignin(_PluginBase):
             logger.error(f"获取代理设置出错: {e}")
         return None
 
-    def __impersonate_candidates(self) -> List[str]:
-        """生成 curl_cffi impersonate 版本候选列表，首选项优先。"""
-        candidates: List[str] = []
-        for v in ([self._impersonate] if self._impersonate else []) + self._impersonate_defaults:
-            if v and v not in candidates:
-                candidates.append(v)
-        return candidates
-
     @staticmethod
     def _is_cloudflare_challenge(text: str) -> bool:
         if not text:
@@ -185,56 +152,130 @@ class NodeSeekSignin(_PluginBase):
         t = text.lower()
         return ("just a moment" in t) or ("cf-chl" in t) or ("challenge" in t and "cloudflare" in t)
 
-    def _request_with_impersonate_fallback(self, method: str, url: str, *, headers: dict,
-                                           json_data=None, timeout: int = 25):
-        """带指纹回退的请求（应对 Cloudflare 403 挑战页）。"""
+    @staticmethod
+    def _is_challenged(resp) -> bool:
+        """判断响应是否被 Cloudflare 挑战拦下。"""
+        if resp is None:
+            return False
+        try:
+            if resp.headers.get("cf-mitigated"):
+                return True
+        except Exception:
+            pass
+        return resp.status_code == 403 and NodeSeekSignin._is_cloudflare_challenge(resp.text)
+
+    # ---------------- Cloudflare 通行证 ----------------
+    def __browser_fetch_cf(self) -> Tuple[Optional[str], Optional[str]]:
+        """用【干净】的 CloakBrowser 上下文过一次 CF，取回 cf_clearance 与配套 UA。
+
+        切记不要向该上下文注入任何站点 Cookie：NodeSeek 的 WAF 对携带失效 session 的
+        请求一律下发挑战，注入旧 Cookie 会让浏览器永远停在 "Just a moment" 页。
+        """
+        try:
+            from cloakbrowser import launch_context
+        except Exception as e:
+            logger.error(f"未安装 CloakBrowser 浏览器仿真环境：{e}")
+            return None, None
+
+        proxy = None
+        try:
+            if self._use_proxy and hasattr(settings, "PROXY_SERVER") and settings.PROXY_SERVER:
+                proxy = settings.PROXY_SERVER
+        except Exception:
+            pass
+
+        context = None
+        page = None
+        try:
+            logger.info("[CF] 启动浏览器获取 Cloudflare 通行证...")
+            context = launch_context(headless=True, proxy=proxy)
+            page = context.new_page()
+            page.goto(SIGNIN_PAGE, timeout=60 * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=60 * 1000)
+            except Exception:
+                pass
+            clearance = None
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                clearance = next((c.get("value") for c in (context.cookies() or [])
+                                  if c.get("name") == "cf_clearance"), None)
+                if clearance:
+                    break
+                time.sleep(3)
+            ua = None
+            try:
+                ua = page.evaluate("()=>navigator.userAgent")
+            except Exception:
+                pass
+            if clearance and ua:
+                logger.info("[CF] 已取得 Cloudflare 通行证")
+                self.save_data("cf", {"clearance": clearance, "ua": ua, "ts": time.time()})
+                return clearance, ua
+            logger.warning("[CF] 未能取得 cf_clearance（可能仍卡在挑战页）")
+            return None, None
+        except Exception as e:
+            logger.error(f"[CF] 获取通行证异常：{e}")
+            return None, None
+        finally:
+            try:
+                if page:
+                    page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+
+    def __ensure_cf(self, force: bool = False) -> Tuple[Optional[str], Optional[str], bool]:
+        """取得可用的 (cf_clearance, UA, 是否来自缓存)。force 或缓存过期时用浏览器重取。"""
+        if not force:
+            cached = self.get_data("cf") or {}
+            clearance, ua, ts = cached.get("clearance"), cached.get("ua"), cached.get("ts") or 0
+            # cf_clearance 有效期通常较长，这里保守按 6 小时复用
+            if clearance and ua and (time.time() - ts) < 6 * 3600:
+                return clearance, ua, True
+        clearance, ua = self.__browser_fetch_cf()
+        return clearance, ua, False
+
+    def __ns_request(self, method: str, url: str, ns_cookie: str, json_data=None, timeout: int = 25):
+        """带 CF 通行证访问 NodeSeek。返回 (response, 被挑战?, 异常)。
+
+        curl 无法执行 JS，独力过不了 Cloudflare，必须借助浏览器取得的 cf_clearance
+        （且 UA 必须与取证时一致，否则通行证无效）。
+        """
         from curl_cffi import requests as cffi_requests
         proxies = self.__get_proxies()
         last_resp = None
-        last_err = None
-        for ver in self.__impersonate_candidates():
+        for attempt in (1, 2):
+            clearance, ua, from_cache = self.__ensure_cf(force=(attempt == 2))
+            cookie = f"cf_clearance={clearance}; {ns_cookie}" if clearance else ns_cookie
+            headers = {
+                'User-Agent': ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                'origin': "https://www.nodeseek.com",
+                'referer': "https://www.nodeseek.com/board",
+                'Content-Type': 'application/json',
+                'Cookie': cookie,
+            }
             try:
                 resp = cffi_requests.request(method, url, headers=headers, json=json_data,
-                                             impersonate=ver, timeout=timeout, proxies=proxies)
-                last_resp = resp
-                if resp.status_code != 403:
-                    return resp, ver, None
-                if self._is_cloudflare_challenge(resp.text):
-                    logger.warning(f"403 Cloudflare 挑战 (impersonate={ver})，尝试切换指纹...")
-                    continue
-                return resp, ver, None
+                                             impersonate="chrome131", timeout=timeout, proxies=proxies)
             except Exception as e:
-                last_err = e
-                logger.warning(f"请求异常 (impersonate={ver}): {e}")
-                continue
-        candidates = self.__impersonate_candidates()
-        return last_resp, (candidates[-1] if candidates else self._impersonate), last_err
+                return None, False, e
+            last_resp = resp
+            if not self._is_challenged(resp):
+                return resp, False, None
+            # 通行证本就是刚取的还被挑战 → 问题出在 Cookie 而非通行证，再刷也是白费一分钟
+            if attempt == 2 or not from_cache:
+                break
+            logger.warning("[CF] 请求被挑战，刷新通行证后重试一次...")
+        # 仍被挑战：通常意味着 Cookie 里的 session 已失效（NodeSeek 会挑战携带无效 session 的请求）
+        return last_resp, True, None
 
     # ---------------- 登录逻辑 ----------------
-    @staticmethod
-    def __extract_cookies(session, response) -> dict:
-        """尽可能从 curl_cffi 的会话/响应中提取 cookie（兼容不同取法）。"""
-        cookies = {}
-        for obj in (session, response):
-            try:
-                d = obj.cookies.get_dict()
-                if d:
-                    cookies.update(d)
-            except Exception:
-                pass
-        # 遍历底层 cookiejar 兜底
-        try:
-            for c in session.cookies.jar:
-                if getattr(c, "name", None):
-                    cookies.setdefault(c.name, c.value)
-        except Exception:
-            pass
-        try:
-            jar_names = [getattr(c, "name", "?") for c in session.cookies.jar]
-            logger.info(f"会话 cookie jar：{jar_names}")
-        except Exception as e:
-            logger.info(f"读取 cookie jar 失败：{e}；session.cookies={str(session.cookies)[:200]}")
-        return cookies
 
     def __solve_captcha(self) -> Tuple[Optional[str], str]:
         """调用验证码服务解出 Turnstile 令牌，返回 (token, 失败原因)。成功时原因为空。"""
@@ -274,36 +315,22 @@ class NodeSeekSignin(_PluginBase):
         except Exception as e:
             return None, f"验证码服务异常：{e}"
 
-    @staticmethod
-    def __cookie_to_browser_pairs(cookie_str: str) -> List[dict]:
-        """把 'k=v; k2=v2' 形式的 Cookie 串转成 CloakBrowser/Playwright 的 add_cookies 入参。"""
-        pairs = []
-        for part in (cookie_str or "").split(";"):
-            part = part.strip()
-            if not part or "=" not in part:
-                continue
-            name, value = part.split("=", 1)
-            name, value = name.strip(), value.strip()
-            if name:
-                pairs.append({"name": name, "value": value, "domain": ".nodeseek.com", "path": "/"})
-        return pairs
-
-    def __browser_signin(self, user: str, password: str,
-                         old_cookie: Optional[str] = None) -> Tuple[str, str, Optional[dict], Optional[str]]:
+    def __browser_signin(self, user: str, password: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
         """账密 → 浏览器仿真：登录 + 签到 + 收益统计，全程在 CloakBrowser 内完成。
 
         返回 (结果状态, 消息, 收益统计dict 或 None, 登录成功取得的会话Cookie 或 None)。
-        关键：登录前把旧 Cookie 注入浏览器预热——NodeSeek 会认这是可信会话，机房 IP 下账密
-        登录便不再被重定向到邮箱验证（emailSignIn），从而能直接刷新拿到新 session Cookie。
         """
         token, reason = self.__solve_captcha()
         if not token:
             return "loginfail", f"登录失败：{reason}", None, None
-        return self.__run_browser_flow(user, password, token, old_cookie)
+        return self.__run_browser_flow(user, password, token)
 
-    def __run_browser_flow(self, user: str, password: str, token: str,
-                           old_cookie: Optional[str] = None) -> Tuple[str, str, Optional[dict], Optional[str]]:
-        """在 CloakBrowser 内执行：注入旧 Cookie 预热 → 登录 → 写入 localStorage 令牌 → 构造鉴权头 → 签到 + 收益统计。"""
+    def __run_browser_flow(self, user: str, password: str, token: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
+        """在 CloakBrowser 内执行：登录 → 写入 localStorage 令牌 → 构造鉴权头 → 签到 + 收益统计。
+
+        浏览器上下文必须保持干净：一旦注入失效的 session Cookie，NodeSeek 的 WAF 会持续
+        下发 Cloudflare 挑战，登录页永远加载不出来（preLogin 模块缺失），导致无法刷新 Cookie。
+        """
         try:
             from cloakbrowser import launch_context
         except Exception as e:
@@ -321,15 +348,6 @@ class NodeSeekSignin(_PluginBase):
         try:
             logger.info("[浏览器仿真] 启动 CloakBrowser 登录并签到...")
             context = launch_context(headless=True, proxy=proxy)
-            # 注入旧 Cookie 预热：让 NodeSeek 视为可信会话，规避机房 IP 下的邮箱验证重定向
-            if old_cookie:
-                try:
-                    ck_pairs = self.__cookie_to_browser_pairs(old_cookie)
-                    if ck_pairs:
-                        context.add_cookies(ck_pairs)
-                        logger.info(f"[浏览器仿真] 已注入旧 Cookie 预热（{len(ck_pairs)} 项），规避邮箱验证")
-                except Exception as e:
-                    logger.warning(f"[浏览器仿真] 注入旧 Cookie 失败：{e}")
             page = context.new_page()
             page.goto(SIGNIN_PAGE)
             try:
@@ -433,6 +451,15 @@ class NodeSeekSignin(_PluginBase):
                 cks = context.cookies()
                 pairs = {c.get("name"): c.get("value") for c in (cks or [])
                          if "nodeseek.com" in (c.get("domain") or "") and c.get("name")}
+                # cf_clearance 归通行证缓存单独保管，不混进业务 Cookie
+                clearance = pairs.pop("cf_clearance", None)
+                if clearance:
+                    try:
+                        ua = page.evaluate("()=>navigator.userAgent")
+                        self.save_data("cf", {"clearance": clearance, "ua": ua, "ts": time.time()})
+                        logger.info("[浏览器仿真] 已同步刷新 Cloudflare 通行证")
+                    except Exception:
+                        pass
                 if pairs:
                     session_cookie = "; ".join(f"{k}={v}" for k, v in pairs.items())
                     logger.info(f"[浏览器仿真] 登录成功，取得会话Cookie字段：{list(pairs.keys())}")
@@ -478,90 +505,24 @@ class NodeSeekSignin(_PluginBase):
             except Exception:
                 pass
 
-    def __session_login(self, user: str, password: str) -> Tuple[Optional[str], str]:
-        """[兜底] curl_cffi 账密登录（仅在关闭「浏览器登录」时使用）。返回 (新 Cookie, 失败原因)。
-
-        注意：NodeSeek 新版鉴权已改为 HTTP 头（x-security-token + x-integrity-token），
-        curl_cffi 在 MoviePilot 环境登录虽成功但取不到鉴权信息，此路径多半无效，仅作保留。
-        """
-        from curl_cffi import requests as cffi_requests
-        token, reason = self.__solve_captcha()
-        if not token:
-            return None, reason
-
-        proxies = self.__get_proxies()
-        initial_impersonate = self._impersonate or "chrome110"
-        session = cffi_requests.Session(impersonate=initial_impersonate)
-        logger.info(f"使用初始 impersonate: {initial_impersonate}")
-        try:
-            session.get(SIGNIN_PAGE, proxies=proxies)
-        except Exception as e:
-            logger.warning(f"预加载登录页异常: {e}")
-
-        # NodeSeek 登录接口：验证码 token 改走请求头 x-captcha-token / x-captcha-source
-        data = {"username": user, "password": password}
-        headers = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-            'sec-ch-ua': "\"Not A(Brand\";v=\"99\", \"Microsoft Edge\";v=\"121\", \"Chromium\";v=\"121\"",
-            'sec-ch-ua-mobile': "?0",
-            'sec-ch-ua-platform': "\"Windows\"",
-            'origin': "https://www.nodeseek.com",
-            'sec-fetch-site': "same-origin",
-            'sec-fetch-mode': "cors",
-            'sec-fetch-dest': "empty",
-            'referer': SIGNIN_PAGE,
-            'accept-language': "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
-            'Content-Type': "application/json",
-            'x-captcha-token': token,
-            'x-captcha-source': "turnstile",
-        }
-        try:
-            response = session.post(SIGNIN_API, json=data, headers=headers, proxies=proxies)
-            try:
-                resp_json = response.json()
-            except Exception:
-                snippet = (response.text or "")[:120]
-                return None, f"登录接口返回非 JSON（HTTP {response.status_code}），可能被 Cloudflare 拦截：{snippet}"
-            logger.info(f"登录响应：HTTP {response.status_code}，success={resp_json.get('success')}，message={resp_json.get('message')}")
-            if resp_json.get("success"):
-                cookies = self.__extract_cookies(session, response)
-                cookie_string = '; '.join([f"{k}={v}" for k, v in cookies.items()])
-                if not cookie_string:
-                    set_cookie = response.headers.get('Set-Cookie', '') or response.headers.get('set-cookie', '')
-                    logger.warning(f"登录成功但仍未取到 Cookie；Set-Cookie={str(set_cookie)[:300]}")
-                    return None, "登录返回成功但未取到 Cookie（curl_cffi 未捕获会话 Cookie，建议改用浏览器仿真）"
-                logger.info(f"登录成功，获取到 Cookie 字段：{list(cookies.keys())}")
-                return cookie_string, ""
-            return None, f"登录接口拒绝：{resp_json.get('message')}"
-        except Exception as e:
-            logger.error(f"登录异常: {e}")
-            return None, f"登录请求异常：{e}"
-
     # ---------------- 签到逻辑 ----------------
     def __sign(self, ns_cookie: str) -> Tuple[str, str]:
         """单个 Cookie 签到，返回 (结果状态, 消息)。"""
         if not ns_cookie:
             return "invalid", "无有效Cookie"
         ns_random = "true" if self._ns_random else "false"
-        headers = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-            'origin': "https://www.nodeseek.com",
-            'referer': "https://www.nodeseek.com/board",
-            'Content-Type': 'application/json',
-            'Cookie': ns_cookie,
-        }
         try:
             url = f"{ATTENDANCE_API}?random={ns_random}"
-            response, used_impersonate, req_err = self._request_with_impersonate_fallback(
-                "POST", url, headers=headers, json_data={}, timeout=25)
+            response, challenged, req_err = self.__ns_request("POST", url, ns_cookie, json_data={})
             if req_err is not None:
                 return "error", f"请求异常: {req_err}"
             if response is None:
                 return "error", "请求失败：无响应"
+            if challenged:
+                # 持有效通行证仍被挑战 → Cookie 里的 session 已失效，交给账密登录刷新
+                return "invalid", "Cookie 已失效（请求被 Cloudflare 挑战），需重新登录"
             if response.status_code == 403:
-                if self._is_cloudflare_challenge(response.text):
-                    return "forbidden", f"403 Cloudflare challenge (最后尝试 impersonate={used_impersonate})"
-                return "forbidden", f"403 Forbidden (impersonate={used_impersonate})"
+                return "forbidden", "403 Forbidden"
             data = response.json()
             msg = data.get("message", "")
             if "鸡腿" in msg or data.get("success"):
@@ -581,12 +542,6 @@ class NodeSeekSignin(_PluginBase):
             return None, "无有效Cookie"
         if days <= 0:
             days = 1
-        headers = {
-            'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-            'origin': "https://www.nodeseek.com",
-            'referer': "https://www.nodeseek.com/board",
-            'Cookie': ns_cookie,
-        }
         try:
             shanghai_tz = ZoneInfo("Asia/Shanghai")
             now_shanghai = datetime.now(shanghai_tz)
@@ -596,12 +551,13 @@ class NodeSeekSignin(_PluginBase):
             page = 1
             while page <= 20:
                 url = f"{CREDIT_API}{page}"
-                response, used_impersonate, req_err = self._request_with_impersonate_fallback(
-                    "GET", url, headers=headers, json_data=None, timeout=25)
+                response, challenged, req_err = self.__ns_request("GET", url, ns_cookie)
                 if req_err is not None:
                     return None, f"请求异常: {req_err}"
                 if response is None:
                     return None, "请求失败：无响应"
+                if challenged:
+                    return None, "查询被 Cloudflare 挑战（Cookie 可能已失效）"
 
                 data = response.json()
                 if not data.get("success") or not data.get("data"):
@@ -742,21 +698,9 @@ class NodeSeekSignin(_PluginBase):
             else:
                 # Cookie 失效/无 Cookie → 重新登录刷新
                 new_cookie = None
-                if user and password and self._use_browser_login:
-                    # 账密登录刷新（登录前注入旧 Cookie 预热，绕开机房 IP 的邮箱验证）
+                if user and password:
                     logger.info(f"账号 {display_user} 使用浏览器账密登录刷新 Cookie...")
-                    result, msg, stats, new_cookie = self.__browser_signin(user, password, old_cookie=cookie)
-                elif user and password:
-                    # 兜底：curl 账密登录（已关闭浏览器登录时）
-                    logger.info(f"账号 {display_user} Cookie 签到失败({msg})，尝试 curl 重新登录...")
-                    cc, login_reason = self.__session_login(user, password)
-                    if cc:
-                        logger.info("登录成功，使用新Cookie重新签到...")
-                        result, msg = self.__sign(cc)
-                        if result in ["success", "already"]:
-                            new_cookie = cc
-                    else:
-                        result, msg = "loginfail", f"登录失败：{login_reason}"
+                    result, msg, stats, new_cookie = self.__browser_signin(user, password)
                 else:
                     logger.error(f"账号 {display_user} 签到失败且未配置账密: {msg}")
 

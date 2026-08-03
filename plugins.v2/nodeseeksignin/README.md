@@ -38,8 +38,9 @@ nodeseeksignin/
 ## 工作方式
 
 - **Cookie 优先**：插件优先用 Cookie 签到，Cookie 有效就一直用、不会重新登录；仅当 Cookie 失效时，才用账号密码通过内置浏览器（CloakBrowser）自动登录刷新出新 Cookie 并写回配置。
-- **首次必填 Cookie**：NodeSeek 对机房 IP 有风控，没有可信会话历史时账密登录会被要求邮箱验证码。请首次务必填入一份有效 Cookie（浏览器登录 nodeseek.com 后复制整段）跑通，让本机 IP 成为可信会话，之后账密登录刷新即可绕开邮箱验证。
-- 账密登录需配置验证码服务（YesCaptcha 或 2Captcha），并要求 MoviePilot 已准备浏览器仿真环境。
+- **Cloudflare 通行证**：NodeSeek 全站在 Cloudflare 之后，curl 无法执行 JS、独力过不了挑战。插件会用内置浏览器取得 `cf_clearance` 并缓存（连同配套 UA，两者必须匹配），签到与收益查询复用它；过期或失效时自动重取。
+- **登录始终使用干净的浏览器上下文**：NodeSeek 的 WAF 会对携带失效 `session` 的请求持续下发 Cloudflare 挑战，因此登录前**不能**注入旧 Cookie，否则登录页永远加载不出来，导致 Cookie 再也刷不出来。
+- 账密登录需配置验证码服务（YesCaptcha 或 2Captcha），并要求 MoviePilot ≥ 2.12.0（内置浏览器仿真）。
 
 ## 使用建议
 
