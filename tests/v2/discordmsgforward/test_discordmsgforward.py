@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Discord消息转发 插件单测：覆盖 v4.2.0 的稳定性修复与 v4.3.0 的频道互转 / 正则示例"""
+"""Discord消息转发 插件单测
+
+覆盖 v4.2.0 的稳定性修复、v4.3.0 的频道互转与正则示例、
+v4.4.0 的跳转链接开关与重复转发检测。
+"""
 from datetime import datetime, timedelta
 
 import pytest
@@ -15,6 +19,7 @@ def _rule(**kwargs):
         "forward_channels": [], "discord_template": "", "keywords": "",
         "blocked_keywords": "", "author_include": "", "author_exclude": "",
         "code_regex": "", "aggregate": True, "forward_image": True,
+        "jump_link": True, "dedup": False,
         "quiet_hours": "", "title_template": "", "text_template": "",
     }
     base.update(kwargs)
@@ -682,3 +687,111 @@ class LinkTemplateTest:
         status = plugin.api_get_status()
         assert status["docs_url"] == dmf.DOCS_URL
         assert "forward_rules" in status
+
+
+# ---------------- 跳转链接开关 ----------------
+class JumpLinkTest:
+    def test_link_passed_by_default(self, plugin):
+        item = {**_item(), "link": "https://discord.com/channels/1/2/3"}
+        plugin._DiscordMsgForward__send_batch(_rule(), "频道", [item])
+        assert plugin.sent[0]["link"] == "https://discord.com/channels/1/2/3"
+
+    def test_link_suppressed_when_off(self, plugin):
+        """关掉后不给 post_message 传 link，通知渠道就不会追加「点击查看：…」"""
+        item = {**_item(), "link": "https://discord.com/channels/1/2/3"}
+        plugin._DiscordMsgForward__send_batch(_rule(jump_link=False), "频道", [item])
+        assert plugin.sent[0]["link"] is None
+
+    def test_legacy_rule_keeps_link(self, plugin):
+        # 4.3.0 及以前保存的规则没有 jump_link 字段，行为必须不变
+        rule = _rule()
+        rule.pop("jump_link", None)
+        item = {**_item(), "link": "https://discord.com/channels/1/2/3"}
+        plugin._DiscordMsgForward__send_batch(rule, "频道", [item])
+        assert plugin.sent[0]["link"] == "https://discord.com/channels/1/2/3"
+
+    def test_template_link_var_independent(self, plugin):
+        """开关只管「点击查看」，模板里显式写的 {link} 不受影响"""
+        item = {**_item(), "link": "https://discord.com/channels/1/2/3"}
+        plugin._DiscordMsgForward__send_batch(
+            _rule(jump_link=False, text_template="{content}\n{link}"), "频道", [item])
+        assert plugin.sent[0]["link"] is None
+        assert "https://discord.com/channels/1/2/3" in plugin.sent[0]["text"]
+
+
+# ---------------- 重复转发检测 ----------------
+class DedupTest:
+    def test_off_by_default(self, plugin):
+        items = [_item(text="一样的内容"), _item(text="一样的内容")]
+        assert plugin._DiscordMsgForward__filter_duplicates(_rule(), items) == items
+
+    def test_same_text_skipped(self, plugin):
+        f = plugin._DiscordMsgForward__filter_duplicates
+        rule = _rule(dedup=True)
+        assert len(f(rule, [_item(text="礼包码 ABC")])) == 1
+        assert f(rule, [_item(text="礼包码 ABC")]) == []          # 第二轮重复
+        assert len(f(rule, [_item(text="礼包码 XYZ")])) == 1      # 不同内容照发
+
+    def test_same_batch_internal_dedup(self, plugin):
+        f = plugin._DiscordMsgForward__filter_duplicates
+        kept = f(_rule(dedup=True), [_item(text="A"), _item(text="A"), _item(text="B")])
+        assert [i["text"] for i in kept] == ["A", "B"]
+
+    def test_codes_take_priority_over_text(self, plugin):
+        """同一个码换个说法重发，也应算重复"""
+        f = plugin._DiscordMsgForward__filter_duplicates
+        rule = _rule(dedup=True)
+        assert len(f(rule, [_item(text="Gift Code: abc123", codes=["abc123"])])) == 1
+        assert f(rule, [_item(text="今日新码 abc123 快领", codes=["abc123"])]) == []
+
+    def test_different_codes_not_deduped(self, plugin):
+        f = plugin._DiscordMsgForward__filter_duplicates
+        rule = _rule(dedup=True)
+        assert len(f(rule, [_item(text="x", codes=["aaa"])])) == 1
+        assert len(f(rule, [_item(text="x", codes=["bbb"])])) == 1
+
+    def test_rules_are_independent(self, plugin):
+        f = plugin._DiscordMsgForward__filter_duplicates
+        assert len(f(_rule(id="r1", dedup=True), [_item(text="同样内容")])) == 1
+        assert len(f(_rule(id="r2", dedup=True), [_item(text="同样内容")])) == 1
+
+    def test_expired_fingerprint_allows_resend(self, dmf, plugin):
+        f = plugin._DiscordMsgForward__filter_duplicates
+        rule = _rule(dedup=True)
+        assert len(f(rule, [_item(text="老消息")])) == 1
+        # 把指纹时间戳推到 TTL 之外
+        store = plugin.get_data("dedup_seen")
+        old = datetime.now(tz=pytz.timezone("Asia/Shanghai")) - timedelta(days=dmf.DEDUP_TTL_DAYS + 1)
+        for e in store["r1"]:
+            e["t"] = old.timestamp()
+        plugin.save_data("dedup_seen", store)
+        assert len(f(rule, [_item(text="老消息")])) == 1
+
+    def test_fingerprint_store_capped(self, dmf, plugin):
+        f = plugin._DiscordMsgForward__filter_duplicates
+        rule = _rule(dedup=True)
+        f(rule, [_item(text=f"msg{i}") for i in range(dmf.DEDUP_MAX_PER_RULE + 50)])
+        assert len(plugin.get_data("dedup_seen")["r1"]) == dmf.DEDUP_MAX_PER_RULE
+
+    def test_deleted_rule_pruned(self, dmf, plugin):
+        plugin._DiscordMsgForward__filter_duplicates(_rule(id="gone", dedup=True), [_item()])
+        assert "gone" in plugin.get_data("dedup_seen")
+        plugin._rules = [_rule(id="r1")]
+        plugin._DiscordMsgForward__prune_dedup()
+        assert "gone" not in plugin.get_data("dedup_seen")
+
+    def test_duplicate_not_stored_in_pending(self, plugin, monkeypatch):
+        """重复检测在免打扰之前，重复内容连暂存都不该进"""
+        plugin._rules = [_rule(dedup=True, quiet_hours="00:00-23:59")]
+        plugin.save_data("last_ids", {"100": "0"})
+        msgs = [_msg(1, "重复内容"), _msg(2, "重复内容")]
+
+        def fake_get(path, params=None, _retry=0):
+            if path.endswith("/messages"):
+                return _resp(200, msgs if (params or {}).get("after") == "0" else [])
+            return _resp(200, {})
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_get", fake_get)
+        plugin.check_messages()
+        pending = plugin.get_data("pending") or []
+        assert len(pending) == 1

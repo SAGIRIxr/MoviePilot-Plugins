@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import hashlib
 import re
 import threading
 import time
@@ -91,6 +92,10 @@ API_TIMEOUT = 30
 MAX_RATE_LIMIT_RETRY = 2
 # Discord 单条消息正文上限（官方限制 2000 字符）
 MAX_DISCORD_LENGTH = 2000
+# 重复检测：每条规则最多记住多少条指纹
+DEDUP_MAX_PER_RULE = 200
+# 重复检测：指纹保留天数，超过就当作新消息
+DEDUP_TTL_DAYS = 7
 
 # 规则默认值
 RULE_DEFAULTS = {
@@ -109,6 +114,8 @@ RULE_DEFAULTS = {
     "code_regex": "",
     "aggregate": True,
     "forward_image": True,
+    "jump_link": True,        # 通知是否附带「点击查看」原消息跳转链接
+    "dedup": False,           # 重复转发检测
     "quiet_hours": "",
     "title_template": "",
     "text_template": "",
@@ -123,7 +130,7 @@ class DiscordMsgForward(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/DiscordForward_A.png"
     # 插件版本
-    plugin_version = "4.3.0"
+    plugin_version = "4.4.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -174,6 +181,7 @@ class DiscordMsgForward(_PluginBase):
         self._use_proxy = config.get("use_proxy") if config.get("use_proxy") is not None else True
         self._history_days = self.__safe_int(config.get("history_days"), default=30, minimum=1)
         self._rules = [self.__norm_rule(r) for r in (config.get("rules") or [])]
+        self.__prune_dedup()
 
         # 保存配置后：后台刷新频道列表缓存
         if self._token:
@@ -564,6 +572,58 @@ class DiscordMsgForward(_PluginBase):
         return self.__chunk(items, MAX_AGGREGATE_ITEMS)
 
     @staticmethod
+    def __dedup_key(item: dict) -> str:
+        """
+        去重指纹。
+        有提取内容时只按提取内容算：同一个礼包码换个说法重发也应视为重复；
+        没有提取内容时退回按正文算。
+        """
+        codes = item.get("codes") or []
+        basis = " / ".join(codes) if codes else (item.get("text") or "")
+        return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+
+    def __filter_duplicates(self, rule: dict, items: List[dict]) -> List[dict]:
+        """按规则的重复检测开关过滤掉近期已转发过的相同消息"""
+        if not rule.get("dedup") or not items:
+            return items
+        store: Dict[str, list] = self.get_data("dedup_seen") or {}
+        seen: List[dict] = store.get(rule["id"]) or []
+
+        now = datetime.now(tz=pytz.timezone(settings.TZ))
+        cutoff = (now - timedelta(days=DEDUP_TTL_DAYS)).timestamp()
+        # 过期指纹先清掉，避免长期堆积
+        seen = [e for e in seen if float(e.get("t") or 0) >= cutoff]
+        known = {e.get("h") for e in seen}
+
+        kept = []
+        skipped = 0
+        for item in items:
+            key = self.__dedup_key(item)
+            if key in known:
+                skipped += 1
+                continue
+            known.add(key)
+            seen.append({"h": key, "t": now.timestamp()})
+            kept.append(item)
+
+        if skipped:
+            logger.info(f"规则 [{rule.get('name')}] 重复检测跳过 {skipped} 条"
+                        f"（与近 {DEDUP_TTL_DAYS} 天内已转发的内容相同）")
+        store[rule["id"]] = seen[-DEDUP_MAX_PER_RULE:]
+        self.save_data("dedup_seen", store)
+        return kept
+
+    def __prune_dedup(self):
+        """清掉已删除规则的去重指纹"""
+        store: Dict[str, list] = self.get_data("dedup_seen") or {}
+        if not store or not self._rules:
+            return
+        ids = {r.get("id") for r in self._rules}
+        pruned = {k: v for k, v in store.items() if k in ids}
+        if len(pruned) != len(store):
+            self.save_data("dedup_seen", pruned)
+
+    @staticmethod
     def __rule_legs(rule: dict) -> List[str]:
         """规则的投递去向：notify=MoviePilot 通知渠道，discord=其它 Discord 频道"""
         legs = []
@@ -704,6 +764,10 @@ class DiscordMsgForward(_PluginBase):
                             "image": raw["image"] if rule.get("forward_image") else None,
                             "codes": self.__extract_codes(rule.get("code_regex"), raw["text"]),
                         })
+                    if not items:
+                        continue
+                    # 去重放在免打扰之前，重复内容连暂存都不进
+                    items = self.__filter_duplicates(rule, items)
                     if not items:
                         continue
                     if self.__in_quiet_hours(rule.get("quiet_hours")):
@@ -937,7 +1001,11 @@ class DiscordMsgForward(_PluginBase):
                 rule.get("text_template") or DEFAULT_TEXT_TEMPLATE, variables)
             notify_targets = rule.get("notify_channels") or []
             mtype = getattr(NotificationType, self._msgtype, None) or NotificationType.Plugin
-            sent, failed = self.__dispatch(mtype, title, text, image, link, notify_targets)
+            # 关掉跳转链接就不传 link，通知渠道那句「点击查看：…」由 link 触发
+            sent, failed = self.__dispatch(
+                mtype, title, text, image,
+                link if rule.get("jump_link", True) else None,
+                notify_targets)
             if sent:
                 delivered.append("、".join(notify_targets) if notify_targets else "全部通知渠道")
                 if failed:

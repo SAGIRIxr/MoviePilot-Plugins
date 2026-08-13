@@ -30,6 +30,8 @@ function defaultRule() {
     code_regex: '',
     aggregate: true,
     forward_image: true,
+    jump_link: true,
+    dedup: false,
     quiet_hours: '',
     title_template: '',
     text_template: '',
@@ -201,6 +203,8 @@ function ruleFilterSummary(rule) {
   if (rule.author_include) parts.push(`作者:${rule.author_include}`)
   if (rule.author_exclude) parts.push(`排除作者:${rule.author_exclude}`)
   if (rule.code_regex) parts.push('提取正则')
+  if (rule.dedup) parts.push('去重')
+  if (rule.jump_link === false) parts.push('无跳转链接')
   return parts.join('　')
 }
 
@@ -480,13 +484,37 @@ onMounted(() => {
           </v-alert>
           <v-divider class="my-3" />
           <v-row dense>
-            <v-col cols="12" md="3">
-              <v-switch v-model="editRule.aggregate" label="消息聚合" color="info" density="compact" hide-details />
+            <v-col cols="6" md="3">
+              <v-switch
+                v-model="editRule.aggregate" label="消息聚合" color="info"
+                density="compact" hide-details
+                title="多条新消息合并成一条通知；想让每条码单独一条就关掉"
+              />
             </v-col>
-            <v-col cols="12" md="3">
-              <v-switch v-model="editRule.forward_image" label="图片转发" color="info" density="compact" hide-details />
+            <v-col cols="6" md="3">
+              <v-switch
+                v-model="editRule.forward_image" label="图片转发" color="info"
+                density="compact" hide-details
+              />
+            </v-col>
+            <v-col cols="6" md="3">
+              <v-switch
+                v-model="editRule.jump_link" label="跳转链接" color="info"
+                density="compact" hide-details
+                title="通知末尾的「点击查看：…」，关掉就不再附带"
+              />
+            </v-col>
+            <v-col cols="6" md="3">
+              <v-switch
+                v-model="editRule.dedup" label="重复检测" color="info"
+                density="compact" hide-details
+                title="内容与近 7 天内已转发过的相同就不再发"
+              />
             </v-col>
           </v-row>
+          <div class="text-caption text-medium-emphasis mb-2">
+            跳转链接 = 通知末尾的「点击查看：…」；重复检测 = 内容与近 7 天已转发的相同则跳过（有提取正则时按提取内容判定）
+          </div>
 
           <v-expansion-panels variant="accordion" class="mt-2">
             <v-expansion-panel>

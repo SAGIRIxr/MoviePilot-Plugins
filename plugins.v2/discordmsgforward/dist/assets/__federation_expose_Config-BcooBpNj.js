@@ -54,6 +54,8 @@ function defaultRule() {
     code_regex: '',
     aggregate: true,
     forward_image: true,
+    jump_link: true,
+    dedup: false,
     quiet_hours: '',
     title_template: '',
     text_template: '',
@@ -225,6 +227,8 @@ function ruleFilterSummary(rule) {
   if (rule.author_include) parts.push(`作者:${rule.author_include}`);
   if (rule.author_exclude) parts.push(`排除作者:${rule.author_exclude}`);
   if (rule.code_regex) parts.push('提取正则');
+  if (rule.dedup) parts.push('去重');
+  if (rule.jump_link === false) parts.push('无跳转链接');
   return parts.join('　')
 }
 
@@ -293,12 +297,12 @@ return (_ctx, _cache) => {
               color: "info",
               class: "mr-2"
             }, {
-              default: _withCtx(() => [...(_cache[35] || (_cache[35] = [
+              default: _withCtx(() => [...(_cache[37] || (_cache[37] = [
                 _createTextVNode("mdi-cog", -1)
               ]))]),
               _: 1
             }),
-            _cache[36] || (_cache[36] = _createTextVNode(" 全局设置 ", -1))
+            _cache[38] || (_cache[38] = _createTextVNode(" 全局设置 ", -1))
           ]),
           _: 1
         }),
@@ -458,12 +462,12 @@ return (_ctx, _cache) => {
               color: "info",
               class: "mr-2"
             }, {
-              default: _withCtx(() => [...(_cache[37] || (_cache[37] = [
+              default: _withCtx(() => [...(_cache[39] || (_cache[39] = [
                 _createTextVNode("mdi-swap-horizontal", -1)
               ]))]),
               _: 1
             }),
-            _cache[40] || (_cache[40] = _createTextVNode(" 转发规则 ", -1)),
+            _cache[42] || (_cache[42] = _createTextVNode(" 转发规则 ", -1)),
             _createVNode(_component_v_spacer),
             _createVNode(_component_v_btn, {
               size: "small",
@@ -474,7 +478,7 @@ return (_ctx, _cache) => {
               "prepend-icon": "mdi-refresh",
               onClick: _cache[8] || (_cache[8] = $event => (loadChannels(true)))
             }, {
-              default: _withCtx(() => [...(_cache[38] || (_cache[38] = [
+              default: _withCtx(() => [...(_cache[40] || (_cache[40] = [
                 _createTextVNode(" 刷新频道列表 ", -1)
               ]))]),
               _: 1
@@ -485,7 +489,7 @@ return (_ctx, _cache) => {
               "prepend-icon": "mdi-plus",
               onClick: addRule
             }, {
-              default: _withCtx(() => [...(_cache[39] || (_cache[39] = [
+              default: _withCtx(() => [...(_cache[41] || (_cache[41] = [
                 _createTextVNode(" 添加规则 ", -1)
               ]))]),
               _: 1
@@ -502,7 +506,7 @@ return (_ctx, _cache) => {
                   type: "info",
                   variant: "tonal"
                 }, {
-                  default: _withCtx(() => [...(_cache[41] || (_cache[41] = [
+                  default: _withCtx(() => [...(_cache[43] || (_cache[43] = [
                     _createTextVNode(" 还没有转发规则，点击右上角「添加规则」创建第一条：选择监听频道和转发渠道即可。 ", -1)
                   ]))]),
                   _: 1
@@ -594,7 +598,7 @@ return (_ctx, _cache) => {
                                           variant: "tonal",
                                           class: "mb-1"
                                         }, {
-                                          default: _withCtx(() => [...(_cache[42] || (_cache[42] = [
+                                          default: _withCtx(() => [...(_cache[44] || (_cache[44] = [
                                             _createTextVNode(" 未选频道 ", -1)
                                           ]))]),
                                           _: 1
@@ -606,7 +610,7 @@ return (_ctx, _cache) => {
                                       size: "x-small",
                                       class: "mr-1"
                                     }, {
-                                      default: _withCtx(() => [...(_cache[43] || (_cache[43] = [
+                                      default: _withCtx(() => [...(_cache[45] || (_cache[45] = [
                                         _createTextVNode("mdi-send", -1)
                                       ]))]),
                                       _: 1
@@ -618,7 +622,7 @@ return (_ctx, _cache) => {
                                           size: "x-small",
                                           class: "ml-2 mr-1"
                                         }, {
-                                          default: _withCtx(() => [...(_cache[44] || (_cache[44] = [
+                                          default: _withCtx(() => [...(_cache[46] || (_cache[46] = [
                                             _createTextVNode("mdi-sleep", -1)
                                           ]))]),
                                           _: 1
@@ -634,7 +638,7 @@ return (_ctx, _cache) => {
                                           size: "x-small",
                                           class: "mr-1"
                                         }, {
-                                          default: _withCtx(() => [...(_cache[45] || (_cache[45] = [
+                                          default: _withCtx(() => [...(_cache[47] || (_cache[47] = [
                                             _createTextVNode("mdi-filter", -1)
                                           ]))]),
                                           _: 1
@@ -654,7 +658,7 @@ return (_ctx, _cache) => {
                                     "prepend-icon": "mdi-pencil",
                                     onClick: $event => (openRule(index))
                                   }, {
-                                    default: _withCtx(() => [...(_cache[46] || (_cache[46] = [
+                                    default: _withCtx(() => [...(_cache[48] || (_cache[48] = [
                                       _createTextVNode(" 编辑 ", -1)
                                     ]))]),
                                     _: 1
@@ -666,7 +670,7 @@ return (_ctx, _cache) => {
                                     "prepend-icon": "mdi-delete",
                                     onClick: $event => (askDelete(index))
                                   }, {
-                                    default: _withCtx(() => [...(_cache[47] || (_cache[47] = [
+                                    default: _withCtx(() => [...(_cache[49] || (_cache[49] = [
                                       _createTextVNode(" 删除 ", -1)
                                     ]))]),
                                     _: 1
@@ -699,7 +703,7 @@ return (_ctx, _cache) => {
         target: "_blank",
         rel: "noopener noreferrer"
       }, {
-        default: _withCtx(() => [...(_cache[48] || (_cache[48] = [
+        default: _withCtx(() => [...(_cache[50] || (_cache[50] = [
           _createTextVNode(" 使用说明 ", -1)
         ]))]),
         _: 1
@@ -710,7 +714,7 @@ return (_ctx, _cache) => {
         variant: "text",
         onClick: _cache[10] || (_cache[10] = $event => (emit('switch')))
       }, {
-        default: _withCtx(() => [...(_cache[49] || (_cache[49] = [
+        default: _withCtx(() => [...(_cache[51] || (_cache[51] = [
           _createTextVNode("详情页", -1)
         ]))]),
         _: 1
@@ -720,7 +724,7 @@ return (_ctx, _cache) => {
         variant: "text",
         onClick: _cache[11] || (_cache[11] = $event => (emit('close')))
       }, {
-        default: _withCtx(() => [...(_cache[50] || (_cache[50] = [
+        default: _withCtx(() => [...(_cache[52] || (_cache[52] = [
           _createTextVNode("关闭", -1)
         ]))]),
         _: 1
@@ -730,7 +734,7 @@ return (_ctx, _cache) => {
         "prepend-icon": "mdi-content-save",
         onClick: saveConfig
       }, {
-        default: _withCtx(() => [...(_cache[51] || (_cache[51] = [
+        default: _withCtx(() => [...(_cache[53] || (_cache[53] = [
           _createTextVNode("保存配置", -1)
         ]))]),
         _: 1
@@ -738,7 +742,7 @@ return (_ctx, _cache) => {
     ]),
     _createVNode(_component_v_dialog, {
       modelValue: dialog.value,
-      "onUpdate:modelValue": _cache[32] || (_cache[32] = $event => ((dialog).value = $event)),
+      "onUpdate:modelValue": _cache[34] || (_cache[34] = $event => ((dialog).value = $event)),
       "max-width": "800",
       scrollable: ""
     }, {
@@ -869,12 +873,12 @@ return (_ctx, _cache) => {
                     size: "small",
                     class: "mr-1"
                   }, {
-                    default: _withCtx(() => [...(_cache[52] || (_cache[52] = [
+                    default: _withCtx(() => [...(_cache[54] || (_cache[54] = [
                       _createTextVNode("mdi-arrow-decision", -1)
                     ]))]),
                     _: 1
                   }),
-                  _cache[53] || (_cache[53] = _createTextVNode(" 投递去向（两种可同时用，至少选一种） ", -1))
+                  _cache[55] || (_cache[55] = _createTextVNode(" 投递去向（两种可同时用，至少选一种） ", -1))
                 ]),
                 _createVNode(_component_v_row, { dense: "" }, {
                   default: _withCtx(() => [
@@ -989,7 +993,7 @@ return (_ctx, _cache) => {
                       density: "compact",
                       class: "mt-2 text-caption"
                     }, {
-                      default: _withCtx(() => [...(_cache[54] || (_cache[54] = [
+                      default: _withCtx(() => [...(_cache[56] || (_cache[56] = [
                         _createTextVNode(" 转发到 Discord 时会自动屏蔽 @everyone / 身份组提及，并跳过 Bot 自己发的消息防止死循环。 ", -1)
                       ]))]),
                       _: 1
@@ -999,7 +1003,7 @@ return (_ctx, _cache) => {
                 _createVNode(_component_v_row, { dense: "" }, {
                   default: _withCtx(() => [
                     _createVNode(_component_v_col, {
-                      cols: "12",
+                      cols: "6",
                       md: "3"
                     }, {
                       default: _withCtx(() => [
@@ -1009,13 +1013,14 @@ return (_ctx, _cache) => {
                           label: "消息聚合",
                           color: "info",
                           density: "compact",
-                          "hide-details": ""
+                          "hide-details": "",
+                          title: "多条新消息合并成一条通知；想让每条码单独一条就关掉"
                         }, null, 8, ["modelValue"])
                       ]),
                       _: 1
                     }),
                     _createVNode(_component_v_col, {
-                      cols: "12",
+                      cols: "6",
                       md: "3"
                     }, {
                       default: _withCtx(() => [
@@ -1029,10 +1034,45 @@ return (_ctx, _cache) => {
                         }, null, 8, ["modelValue"])
                       ]),
                       _: 1
+                    }),
+                    _createVNode(_component_v_col, {
+                      cols: "6",
+                      md: "3"
+                    }, {
+                      default: _withCtx(() => [
+                        _createVNode(_component_v_switch, {
+                          modelValue: editRule.value.jump_link,
+                          "onUpdate:modelValue": _cache[23] || (_cache[23] = $event => ((editRule.value.jump_link) = $event)),
+                          label: "跳转链接",
+                          color: "info",
+                          density: "compact",
+                          "hide-details": "",
+                          title: "通知末尾的「点击查看：…」，关掉就不再附带"
+                        }, null, 8, ["modelValue"])
+                      ]),
+                      _: 1
+                    }),
+                    _createVNode(_component_v_col, {
+                      cols: "6",
+                      md: "3"
+                    }, {
+                      default: _withCtx(() => [
+                        _createVNode(_component_v_switch, {
+                          modelValue: editRule.value.dedup,
+                          "onUpdate:modelValue": _cache[24] || (_cache[24] = $event => ((editRule.value.dedup) = $event)),
+                          label: "重复检测",
+                          color: "info",
+                          density: "compact",
+                          "hide-details": "",
+                          title: "内容与近 7 天内已转发过的相同就不再发"
+                        }, null, 8, ["modelValue"])
+                      ]),
+                      _: 1
                     })
                   ]),
                   _: 1
                 }),
+                _cache[63] || (_cache[63] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mb-2" }, " 跳转链接 = 通知末尾的「点击查看：…」；重复检测 = 内容与近 7 天已转发的相同则跳过（有提取正则时按提取内容判定） ", -1)),
                 _createVNode(_component_v_expansion_panels, {
                   variant: "accordion",
                   class: "mt-2"
@@ -1046,12 +1086,12 @@ return (_ctx, _cache) => {
                               size: "small",
                               class: "mr-2"
                             }, {
-                              default: _withCtx(() => [...(_cache[55] || (_cache[55] = [
+                              default: _withCtx(() => [...(_cache[57] || (_cache[57] = [
                                 _createTextVNode("mdi-filter", -1)
                               ]))]),
                               _: 1
                             }),
-                            _cache[56] || (_cache[56] = _createTextVNode(" 过滤规则（可选，留空全部转发） ", -1))
+                            _cache[58] || (_cache[58] = _createTextVNode(" 过滤规则（可选，留空全部转发） ", -1))
                           ]),
                           _: 1
                         }),
@@ -1066,7 +1106,7 @@ return (_ctx, _cache) => {
                                   default: _withCtx(() => [
                                     _createVNode(_component_v_text_field, {
                                       modelValue: editRule.value.keywords,
-                                      "onUpdate:modelValue": _cache[23] || (_cache[23] = $event => ((editRule.value.keywords) = $event)),
+                                      "onUpdate:modelValue": _cache[25] || (_cache[25] = $event => ((editRule.value.keywords) = $event)),
                                       label: "关键词（白名单）",
                                       placeholder: "含任一关键词才转发，逗号或 | 分隔",
                                       density: "compact",
@@ -1083,7 +1123,7 @@ return (_ctx, _cache) => {
                                   default: _withCtx(() => [
                                     _createVNode(_component_v_text_field, {
                                       modelValue: editRule.value.blocked_keywords,
-                                      "onUpdate:modelValue": _cache[24] || (_cache[24] = $event => ((editRule.value.blocked_keywords) = $event)),
+                                      "onUpdate:modelValue": _cache[26] || (_cache[26] = $event => ((editRule.value.blocked_keywords) = $event)),
                                       label: "屏蔽词（黑名单）",
                                       placeholder: "含任一屏蔽词不转发",
                                       density: "compact",
@@ -1100,7 +1140,7 @@ return (_ctx, _cache) => {
                                   default: _withCtx(() => [
                                     _createVNode(_component_v_text_field, {
                                       modelValue: editRule.value.author_include,
-                                      "onUpdate:modelValue": _cache[25] || (_cache[25] = $event => ((editRule.value.author_include) = $event)),
+                                      "onUpdate:modelValue": _cache[27] || (_cache[27] = $event => ((editRule.value.author_include) = $event)),
                                       label: "只转发这些作者",
                                       placeholder: "用户名精确匹配，不分大小写",
                                       density: "compact",
@@ -1117,7 +1157,7 @@ return (_ctx, _cache) => {
                                   default: _withCtx(() => [
                                     _createVNode(_component_v_text_field, {
                                       modelValue: editRule.value.author_exclude,
-                                      "onUpdate:modelValue": _cache[26] || (_cache[26] = $event => ((editRule.value.author_exclude) = $event)),
+                                      "onUpdate:modelValue": _cache[28] || (_cache[28] = $event => ((editRule.value.author_exclude) = $event)),
                                       label: "屏蔽这些作者",
                                       placeholder: "用户名精确匹配，不分大小写",
                                       density: "compact",
@@ -1144,12 +1184,12 @@ return (_ctx, _cache) => {
                               size: "small",
                               class: "mr-2"
                             }, {
-                              default: _withCtx(() => [...(_cache[57] || (_cache[57] = [
+                              default: _withCtx(() => [...(_cache[59] || (_cache[59] = [
                                 _createTextVNode("mdi-tune", -1)
                               ]))]),
                               _: 1
                             }),
-                            _cache[58] || (_cache[58] = _createTextVNode(" 高级选项（可选，默认即可） ", -1))
+                            _cache[60] || (_cache[60] = _createTextVNode(" 高级选项（可选，默认即可） ", -1))
                           ]),
                           _: 1
                         }),
@@ -1161,7 +1201,7 @@ return (_ctx, _cache) => {
                                   default: _withCtx(() => [
                                     _createVNode(_component_v_text_field, {
                                       modelValue: editRule.value.code_regex,
-                                      "onUpdate:modelValue": _cache[27] || (_cache[27] = $event => ((editRule.value.code_regex) = $event)),
+                                      "onUpdate:modelValue": _cache[29] || (_cache[29] = $event => ((editRule.value.code_regex) = $event)),
                                       label: "内容提取正则（如礼包码）",
                                       placeholder: "留空不提取；可点右侧「示例」直接填入",
                                       density: "compact",
@@ -1179,7 +1219,7 @@ return (_ctx, _cache) => {
                                               color: "info",
                                               "prepend-icon": "mdi-lightbulb-on-outline"
                                             }), {
-                                              default: _withCtx(() => [...(_cache[59] || (_cache[59] = [
+                                              default: _withCtx(() => [...(_cache[61] || (_cache[61] = [
                                                 _createTextVNode(" 示例 ", -1)
                                               ]))]),
                                               _: 1
@@ -1217,7 +1257,7 @@ return (_ctx, _cache) => {
                                                   ? (_openBlock(), _createBlock(_component_v_list_item, { key: 0 }, {
                                                       default: _withCtx(() => [
                                                         _createVNode(_component_v_list_item_title, null, {
-                                                          default: _withCtx(() => [...(_cache[60] || (_cache[60] = [
+                                                          default: _withCtx(() => [...(_cache[62] || (_cache[62] = [
                                                             _createTextVNode("示例加载中…", -1)
                                                           ]))]),
                                                           _: 1
@@ -1246,7 +1286,7 @@ return (_ctx, _cache) => {
                                       default: _withCtx(() => [
                                         _createVNode(_component_v_textarea, {
                                           modelValue: editRule.value.discord_template,
-                                          "onUpdate:modelValue": _cache[28] || (_cache[28] = $event => ((editRule.value.discord_template) = $event)),
+                                          "onUpdate:modelValue": _cache[30] || (_cache[30] = $event => ((editRule.value.discord_template) = $event)),
                                           label: "Discord 转发模板",
                                           rows: "3",
                                           placeholder: "**{channel}** · {author} · {time}\n{content}\n🎁 {codes}\n🔗 {link}",
@@ -1267,7 +1307,7 @@ return (_ctx, _cache) => {
                                   default: _withCtx(() => [
                                     _createVNode(_component_v_text_field, {
                                       modelValue: editRule.value.title_template,
-                                      "onUpdate:modelValue": _cache[29] || (_cache[29] = $event => ((editRule.value.title_template) = $event)),
+                                      "onUpdate:modelValue": _cache[31] || (_cache[31] = $event => ((editRule.value.title_template) = $event)),
                                       label: "标题模板",
                                       placeholder: "【Discord | {channel}】",
                                       density: "compact",
@@ -1284,7 +1324,7 @@ return (_ctx, _cache) => {
                                   default: _withCtx(() => [
                                     _createVNode(_component_v_textarea, {
                                       modelValue: editRule.value.text_template,
-                                      "onUpdate:modelValue": _cache[30] || (_cache[30] = $event => ((editRule.value.text_template) = $event)),
+                                      "onUpdate:modelValue": _cache[32] || (_cache[32] = $event => ((editRule.value.text_template) = $event)),
                                       label: "内容模板",
                                       rows: "3",
                                       placeholder: "{content}\\n\\n🎁 提取内容：{codes}\\n\\n👤 {author}  🕐 {time}",
@@ -1318,9 +1358,9 @@ return (_ctx, _cache) => {
                 _createVNode(_component_v_spacer),
                 _createVNode(_component_v_btn, {
                   variant: "text",
-                  onClick: _cache[31] || (_cache[31] = $event => (dialog.value = false))
+                  onClick: _cache[33] || (_cache[33] = $event => (dialog.value = false))
                 }, {
-                  default: _withCtx(() => [...(_cache[61] || (_cache[61] = [
+                  default: _withCtx(() => [...(_cache[64] || (_cache[64] = [
                     _createTextVNode("取消", -1)
                   ]))]),
                   _: 1
@@ -1329,7 +1369,7 @@ return (_ctx, _cache) => {
                   color: "primary",
                   onClick: confirmRule
                 }, {
-                  default: _withCtx(() => [...(_cache[62] || (_cache[62] = [
+                  default: _withCtx(() => [...(_cache[65] || (_cache[65] = [
                     _createTextVNode("确定", -1)
                   ]))]),
                   _: 1
@@ -1345,14 +1385,14 @@ return (_ctx, _cache) => {
     }, 8, ["modelValue"]),
     _createVNode(_component_v_dialog, {
       modelValue: deleteDialog.value,
-      "onUpdate:modelValue": _cache[34] || (_cache[34] = $event => ((deleteDialog).value = $event)),
+      "onUpdate:modelValue": _cache[36] || (_cache[36] = $event => ((deleteDialog).value = $event)),
       "max-width": "360"
     }, {
       default: _withCtx(() => [
         _createVNode(_component_v_card, null, {
           default: _withCtx(() => [
             _createVNode(_component_v_card_title, null, {
-              default: _withCtx(() => [...(_cache[63] || (_cache[63] = [
+              default: _withCtx(() => [...(_cache[66] || (_cache[66] = [
                 _createTextVNode("删除规则", -1)
               ]))]),
               _: 1
@@ -1368,9 +1408,9 @@ return (_ctx, _cache) => {
                 _createVNode(_component_v_spacer),
                 _createVNode(_component_v_btn, {
                   variant: "text",
-                  onClick: _cache[33] || (_cache[33] = $event => (deleteDialog.value = false))
+                  onClick: _cache[35] || (_cache[35] = $event => (deleteDialog.value = false))
                 }, {
-                  default: _withCtx(() => [...(_cache[64] || (_cache[64] = [
+                  default: _withCtx(() => [...(_cache[67] || (_cache[67] = [
                     _createTextVNode("取消", -1)
                   ]))]),
                   _: 1
@@ -1379,7 +1419,7 @@ return (_ctx, _cache) => {
                   color: "error",
                   onClick: confirmDelete
                 }, {
-                  default: _withCtx(() => [...(_cache[65] || (_cache[65] = [
+                  default: _withCtx(() => [...(_cache[68] || (_cache[68] = [
                     _createTextVNode("删除", -1)
                   ]))]),
                   _: 1
@@ -1398,6 +1438,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Config = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-f2d8860e"]]);
+const Config = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-c27a03d9"]]);
 
 export { Config as default };
