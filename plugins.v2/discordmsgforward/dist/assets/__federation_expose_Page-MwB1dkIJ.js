@@ -1,24 +1,30 @@
 import { importShared } from './__federation_fn_import-JrT3xvdd.js';
 import { _ as _export_sfc } from './_plugin-vue_export-helper-pcqpp-6-.js';
 
-const {toDisplayString:_toDisplayString,createTextVNode:_createTextVNode,resolveComponent:_resolveComponent,withCtx:_withCtx,openBlock:_openBlock,createBlock:_createBlock,createCommentVNode:_createCommentVNode,createVNode:_createVNode,createElementVNode:_createElementVNode,renderList:_renderList,Fragment:_Fragment,createElementBlock:_createElementBlock} = await importShared('vue');
+const {toDisplayString:_toDisplayString,createTextVNode:_createTextVNode,resolveComponent:_resolveComponent,withCtx:_withCtx,openBlock:_openBlock,createBlock:_createBlock,createCommentVNode:_createCommentVNode,createVNode:_createVNode,createElementVNode:_createElementVNode,Fragment:_Fragment,createElementBlock:_createElementBlock,renderList:_renderList} = await importShared('vue');
 
 
 const _hoisted_1 = { class: "plugin-page" };
 const _hoisted_2 = { class: "text-h6" };
 const _hoisted_3 = { class: "text-caption" };
 const _hoisted_4 = { class: "text-h6" };
-const _hoisted_5 = { class: "text-no-wrap" };
+const _hoisted_5 = { class: "text-caption" };
 const _hoisted_6 = { class: "text-no-wrap" };
 const _hoisted_7 = { class: "text-no-wrap" };
-const _hoisted_8 = { class: "content-cell" };
-const _hoisted_9 = { key: 1 };
-const _hoisted_10 = { class: "d-flex mt-4" };
+const _hoisted_8 = { class: "target-cell" };
+const _hoisted_9 = { class: "text-no-wrap" };
+const _hoisted_10 = { class: "content-cell" };
+const _hoisted_11 = { key: 1 };
+const _hoisted_12 = { class: "d-flex mt-4" };
 
-const {ref,onMounted} = await importShared('vue');
+const {ref,computed,onMounted} = await importShared('vue');
 
 
 const PLUGIN_ID = 'DiscordMsgForward';
+
+// 后端拿不到状态时的兜底地址，保证「使用说明」按钮任何时候都可点
+const FALLBACK_DOCS_URL =
+  'https://github.com/SAGIRIxr/MoviePilot-Plugins/blob/main/plugins.v2/discordmsgforward/README.md';
 
 
 const _sfc_main = {
@@ -40,6 +46,8 @@ const checking = ref(false);
 const message = ref('');
 const messageType = ref('info');
 const clearDialog = ref(false);
+
+const docsUrl = computed(() => status.value?.docs_url || FALLBACK_DOCS_URL);
 
 function showMessage(text, type = 'info') {
   message.value = text;
@@ -133,8 +141,24 @@ return (_ctx, _cache) => {
               ]))]),
               _: 1
             }),
-            _cache[9] || (_cache[9] = _createTextVNode(" 运行状态 ", -1)),
+            _cache[10] || (_cache[10] = _createTextVNode(" 运行状态 ", -1)),
             _createVNode(_component_v_spacer),
+            _createVNode(_component_v_btn, {
+              size: "small",
+              variant: "tonal",
+              color: "primary",
+              class: "mr-2",
+              "prepend-icon": "mdi-book-open-variant",
+              "append-icon": "mdi-open-in-new",
+              href: docsUrl.value,
+              target: "_blank",
+              rel: "noopener noreferrer"
+            }, {
+              default: _withCtx(() => [...(_cache[6] || (_cache[6] = [
+                _createTextVNode(" 使用说明 ", -1)
+              ]))]),
+              _: 1
+            }, 8, ["href"]),
             _createVNode(_component_v_btn, {
               size: "small",
               variant: "tonal",
@@ -144,7 +168,7 @@ return (_ctx, _cache) => {
               "prepend-icon": "mdi-play",
               onClick: checkNow
             }, {
-              default: _withCtx(() => [...(_cache[6] || (_cache[6] = [
+              default: _withCtx(() => [...(_cache[7] || (_cache[7] = [
                 _createTextVNode(" 立即检查 ", -1)
               ]))]),
               _: 1
@@ -158,7 +182,7 @@ return (_ctx, _cache) => {
               "prepend-icon": "mdi-refresh",
               onClick: loadData
             }, {
-              default: _withCtx(() => [...(_cache[7] || (_cache[7] = [
+              default: _withCtx(() => [...(_cache[8] || (_cache[8] = [
                 _createTextVNode(" 刷新 ", -1)
               ]))]),
               _: 1
@@ -169,7 +193,7 @@ return (_ctx, _cache) => {
               "prepend-icon": "mdi-cog",
               onClick: _cache[0] || (_cache[0] = $event => (emit('switch')))
             }, {
-              default: _withCtx(() => [...(_cache[8] || (_cache[8] = [
+              default: _withCtx(() => [...(_cache[9] || (_cache[9] = [
                 _createTextVNode(" 配置 ", -1)
               ]))]),
               _: 1
@@ -188,7 +212,7 @@ return (_ctx, _cache) => {
                       md: "3"
                     }, {
                       default: _withCtx(() => [
-                        _cache[10] || (_cache[10] = _createElementVNode("div", { class: "text-caption" }, "插件状态", -1)),
+                        _cache[11] || (_cache[11] = _createElementVNode("div", { class: "text-caption" }, "插件状态", -1)),
                         _createVNode(_component_v_chip, {
                           color: status.value.enabled ? 'success' : 'grey',
                           size: "small",
@@ -207,9 +231,16 @@ return (_ctx, _cache) => {
                       md: "3"
                     }, {
                       default: _withCtx(() => [
-                        _cache[11] || (_cache[11] = _createElementVNode("div", { class: "text-caption" }, "转发规则", -1)),
+                        _cache[12] || (_cache[12] = _createElementVNode("div", { class: "text-caption" }, "转发规则", -1)),
                         _createElementVNode("span", _hoisted_2, _toDisplayString(status.value.rules_enabled), 1),
-                        _createElementVNode("span", _hoisted_3, " / " + _toDisplayString(status.value.rules_total) + " 条启用", 1)
+                        _createElementVNode("span", _hoisted_3, [
+                          _createTextVNode(" / " + _toDisplayString(status.value.rules_total) + " 条启用", 1),
+                          (status.value.forward_rules)
+                            ? (_openBlock(), _createElementBlock(_Fragment, { key: 0 }, [
+                                _createTextVNode("，" + _toDisplayString(status.value.forward_rules) + " 条转 Discord", 1)
+                              ], 64))
+                            : _createCommentVNode("", true)
+                        ])
                       ]),
                       _: 1
                     }),
@@ -218,9 +249,9 @@ return (_ctx, _cache) => {
                       md: "3"
                     }, {
                       default: _withCtx(() => [
-                        _cache[12] || (_cache[12] = _createElementVNode("div", { class: "text-caption" }, "免打扰暂存", -1)),
+                        _cache[13] || (_cache[13] = _createElementVNode("div", { class: "text-caption" }, "待发送", -1)),
                         _createElementVNode("span", _hoisted_4, _toDisplayString(status.value.pending_count), 1),
-                        _cache[13] || (_cache[13] = _createElementVNode("span", { class: "text-caption" }, " 条待推送", -1))
+                        _createElementVNode("span", _hoisted_5, " 暂存 / " + _toDisplayString(status.value.retry_count || 0) + " 重试", 1)
                       ]),
                       _: 1
                     }),
@@ -259,6 +290,35 @@ return (_ctx, _cache) => {
                       ]),
                       _: 1
                     }))
+                  : _createCommentVNode("", true),
+                (!status.value.token_set || !status.value.rules_total)
+                  ? (_openBlock(), _createBlock(_component_v_alert, {
+                      key: 1,
+                      type: "info",
+                      variant: "tonal",
+                      density: "compact",
+                      class: "mt-3"
+                    }, {
+                      default: _withCtx(() => [
+                        _cache[16] || (_cache[16] = _createElementVNode("div", { class: "mb-2" }, " 还没配置好：需要先在 Discord 开发者后台建一个 Bot、把它拉进服务器，再回来填 Token 并添加规则。 ", -1)),
+                        _createVNode(_component_v_btn, {
+                          size: "small",
+                          color: "primary",
+                          variant: "flat",
+                          "prepend-icon": "mdi-book-open-variant",
+                          "append-icon": "mdi-open-in-new",
+                          href: docsUrl.value,
+                          target: "_blank",
+                          rel: "noopener noreferrer"
+                        }, {
+                          default: _withCtx(() => [...(_cache[15] || (_cache[15] = [
+                            _createTextVNode(" 查看使用说明 ", -1)
+                          ]))]),
+                          _: 1
+                        }, 8, ["href"])
+                      ]),
+                      _: 1
+                    }))
                   : _createCommentVNode("", true)
               ]),
               _: 1
@@ -275,12 +335,12 @@ return (_ctx, _cache) => {
               color: "info",
               class: "mr-2"
             }, {
-              default: _withCtx(() => [...(_cache[15] || (_cache[15] = [
+              default: _withCtx(() => [...(_cache[17] || (_cache[17] = [
                 _createTextVNode("mdi-history", -1)
               ]))]),
               _: 1
             }),
-            _cache[17] || (_cache[17] = _createTextVNode(" 转发历史 ", -1)),
+            _cache[19] || (_cache[19] = _createTextVNode(" 转发历史 ", -1)),
             _createVNode(_component_v_spacer),
             (history.value.length)
               ? (_openBlock(), _createBlock(_component_v_btn, {
@@ -291,7 +351,7 @@ return (_ctx, _cache) => {
                   "prepend-icon": "mdi-delete-sweep",
                   onClick: _cache[1] || (_cache[1] = $event => (clearDialog.value = true))
                 }, {
-                  default: _withCtx(() => [...(_cache[16] || (_cache[16] = [
+                  default: _withCtx(() => [...(_cache[18] || (_cache[18] = [
                     _createTextVNode(" 清空 ", -1)
                   ]))]),
                   _: 1
@@ -309,7 +369,7 @@ return (_ctx, _cache) => {
                   type: "info",
                   variant: "tonal"
                 }, {
-                  default: _withCtx(() => [...(_cache[18] || (_cache[18] = [
+                  default: _withCtx(() => [...(_cache[20] || (_cache[20] = [
                     _createTextVNode(" 暂无转发记录 ", -1)
                   ]))]),
                   _: 1
@@ -320,11 +380,12 @@ return (_ctx, _cache) => {
                   density: "compact"
                 }, {
                   default: _withCtx(() => [
-                    _cache[19] || (_cache[19] = _createElementVNode("thead", null, [
+                    _cache[21] || (_cache[21] = _createElementVNode("thead", null, [
                       _createElementVNode("tr", null, [
                         _createElementVNode("th", { class: "text-start" }, "时间"),
                         _createElementVNode("th", { class: "text-start" }, "规则"),
                         _createElementVNode("th", { class: "text-start" }, "频道"),
+                        _createElementVNode("th", { class: "text-start" }, "去向"),
                         _createElementVNode("th", { class: "text-start" }, "发送者"),
                         _createElementVNode("th", { class: "text-start" }, "内容"),
                         _createElementVNode("th", { class: "text-start" }, "条数"),
@@ -334,11 +395,12 @@ return (_ctx, _cache) => {
                     _createElementVNode("tbody", null, [
                       (_openBlock(true), _createElementBlock(_Fragment, null, _renderList(history.value, (h, i) => {
                         return (_openBlock(), _createElementBlock("tr", { key: i }, [
-                          _createElementVNode("td", _hoisted_5, _toDisplayString(h.date), 1),
-                          _createElementVNode("td", _hoisted_6, _toDisplayString(h.rule || '-'), 1),
+                          _createElementVNode("td", _hoisted_6, _toDisplayString(h.date), 1),
+                          _createElementVNode("td", _hoisted_7, _toDisplayString(h.rule || '-'), 1),
                           _createElementVNode("td", null, _toDisplayString(h.channel), 1),
-                          _createElementVNode("td", _hoisted_7, _toDisplayString(h.author), 1),
-                          _createElementVNode("td", _hoisted_8, _toDisplayString(h.content), 1),
+                          _createElementVNode("td", _hoisted_8, _toDisplayString(h.targets || '-'), 1),
+                          _createElementVNode("td", _hoisted_9, _toDisplayString(h.author), 1),
+                          _createElementVNode("td", _hoisted_10, _toDisplayString(h.content), 1),
                           _createElementVNode("td", null, _toDisplayString(h.count || 1), 1),
                           _createElementVNode("td", null, [
                             (h.codes)
@@ -353,7 +415,7 @@ return (_ctx, _cache) => {
                                   ]),
                                   _: 2
                                 }, 1024))
-                              : (_openBlock(), _createElementBlock("span", _hoisted_9, "-"))
+                              : (_openBlock(), _createElementBlock("span", _hoisted_11, "-"))
                           ])
                         ]))
                       }), 128))
@@ -367,13 +429,13 @@ return (_ctx, _cache) => {
       ]),
       _: 1
     }),
-    _createElementVNode("div", _hoisted_10, [
+    _createElementVNode("div", _hoisted_12, [
       _createVNode(_component_v_spacer),
       _createVNode(_component_v_btn, {
         variant: "text",
         onClick: _cache[2] || (_cache[2] = $event => (emit('close')))
       }, {
-        default: _withCtx(() => [...(_cache[20] || (_cache[20] = [
+        default: _withCtx(() => [...(_cache[22] || (_cache[22] = [
           _createTextVNode("关闭", -1)
         ]))]),
         _: 1
@@ -388,13 +450,13 @@ return (_ctx, _cache) => {
         _createVNode(_component_v_card, null, {
           default: _withCtx(() => [
             _createVNode(_component_v_card_title, null, {
-              default: _withCtx(() => [...(_cache[21] || (_cache[21] = [
+              default: _withCtx(() => [...(_cache[23] || (_cache[23] = [
                 _createTextVNode("清空历史", -1)
               ]))]),
               _: 1
             }),
             _createVNode(_component_v_card_text, null, {
-              default: _withCtx(() => [...(_cache[22] || (_cache[22] = [
+              default: _withCtx(() => [...(_cache[24] || (_cache[24] = [
                 _createTextVNode("确定清空全部转发历史记录吗？此操作不可恢复。", -1)
               ]))]),
               _: 1
@@ -406,7 +468,7 @@ return (_ctx, _cache) => {
                   variant: "text",
                   onClick: _cache[3] || (_cache[3] = $event => (clearDialog.value = false))
                 }, {
-                  default: _withCtx(() => [...(_cache[23] || (_cache[23] = [
+                  default: _withCtx(() => [...(_cache[25] || (_cache[25] = [
                     _createTextVNode("取消", -1)
                   ]))]),
                   _: 1
@@ -415,7 +477,7 @@ return (_ctx, _cache) => {
                   color: "error",
                   onClick: clearHistory
                 }, {
-                  default: _withCtx(() => [...(_cache[24] || (_cache[24] = [
+                  default: _withCtx(() => [...(_cache[26] || (_cache[26] = [
                     _createTextVNode("清空", -1)
                   ]))]),
                   _: 1
@@ -434,6 +496,6 @@ return (_ctx, _cache) => {
 }
 
 };
-const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-299f0c0c"]]);
+const Page = /*#__PURE__*/_export_sfc(_sfc_main, [['__scopeId',"data-v-147a09ea"]]);
 
 export { Page as default };
