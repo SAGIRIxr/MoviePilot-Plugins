@@ -10,13 +10,19 @@ const emit = defineEmits(['save', 'close', 'switch'])
 
 const PLUGIN_ID = 'DiscordMsgForward'
 
+const DOCS_URL =
+  'https://github.com/SAGIRIxr/MoviePilot-Plugins/blob/main/plugins.v2/discordmsgforward/README.md'
+
 function defaultRule() {
   return {
     id: Math.random().toString(36).slice(2, 10),
     name: '',
     enabled: true,
     channels: [],
+    notify_enabled: true,
     notify_channels: [],
+    forward_channels: [],
+    discord_template: '',
     keywords: '',
     blocked_keywords: '',
     author_include: '',
@@ -45,6 +51,7 @@ const config = reactive({
 const channelOptions = ref([])
 const notifierOptions = ref([])
 const msgtypeOptions = ref([])
+const regexPresets = ref([])
 const loadingChannels = ref(false)
 const showToken = ref(false)
 const message = ref('')
@@ -61,17 +68,31 @@ const deleteIndex = ref(-1)
 
 // 手动添加频道 ID
 const manualChannel = ref('')
+const manualForward = ref('')
 
-function addManualChannel() {
-  const cid = manualChannel.value.trim()
+function addManualId(source, field) {
+  const cid = source.value.trim()
   if (!/^\d{5,}$/.test(cid)) {
     showMessage('频道 ID 应为纯数字', 'error')
     return
   }
-  if (!editRule.value.channels.includes(cid)) {
-    editRule.value.channels.push(cid)
+  if (!editRule.value[field].includes(cid)) {
+    editRule.value[field].push(cid)
   }
-  manualChannel.value = ''
+  source.value = ''
+}
+
+function addManualChannel() {
+  addManualId(manualChannel, 'channels')
+}
+
+function addManualForward() {
+  addManualId(manualForward, 'forward_channels')
+}
+
+function applyPreset(preset) {
+  editRule.value.code_regex = preset.value
+  showMessage(`已填入「${preset.title}」正则`, 'success')
 }
 
 const channelNameMap = computed(() => {
@@ -92,12 +113,14 @@ function showMessage(text, type = 'info') {
 
 async function loadOptions() {
   try {
-    const [notifiers, msgtypes] = await Promise.all([
+    const [notifiers, msgtypes, presets] = await Promise.all([
       props.api.get(`plugin/${PLUGIN_ID}/notifiers`),
       props.api.get(`plugin/${PLUGIN_ID}/msgtypes`),
+      props.api.get(`plugin/${PLUGIN_ID}/regex_presets`),
     ])
     notifierOptions.value = notifiers?.options || []
     msgtypeOptions.value = msgtypes?.options || []
+    regexPresets.value = presets?.options || []
   } catch (e) {
     console.error('加载选项失败', e)
   }
@@ -135,6 +158,10 @@ function confirmRule() {
   if (!editRule.value.name) {
     editRule.value.name = `规则 ${config.rules.length + 1}`
   }
+  if (!editRule.value.notify_enabled && !editRule.value.forward_channels.length) {
+    showMessage('请至少选择一个去向：推送到通知渠道，或转发到 Discord 频道', 'error')
+    return
+  }
   if (editIndex.value >= 0) {
     config.rules.splice(editIndex.value, 1, JSON.parse(JSON.stringify(editRule.value)))
   } else {
@@ -154,6 +181,17 @@ function confirmDelete() {
   }
   deleteDialog.value = false
   deleteIndex.value = -1
+}
+
+function ruleTargetSummary(rule) {
+  const parts = []
+  if (rule.notify_enabled) {
+    parts.push(rule.notify_channels.length ? rule.notify_channels.join('、') : '全部通知渠道')
+  }
+  if (rule.forward_channels?.length) {
+    parts.push('Discord: ' + rule.forward_channels.map(channelName).join('、'))
+  }
+  return parts.length ? parts.join('　+　') : '未选去向'
 }
 
 function ruleFilterSummary(rule) {
@@ -295,9 +333,9 @@ onMounted(() => {
                     未选频道
                   </v-chip>
                 </div>
-                <div class="text-caption mb-1">
+                <div class="text-caption mb-1 text-truncate">
                   <v-icon size="x-small" class="mr-1">mdi-send</v-icon>
-                  {{ rule.notify_channels.length ? rule.notify_channels.join('、') : '全部渠道' }}
+                  {{ ruleTargetSummary(rule) }}
                   <v-icon v-if="rule.quiet_hours" size="x-small" class="ml-2 mr-1">mdi-sleep</v-icon>
                   <span v-if="rule.quiet_hours">{{ rule.quiet_hours }}</span>
                 </div>
@@ -323,6 +361,12 @@ onMounted(() => {
 
     <!-- 操作按钮 -->
     <div class="d-flex">
+      <v-btn
+        variant="text" color="primary" prepend-icon="mdi-book-open-variant"
+        :href="DOCS_URL" target="_blank" rel="noopener noreferrer"
+      >
+        使用说明
+      </v-btn>
       <v-spacer />
       <v-btn class="mr-2" variant="text" @click="emit('switch')">详情页</v-btn>
       <v-btn class="mr-2" variant="text" @click="emit('close')">关闭</v-btn>
@@ -379,17 +423,62 @@ onMounted(() => {
               />
             </v-col>
           </v-row>
+          <v-divider class="my-3" />
+          <div class="text-subtitle-2 mb-2">
+            <v-icon size="small" class="mr-1">mdi-arrow-decision</v-icon>
+            投递去向（两种可同时用，至少选一种）
+          </div>
           <v-row dense>
-            <v-col cols="12">
+            <v-col cols="12" md="4">
+              <v-switch
+                v-model="editRule.notify_enabled" label="推送到通知渠道"
+                color="primary" density="compact" hide-details
+              />
+            </v-col>
+            <v-col cols="12" md="8">
               <v-select
-                v-model="editRule.notify_channels" label="转发渠道" :items="notifierOptions"
+                v-model="editRule.notify_channels" label="通知渠道" :items="notifierOptions"
                 item-title="title" item-value="value"
                 multiple chips closable-chips clearable
-                density="compact" variant="outlined" prepend-inner-icon="mdi-send-circle"
+                :disabled="!editRule.notify_enabled"
+                density="compact" variant="outlined" prepend-inner-icon="mdi-bell-ring"
                 hint="留空 = 发送到全部启用的通知渠道" persistent-hint
               />
             </v-col>
           </v-row>
+          <v-row dense class="mt-2">
+            <v-col cols="12">
+              <v-select
+                v-model="editRule.forward_channels" label="转发到 Discord 频道（频道 → 频道）"
+                :items="channelOptions" item-title="title" item-value="value"
+                multiple chips closable-chips clearable
+                density="compact" variant="outlined" prepend-inner-icon="mdi-forum"
+                :loading="loadingChannels"
+                hint="Bot 需要在目标频道有「发送消息」权限；留空则不转发到 Discord"
+                persistent-hint
+                no-data-text="暂无频道：请先在全局设置填写 Token 并保存，或点击「刷新频道列表」"
+              />
+            </v-col>
+          </v-row>
+          <v-row dense class="mt-2">
+            <v-col cols="12">
+              <v-text-field
+                v-model="manualForward" label="手动添加转发目标频道 ID（可选）"
+                placeholder="下拉列表没有的频道（如线程/论坛帖子）填 ID 后点 + 添加"
+                density="compact" variant="outlined" prepend-inner-icon="mdi-forum-plus"
+                append-inner-icon="mdi-plus-circle" hide-details
+                @click:append-inner="addManualForward"
+                @keyup.enter="addManualForward"
+              />
+            </v-col>
+          </v-row>
+          <v-alert
+            v-if="editRule.forward_channels.length" type="info" variant="tonal"
+            density="compact" class="mt-2 text-caption"
+          >
+            转发到 Discord 时会自动屏蔽 @everyone / 身份组提及，并跳过 Bot 自己发的消息防止死循环。
+          </v-alert>
+          <v-divider class="my-3" />
           <v-row dense>
             <v-col cols="12" md="3">
               <v-switch v-model="editRule.aggregate" label="消息聚合" color="info" density="compact" hide-details />
@@ -448,9 +537,45 @@ onMounted(() => {
                   <v-col cols="12">
                     <v-text-field
                       v-model="editRule.code_regex" label="内容提取正则（如礼包码）"
-                      placeholder="如：[A-Za-z0-9]{6,20}，留空不提取"
+                      placeholder="留空不提取；可点右侧「示例」直接填入"
                       density="compact" variant="outlined" prepend-inner-icon="mdi-regex"
                       hint="命中内容在通知中单独列出，对应模板变量 {codes}" persistent-hint
+                    >
+                      <template #append>
+                        <v-menu location="bottom end">
+                          <template #activator="{ props: menuProps }">
+                            <v-btn
+                              v-bind="menuProps" size="small" variant="tonal" color="info"
+                              prepend-icon="mdi-lightbulb-on-outline"
+                            >
+                              示例
+                            </v-btn>
+                          </template>
+                          <v-list density="compact" max-width="420">
+                            <v-list-item
+                              v-for="preset in regexPresets" :key="preset.title"
+                              @click="applyPreset(preset)"
+                            >
+                              <v-list-item-title>{{ preset.title }}</v-list-item-title>
+                              <v-list-item-subtitle class="text-wrap">
+                                {{ preset.desc }}
+                              </v-list-item-subtitle>
+                            </v-list-item>
+                            <v-list-item v-if="!regexPresets.length">
+                              <v-list-item-title>示例加载中…</v-list-item-title>
+                            </v-list-item>
+                          </v-list>
+                        </v-menu>
+                      </template>
+                    </v-text-field>
+                  </v-col>
+                  <v-col v-if="editRule.forward_channels.length" cols="12">
+                    <v-textarea
+                      v-model="editRule.discord_template" label="Discord 转发模板" rows="3"
+                      placeholder="**{channel}** · {author} · {time}&#10;{content}&#10;🎁 {codes}&#10;🔗 {link}"
+                      density="compact" variant="outlined" prepend-inner-icon="mdi-forum"
+                      hint="转发到 Discord 频道时用的正文，支持 Markdown，上限 2000 字；留空用默认模板"
+                      persistent-hint
                     />
                   </v-col>
                   <v-col cols="12" md="5">
@@ -465,7 +590,7 @@ onMounted(() => {
                       v-model="editRule.text_template" label="内容模板" rows="3"
                       placeholder="{content}\n\n🎁 提取内容：{codes}\n\n👤 {author}  🕐 {time}"
                       density="compact" variant="outlined" prepend-inner-icon="mdi-text"
-                      hint="变量：{channel} {author} {content} {codes} {time} {count}；提取内容为空时含 {codes} 的行自动隐藏" persistent-hint
+                      hint="变量：{channel} {author} {content} {codes} {time} {count} {link}；{codes}/{link} 为空时所在行自动隐藏" persistent-hint
                     />
                   </v-col>
                 </v-row>

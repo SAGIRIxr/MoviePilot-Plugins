@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 
 const props = defineProps({
   api: { type: Object, default: () => ({}) },
@@ -9,6 +9,10 @@ const emit = defineEmits(['action', 'switch', 'close'])
 
 const PLUGIN_ID = 'DiscordMsgForward'
 
+// 后端拿不到状态时的兜底地址，保证「使用说明」按钮任何时候都可点
+const FALLBACK_DOCS_URL =
+  'https://github.com/SAGIRIxr/MoviePilot-Plugins/blob/main/plugins.v2/discordmsgforward/README.md'
+
 const status = ref(null)
 const history = ref([])
 const loading = ref(false)
@@ -16,6 +20,8 @@ const checking = ref(false)
 const message = ref('')
 const messageType = ref('info')
 const clearDialog = ref(false)
+
+const docsUrl = computed(() => status.value?.docs_url || FALLBACK_DOCS_URL)
 
 function showMessage(text, type = 'info') {
   message.value = text
@@ -79,6 +85,13 @@ onMounted(loadData)
         运行状态
         <v-spacer />
         <v-btn
+          size="small" variant="tonal" color="primary" class="mr-2"
+          prepend-icon="mdi-book-open-variant" append-icon="mdi-open-in-new"
+          :href="docsUrl" target="_blank" rel="noopener noreferrer"
+        >
+          使用说明
+        </v-btn>
+        <v-btn
           size="small" variant="tonal" color="success" class="mr-2"
           :loading="checking" prepend-icon="mdi-play" @click="checkNow"
         >
@@ -106,12 +119,14 @@ onMounted(loadData)
           <v-col cols="6" md="3">
             <div class="text-caption">转发规则</div>
             <span class="text-h6">{{ status.rules_enabled }}</span>
-            <span class="text-caption"> / {{ status.rules_total }} 条启用</span>
+            <span class="text-caption">
+              / {{ status.rules_total }} 条启用<template v-if="status.forward_rules">，{{ status.forward_rules }} 条转 Discord</template>
+            </span>
           </v-col>
           <v-col cols="6" md="3">
-            <div class="text-caption">免打扰暂存</div>
+            <div class="text-caption">待发送</div>
             <span class="text-h6">{{ status.pending_count }}</span>
-            <span class="text-caption"> 条待推送</span>
+            <span class="text-caption"> 暂存 / {{ status.retry_count || 0 }} 重试</span>
           </v-col>
           <v-col cols="6" md="3">
             <div class="text-caption">Bot Token</div>
@@ -124,6 +139,21 @@ onMounted(loadData)
           v-if="status.fail_streak > 0" type="warning" variant="tonal" density="compact" class="mt-3"
         >
           已连续 {{ status.fail_streak }} 次轮询失败{{ status.last_error ? `：${status.last_error}` : '' }}
+        </v-alert>
+        <v-alert
+          v-if="!status.token_set || !status.rules_total"
+          type="info" variant="tonal" density="compact" class="mt-3"
+        >
+          <div class="mb-2">
+            还没配置好：需要先在 Discord 开发者后台建一个 Bot、把它拉进服务器，再回来填 Token 并添加规则。
+          </div>
+          <v-btn
+            size="small" color="primary" variant="flat"
+            prepend-icon="mdi-book-open-variant" append-icon="mdi-open-in-new"
+            :href="docsUrl" target="_blank" rel="noopener noreferrer"
+          >
+            查看使用说明
+          </v-btn>
         </v-alert>
       </v-card-text>
     </v-card>
@@ -152,6 +182,7 @@ onMounted(loadData)
               <th class="text-start">时间</th>
               <th class="text-start">规则</th>
               <th class="text-start">频道</th>
+              <th class="text-start">去向</th>
               <th class="text-start">发送者</th>
               <th class="text-start">内容</th>
               <th class="text-start">条数</th>
@@ -163,6 +194,7 @@ onMounted(loadData)
               <td class="text-no-wrap">{{ h.date }}</td>
               <td class="text-no-wrap">{{ h.rule || '-' }}</td>
               <td>{{ h.channel }}</td>
+              <td class="target-cell">{{ h.targets || '-' }}</td>
               <td class="text-no-wrap">{{ h.author }}</td>
               <td class="content-cell">{{ h.content }}</td>
               <td>{{ h.count || 1 }}</td>
@@ -199,6 +231,13 @@ onMounted(loadData)
 <style scoped>
 .content-cell {
   max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.target-cell {
+  max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Discord消息转发 插件单测：覆盖 v4.2.0 修复的 Bug 与健壮性行为"""
+"""Discord消息转发 插件单测：覆盖 v4.2.0 的稳定性修复与 v4.3.0 的频道互转 / 正则示例"""
 from datetime import datetime, timedelta
 
 import pytest
@@ -11,7 +11,8 @@ pytestmark = pytest.mark.v2
 def _rule(**kwargs):
     base = {
         "id": "r1", "name": "测试规则", "enabled": True,
-        "channels": ["100"], "notify_channels": [], "keywords": "",
+        "channels": ["100"], "notify_enabled": True, "notify_channels": [],
+        "forward_channels": [], "discord_template": "", "keywords": "",
         "blocked_keywords": "", "author_include": "", "author_exclude": "",
         "code_regex": "", "aggregate": True, "forward_image": True,
         "quiet_hours": "", "title_template": "", "text_template": "",
@@ -25,10 +26,16 @@ def _item(text="内容", author="小明", codes=None, when="2026-01-01 10:00:00"
             "image": None, "link": None, "codes": codes or []}
 
 
-def _msg(mid, content="hello", author="小明"):
+def _msg(mid, content="hello", author="小明", uid="u1"):
     return {"id": str(mid), "content": content,
-            "author": {"username": author},
+            "author": {"username": author, "id": uid},
             "timestamp": "2026-01-01T10:00:00+00:00"}
+
+
+def _resp(status=200, data=None, text=""):
+    """构造一个最小的 requests.Response 替身"""
+    return type("R", (), {"status_code": status, "text": text,
+                          "json": lambda self, d=data: d if d is not None else {}})()
 
 
 # ---------------- 模板渲染 ----------------
@@ -399,3 +406,279 @@ class RateLimitTest:
         assert parse(type("R", (), {"headers": {"Retry-After": "999"},
                                     "json": lambda self: {}})()) == 30.0
         assert parse(type("R", (), {"headers": {}, "json": lambda self: {}})()) == 3.0
+
+
+# ---------------- 内置礼包码正则示例 ----------------
+class GiftCodePresetTest:
+    """三段样本取自真实的 WOS 发码频道，__extract_text 会把 Embed 拼成这种形态"""
+
+    WSCO_EMBED = (
+        "🎁 NEW GIFT CODE AVAILABLE 🎁\n"
+        "A new official Whiteout Survival gift code has been released!\n"
+        "Redeem it now on the official redemption page.\n"
+        "✨ Gift Code: summer26jp\n"
+        "🔗 Redeem: Open redemption page\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 Aria 1.2 for your alliance Discord — auto-redeem all gift codes for your "
+        "entire alliance, plus war boards, Foundry planner, events, tickets & roles in one bot.\n"
+        "See plans & features → whiteoutsurvival-community.com/aria\n"
+        "🎁 NEW GIFT CODE AVAILABLE 🎁"
+    )
+    WSCO_NEWLINE = ("🎁 NEW GIFT CODE AVAILABLE 🎁\n✨ Gift Code\nsummer26jp\n"
+                    "🔗 Redeem\nOpen redemption page")
+    PLAIN_CODE = ("📌 Code: 47ar5vzKz\n"
+                  "⏰Valid Until: August 3, 23:59 (UTC+0)\n"
+                  "🥳 Redemption page: https://wos-giftcode.centurygame.com/")
+    BACKTICK_LIST = (
+        "Gift Codes\n"
+        "Active now · 7 Register ID · My Giftcodes — buttons below ━━━━━━━━━━━━━━━━ "
+        "`summer26jp`  `WOS0812`  `100gomYTKOR`  `GuDokYTKOR`  `2ndYoutubeKR`  "
+        "`1stYoutubeKR`  `gogoWOS` ━━━━━━━━━━━━━━━━  Updated 13 Aug 2026\n"
+        "────────────────────────\n"
+        "Made with ❤️ in Germany ＆ Poland\n"
+        "© WSCO Community – discord.gg/wos-community · Developed by Bros24 · State 214"
+    )
+
+    @pytest.mark.parametrize("sample, expected", [
+        ("WSCO_EMBED", ["summer26jp"]),
+        ("WSCO_NEWLINE", ["summer26jp"]),
+        ("PLAIN_CODE", ["47ar5vzKz"]),
+        ("BACKTICK_LIST", ["summer26jp", "WOS0812", "100gomYTKOR", "GuDokYTKOR",
+                           "2ndYoutubeKR", "1stYoutubeKR", "gogoWOS"]),
+    ])
+    def test_real_samples(self, dmf, sample, expected):
+        extract = dmf.DiscordMsgForward._DiscordMsgForward__extract_codes
+        assert extract(dmf.GIFTCODE_REGEX, getattr(self, sample)) == expected
+
+    @pytest.mark.parametrize("text", [
+        "🎁 NEW GIFT CODE AVAILABLE 🎁",           # 全大写英文，不是码
+        "Code Redeem Now on the site",             # 标签后没有冒号/换行
+        "Gift Code Expired yesterday",
+        "Please read the Code of Conduct",
+        "https://wos-giftcode.centurygame.com/",   # URL 里的 code
+        "auto-redeem all gift codes for your entire alliance",
+        "Gift Codes\nActive now · 7 Register ID",  # 复数标题后跟正文
+        "Code: ab1",                               # 太短
+        "Code: abcdefghij0123456789extra",         # 太长
+    ])
+    def test_no_false_positive(self, dmf, text):
+        extract = dmf.DiscordMsgForward._DiscordMsgForward__extract_codes
+        assert extract(dmf.GIFTCODE_REGEX, text) == []
+
+    def test_code_followed_by_cjk(self, dmf):
+        # 结尾用 (?![A-Za-z0-9]) 而不是 \b，中文紧跟在码后面也要能提取
+        extract = dmf.DiscordMsgForward._DiscordMsgForward__extract_codes
+        assert extract(dmf.GIFTCODE_REGEX, "Code: abc123兑换码") == ["abc123"]
+
+    def test_all_presets_compile(self, dmf):
+        import re
+        assert dmf.REGEX_PRESETS
+        for preset in dmf.REGEX_PRESETS:
+            re.compile(preset["value"])
+            assert preset["title"] and preset["desc"]
+
+    def test_preset_api_returns_options(self, dmf):
+        options = dmf.DiscordMsgForward.api_get_regex_presets()["options"]
+        assert any(o["value"] == dmf.GIFTCODE_REGEX for o in options)
+
+
+# ---------------- 投递去向 ----------------
+class RuleLegsTest:
+    def test_legs_resolution(self, dmf):
+        legs = dmf.DiscordMsgForward._DiscordMsgForward__rule_legs
+        assert legs(_rule()) == ["notify"]
+        assert legs(_rule(forward_channels=["900"])) == ["notify", "discord"]
+        assert legs(_rule(notify_enabled=False, forward_channels=["900"])) == ["discord"]
+        assert legs(_rule(notify_enabled=False)) == []
+
+    def test_legacy_rule_defaults_to_notify(self, dmf):
+        # 4.2.0 及以前保存的规则没有 notify_enabled 字段，必须仍然走通知渠道
+        legs = dmf.DiscordMsgForward._DiscordMsgForward__rule_legs
+        assert legs({"channels": ["100"]}) == ["notify"]
+
+    def test_rule_without_destination_drops_batch(self, plugin):
+        record = plugin._DiscordMsgForward__send_batch(
+            _rule(notify_enabled=False), "频道", [_item()])
+        assert record is None
+        assert plugin.sent == []
+        assert plugin.get_data("retry_queue") in (None, [])
+
+
+class ForwardTargetTest:
+    def test_watched_target_dropped_without_bot_id(self, plugin):
+        resolve = plugin._DiscordMsgForward__forward_targets
+        rule = _rule(channels=["100"], forward_channels=["100", "900"])
+        # 拿不到 Bot 自身 ID 时，指向被监听频道的目标必须放弃，否则会死循环刷屏
+        assert resolve(rule, {"100"}, None) == ["900"]
+
+    def test_watched_target_kept_with_bot_id(self, plugin):
+        resolve = plugin._DiscordMsgForward__forward_targets
+        rule = _rule(channels=["100"], forward_channels=["100", "900"])
+        assert resolve(rule, {"100"}, "bot1") == ["100", "900"]
+
+
+# ---------------- 频道 → 频道转发 ----------------
+class DiscordForwardTest:
+    def test_posts_to_target_channel(self, plugin, monkeypatch):
+        posts = []
+
+        def fake_post(path, payload, _retry=0):
+            posts.append((path, payload))
+            return _resp(200)
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_post", fake_post)
+        record = plugin._DiscordMsgForward__send_batch(
+            _rule(notify_enabled=False, forward_channels=["900"]),
+            "频道", [_item(text="正文内容")], bot_id="bot1")
+        assert record is not None
+        assert posts[0][0] == "/channels/900/messages"
+        assert "正文内容" in posts[0][1]["content"]
+        assert plugin.sent == []                       # 没有走通知渠道
+
+    def test_mentions_are_suppressed(self, plugin, monkeypatch):
+        posts = []
+
+        def fake_post(path, payload, _retry=0):
+            posts.append(payload)
+            return _resp(200)
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_post", fake_post)
+        plugin._DiscordMsgForward__send_batch(
+            _rule(notify_enabled=False, forward_channels=["900"]),
+            "频道", [_item(text="@everyone 快来")], bot_id="bot1")
+        assert posts[0]["allowed_mentions"] == {"parse": []}
+
+    def test_content_truncated_to_discord_limit(self, dmf, plugin, monkeypatch):
+        posts = []
+
+        def fake_post(path, payload, _retry=0):
+            posts.append(payload)
+            return _resp(200)
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_post", fake_post)
+        plugin._DiscordMsgForward__send_batch(
+            _rule(notify_enabled=False, forward_channels=["900"], discord_template="{content}"),
+            "频道", [_item(text="x" * 5000)], bot_id="bot1")
+        assert len(posts[0]["content"]) <= dmf.MAX_DISCORD_LENGTH
+        assert "已截断" in posts[0]["content"]
+
+    def test_one_target_fails_others_still_delivered(self, plugin, monkeypatch):
+        def fake_post(path, payload, _retry=0):
+            return _resp(403) if "/901/" in path else _resp(200)
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_post", fake_post)
+        record = plugin._DiscordMsgForward__send_batch(
+            _rule(notify_enabled=False, forward_channels=["901", "900"]),
+            "频道", [_item()], bot_id="bot1")
+        assert record is not None                       # 有一个成功就算送达
+        assert plugin.get_data("retry_queue") in (None, [])
+
+    def test_all_targets_fail_enters_retry(self, plugin, monkeypatch):
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_post",
+                            lambda path, payload, _retry=0: _resp(403))
+        record = plugin._DiscordMsgForward__send_batch(
+            _rule(notify_enabled=False, forward_channels=["900"]),
+            "频道", [_item()], bot_id="bot1")
+        assert record is None
+        assert plugin.get_data("retry_queue")[0]["legs"] == ["discord"]
+
+    def test_only_failed_leg_is_retried(self, plugin, monkeypatch):
+        """通知成功、Discord 失败时，重投只补发 Discord，通知不能重复推送"""
+        plugin._rules = [_rule(forward_channels=["900"])]
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_post",
+                            lambda path, payload, _retry=0: _resp(403))
+        record = plugin._DiscordMsgForward__send_batch(
+            _rule(forward_channels=["900"]), "频道", [_item()], bot_id="bot1")
+        assert record is not None and len(plugin.sent) == 1
+        assert plugin.get_data("retry_queue")[0]["legs"] == ["discord"]
+
+        posts = []
+
+        def ok_post(path, payload, _retry=0):
+            posts.append(path)
+            return _resp(200)
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_post", ok_post)
+        plugin._DiscordMsgForward__flush_retry(set(), "bot1")
+        assert len(plugin.sent) == 1                     # 通知没有被重复发送
+        assert posts == ["/channels/900/messages"]
+        assert plugin.get_data("retry_queue") == []
+
+    def test_post_5xx_not_auto_retried(self, plugin, monkeypatch):
+        """写接口 5xx 不能自动重试，否则可能重复发帖；只有 429 才重试"""
+        calls = []
+
+        class _FakeSession:
+            def post(self, *a, **k):
+                calls.append(1)
+                return type("R", (), {"status_code": 500, "text": "",
+                                      "headers": {}, "json": lambda self: {}})()
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__get_session", lambda: _FakeSession())
+        resp = plugin._DiscordMsgForward__api_post("/channels/900/messages", {"content": "x"})
+        assert resp.status_code == 500
+        assert len(calls) == 1
+
+
+# ---------------- 自消息过滤（防死循环） ----------------
+class SelfMessageTest:
+    def test_own_message_not_forwarded(self, plugin, monkeypatch):
+        plugin._rules = [_rule(notify_enabled=False, forward_channels=["900"])]
+        plugin.save_data("last_ids", {"100": "0"})
+        plugin.save_data("bot_user_id", "bot1")
+        msgs = [_msg(1, "别人发的", uid="u1"), _msg(2, "上一轮转发的", uid="bot1")]
+
+        def fake_get(path, params=None, _retry=0):
+            if path.endswith("/messages"):
+                return _resp(200, msgs if (params or {}).get("after") == "0" else [])
+            return _resp(200, {})
+
+        posts = []
+
+        def fake_post(path, payload, _retry=0):
+            posts.append(payload)
+            return _resp(200)
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_get", fake_get)
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_post", fake_post)
+        plugin.check_messages()
+
+        assert len(posts) == 1
+        assert "别人发的" in posts[0]["content"]
+        assert "上一轮转发的" not in posts[0]["content"]
+
+    def test_bot_id_cached_from_api(self, plugin, monkeypatch):
+        calls = []
+
+        def fake_get(path, params=None, _retry=0):
+            calls.append(path)
+            return _resp(200, {"id": "bot-123"})
+
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_get", fake_get)
+        assert plugin._DiscordMsgForward__get_bot_user_id() == "bot-123"
+        assert plugin._DiscordMsgForward__get_bot_user_id() == "bot-123"
+        assert calls == ["/users/@me"]                   # 第二次走缓存
+
+    def test_bot_id_failure_returns_none(self, plugin, monkeypatch):
+        monkeypatch.setattr(plugin, "_DiscordMsgForward__api_get",
+                            lambda path, params=None, _retry=0: _resp(401))
+        assert plugin._DiscordMsgForward__get_bot_user_id() is None
+
+
+# ---------------- 模板 {link} 与详情页入口 ----------------
+class LinkTemplateTest:
+    def test_link_line_removed_when_empty(self, dmf):
+        render = dmf.DiscordMsgForward._DiscordMsgForward__render_template
+        out = render("{content}\n🔗 {link}", {"content": "正文", "link": ""})
+        assert "🔗" not in out and "正文" in out
+
+    def test_link_rendered_when_present(self, dmf):
+        render = dmf.DiscordMsgForward._DiscordMsgForward__render_template
+        out = render("{content}\n🔗 {link}",
+                     {"content": "正文", "link": "https://discord.com/channels/1/2/3"})
+        assert "https://discord.com/channels/1/2/3" in out
+
+    def test_status_exposes_docs_url(self, dmf, plugin):
+        status = plugin.api_get_status()
+        assert status["docs_url"] == dmf.DOCS_URL
+        assert "forward_rules" in status
