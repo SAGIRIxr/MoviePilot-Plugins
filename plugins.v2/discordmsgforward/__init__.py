@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -9,6 +10,8 @@ import pytz
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from app.core.config import settings
 from app.core.event import eventmanager, Event
@@ -30,6 +33,23 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 
 # 连续失败多少次后告警
 FAIL_ALERT_THRESHOLD = 3
+
+# 单次轮询每个频道最多翻几页（每页 100 条），防止积压时无限拉取
+MAX_PAGES_PER_POLL = 5
+# 单条聚合通知最多包含多少条消息，超出拆成多条通知
+MAX_AGGREGATE_ITEMS = 20
+# 单条通知正文最大长度，超出截断（企微/TG 等渠道均有长度上限）
+MAX_CONTENT_LENGTH = 3000
+# 免打扰暂存 / 失败重试队列最大条数，超出丢弃最旧的
+MAX_QUEUE_SIZE = 500
+# 转发历史最大条数
+MAX_HISTORY_SIZE = 1000
+# 发送失败最多重投几次
+MAX_SEND_ATTEMPTS = 3
+# 单次 API 请求超时（秒）
+API_TIMEOUT = 30
+# 429 限流最多自动等待重试几次
+MAX_RATE_LIMIT_RETRY = 2
 
 # 规则默认值
 RULE_DEFAULTS = {
@@ -59,7 +79,7 @@ class DiscordMsgForward(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/DiscordForward_A.png"
     # 插件版本
-    plugin_version = "4.1.0"
+    plugin_version = "4.2.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -88,30 +108,40 @@ class DiscordMsgForward(_PluginBase):
     # 转发规则列表
     _rules: List[dict] = []
 
-    # 定时器
+    # 定时器（复用同一个实例，避免每次触发都新建后台线程池）
     _scheduler: Optional[BackgroundScheduler] = None
+    # HTTP 会话（复用连接）
+    _session: Optional[requests.Session] = None
+    # 防止定时轮询与「立即检查」并发跑同一份 last_ids
+    _check_lock = threading.Lock()
+    # 保护 _scheduler 的创建/销毁
+    _scheduler_lock = threading.Lock()
 
     def init_plugin(self, config: dict = None):
         # 停止现有任务
         self.stop_service()
 
-        if config:
-            self._enabled = config.get("enabled") or False
-            self._token = (config.get("token") or "").strip()
-            self._interval = int(config.get("interval") or 5)
-            self._msgtype = config.get("msgtype") or "Plugin"
-            self._fail_alert = config.get("fail_alert") if config.get("fail_alert") is not None else True
-            self._use_proxy = config.get("use_proxy") if config.get("use_proxy") is not None else True
-            self._history_days = int(config.get("history_days") or 30)
-            self._rules = [self.__norm_rule(r) for r in (config.get("rules") or [])]
+        config = config or {}
+        self._enabled = config.get("enabled") or False
+        self._token = (config.get("token") or "").strip()
+        self._interval = self.__safe_int(config.get("interval"), default=5, minimum=1)
+        self._msgtype = config.get("msgtype") or "Plugin"
+        self._fail_alert = config.get("fail_alert") if config.get("fail_alert") is not None else True
+        self._use_proxy = config.get("use_proxy") if config.get("use_proxy") is not None else True
+        self._history_days = self.__safe_int(config.get("history_days"), default=30, minimum=1)
+        self._rules = [self.__norm_rule(r) for r in (config.get("rules") or [])]
 
         # 保存配置后：后台刷新频道列表缓存
         if self._token:
-            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            self._scheduler.add_job(func=self.refresh_channel_options, trigger='date',
-                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                    name="刷新Discord频道列表")
-            self._scheduler.start()
+            self.__run_once(self.refresh_channel_options, "刷新Discord频道列表", delay=3)
+
+    @staticmethod
+    def __safe_int(value: Any, default: int, minimum: int = 0) -> int:
+        """容错的整数转换：前端传空串/非法值时回落到默认值"""
+        try:
+            return max(minimum, int(value))
+        except (TypeError, ValueError):
+            return default
 
     @staticmethod
     def __norm_rule(rule: dict) -> dict:
@@ -120,6 +150,23 @@ class DiscordMsgForward(_PluginBase):
         if not merged.get("id"):
             merged["id"] = uuid.uuid4().hex[:8]
         return merged
+
+    # ---------------- 调度 ----------------
+    def __run_once(self, func, name: str, delay: int = 1):
+        """复用同一个后台调度器投递一次性任务，避免调度器/线程泄漏"""
+        try:
+            with self._scheduler_lock:
+                if self._scheduler is None or not self._scheduler.running:
+                    self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                    self._scheduler.start()
+                self._scheduler.add_job(
+                    func=func,
+                    trigger="date",
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=delay),
+                    name=name,
+                )
+        except Exception as e:
+            logger.error(f"投递后台任务 [{name}] 失败: {e}")
 
     # ---------------- 工具方法 ----------------
     def __get_proxies(self):
@@ -140,18 +187,60 @@ class DiscordMsgForward(_PluginBase):
             return []
         return [x.strip() for x in re.split(r"[|,，]", value) if x.strip()]
 
-    def __api_get(self, path: str, params: dict = None):
-        """调用 Discord REST API"""
-        resp = requests.get(
+    def __get_session(self) -> requests.Session:
+        """复用 HTTP 会话：连接池 + 5xx 自动重试"""
+        if self._session is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(
+                pool_connections=4,
+                pool_maxsize=8,
+                max_retries=Retry(
+                    total=2,
+                    connect=2,
+                    read=2,
+                    status=0,
+                    backoff_factor=1,
+                    status_forcelist=(500, 502, 503, 504),
+                    allowed_methods=frozenset(["GET"]),
+                ),
+            )
+            session.mount("https://", adapter)
+            session.headers.update({
+                "User-Agent": "DiscordBot (MoviePilot-Plugin-DiscordMsgForward, 4.2)",
+            })
+            self._session = session
+        return self._session
+
+    @staticmethod
+    def __parse_retry_after(resp) -> float:
+        """解析 429 响应的等待秒数"""
+        value = resp.headers.get("Retry-After")
+        if value is None:
+            try:
+                value = (resp.json() or {}).get("retry_after")
+            except Exception:
+                value = None
+        try:
+            wait = float(value)
+        except (TypeError, ValueError):
+            wait = 3.0
+        # 限制在 1~30 秒，避免长时间阻塞轮询线程
+        return min(max(wait, 1.0), 30.0)
+
+    def __api_get(self, path: str, params: dict = None, _retry: int = 0):
+        """调用 Discord REST API，自动处理 429 限流"""
+        resp = self.__get_session().get(
             f"{DISCORD_API}{path}",
-            headers={
-                "Authorization": f"Bot {self._token}",
-                "User-Agent": "DiscordBot (MoviePilot-Plugin-DiscordMsgForward, 4.0)",
-            },
+            headers={"Authorization": f"Bot {self._token}"},
             params=params,
             proxies=self.__get_proxies(),
-            timeout=30,
+            timeout=API_TIMEOUT,
         )
+        if resp.status_code == 429 and _retry < MAX_RATE_LIMIT_RETRY:
+            wait = self.__parse_retry_after(resp)
+            logger.warning(f"Discord 限流（{path}），等待 {wait:.1f} 秒后重试")
+            time.sleep(wait)
+            return self.__api_get(path, params, _retry + 1)
         return resp
 
     def refresh_channel_options(self) -> List[dict]:
@@ -319,10 +408,16 @@ class DiscordMsgForward(_PluginBase):
         if not m:
             logger.warning(f"免打扰时段格式无效（应为 23:00-08:00）：{quiet_hours}")
             return False
-        now = datetime.now(tz=pytz.timezone(settings.TZ)).time()
-        start = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
-        end = now.replace(hour=int(m.group(3)), minute=int(m.group(4)), second=0, microsecond=0)
-        if start <= end:
+        try:
+            now = datetime.now(tz=pytz.timezone(settings.TZ)).time()
+            start = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+            end = now.replace(hour=int(m.group(3)), minute=int(m.group(4)), second=0, microsecond=0)
+        except ValueError:
+            logger.warning(f"免打扰时段时间非法（小时应 0-23，分钟应 0-59）：{quiet_hours}")
+            return False
+        if start == end:
+            return False
+        if start < end:
             return start <= now < end
         return now >= start or now < end
 
@@ -342,9 +437,52 @@ class DiscordMsgForward(_PluginBase):
             logger.debug(f"查询频道 {cid} 所属服务器失败: {e}")
         return None
 
+    def __fetch_new_messages(self, cid: str, last_id: str) -> Tuple[List[dict], Optional[Any]]:
+        """
+        分页拉取 last_id 之后的新消息，返回 (按时间升序的消息列表, 失败响应)。
+        Discord 单次最多返回 100 条，积压较多时需要连续翻页，否则要等好几轮轮询才能追平。
+        """
+        collected: List[dict] = []
+        cursor = last_id
+        for _ in range(MAX_PAGES_PER_POLL):
+            resp = self.__api_get(f"/channels/{cid}/messages",
+                                  params={"after": cursor, "limit": 100})
+            if resp.status_code != 200:
+                return collected, resp
+            batch = sorted(resp.json() or [], key=lambda m: int(m["id"]))
+            if not batch:
+                break
+            collected.extend(batch)
+            cursor = batch[-1]["id"]
+            if len(batch) < 100:
+                break
+        else:
+            logger.warning(f"频道 {cid} 积压消息较多，本轮已拉取 {len(collected)} 条，剩余下轮继续")
+        return collected, None
+
+    @staticmethod
+    def __chunk(items: List[dict], size: int) -> List[List[dict]]:
+        """把消息列表切成不超过 size 条的批次"""
+        return [items[i:i + size] for i in range(0, len(items), size)] or []
+
+    def __build_batches(self, rule: dict, items: List[dict]) -> List[List[dict]]:
+        """按规则的聚合开关切分发送批次，聚合时限制单批条数"""
+        if not rule.get("aggregate"):
+            return [[item] for item in items]
+        return self.__chunk(items, MAX_AGGREGATE_ITEMS)
+
     # ---------------- 核心逻辑 ----------------
     def check_messages(self):
-        """轮询所有规则涉及的频道，按规则分发转发"""
+        """轮询所有规则涉及的频道，按规则分发转发（同一时刻只允许一个实例运行）"""
+        if not self._check_lock.acquire(blocking=False):
+            logger.info("上一次 Discord 检查尚未结束，本次跳过")
+            return
+        try:
+            self.__check_messages()
+        finally:
+            self._check_lock.release()
+
+    def __check_messages(self):
         if not self._token:
             logger.error("未配置 Discord Bot Token")
             return
@@ -363,7 +501,8 @@ class DiscordMsgForward(_PluginBase):
             return
 
         history_items: List[dict] = []
-        # 先冲刷已结束免打扰时段的暂存消息
+        # 先重投上轮发送失败的批次，再冲刷已结束免打扰时段的暂存消息
+        history_items.extend(self.__flush_retry())
         history_items.extend(self.__flush_pending())
 
         last_ids: Dict[str, str] = self.get_data("last_ids") or {}
@@ -390,17 +529,18 @@ class DiscordMsgForward(_PluginBase):
                     logger.info(f"频道 [{cname}] 首次监听，已记录基线消息ID：{last_ids[cid]}，此后的新消息才会转发")
                     continue
 
-                resp = self.__api_get(f"/channels/{cid}/messages",
-                                      params={"after": last_id, "limit": 100})
-                if resp.status_code != 200:
+                msgs, error_resp = self.__fetch_new_messages(cid, last_id)
+                if error_resp is not None:
                     fail_count += 1
-                    last_error = self.__log_api_error(cid, cname, resp)
-                    continue
-                success_count += 1
-
-                msgs = sorted(resp.json(), key=lambda m: int(m["id"]))
+                    last_error = self.__log_api_error(cid, cname, error_resp)
+                    # 已成功拉到的部分照常处理，游标只推进到已拉取的最后一条
+                    if not msgs:
+                        continue
+                else:
+                    success_count += 1
                 if not msgs:
                     continue
+
                 logger.info(f"频道 [{cname}] 获取到 {len(msgs)} 条新消息")
                 last_ids[cid] = msgs[-1]["id"]
                 guild_id = self.__get_guild_id(cid, meta)
@@ -442,8 +582,7 @@ class DiscordMsgForward(_PluginBase):
                             pending.append({**item, "cname": cname, "rule_id": rule["id"]})
                         logger.info(f"规则 [{rule.get('name')}] 处于免打扰时段，{len(items)} 条消息已暂存")
                         continue
-                    batches = [items] if rule.get("aggregate") else [[item] for item in items]
-                    for batch in batches:
+                    for batch in self.__build_batches(rule, items):
                         record = self.__send_batch(rule, cname, batch)
                         if record:
                             history_items.append(record)
@@ -454,10 +593,19 @@ class DiscordMsgForward(_PluginBase):
 
         self.save_data("last_ids", last_ids)
         self.save_data("channel_meta", meta)
-        self.save_data("pending", pending)
+        self.save_data("pending", self.__cap_queue(pending, "免打扰暂存"))
         if history_items:
             self.__save_history(history_items)
         self.__update_fail_state(success_count, fail_count, last_error)
+
+    @staticmethod
+    def __cap_queue(queue: List[dict], name: str) -> List[dict]:
+        """限制队列长度，超出丢弃最旧的，防止长期堆积拖慢每轮读写"""
+        if len(queue) <= MAX_QUEUE_SIZE:
+            return queue
+        dropped = len(queue) - MAX_QUEUE_SIZE
+        logger.warning(f"{name}队列超过 {MAX_QUEUE_SIZE} 条，已丢弃最旧的 {dropped} 条")
+        return queue[-MAX_QUEUE_SIZE:]
 
     def __flush_pending(self) -> List[dict]:
         """冲刷免打扰时段暂存的消息（仅时段已结束的规则），按规则+频道汇总推送"""
@@ -478,14 +626,55 @@ class DiscordMsgForward(_PluginBase):
                 continue
             groups.setdefault((item["rule_id"], item.get("cname") or "未知频道"), []).append(item)
         for (rule_id, cname), items in groups.items():
-            record = self.__send_batch(rule_map[rule_id], cname, items)
-            if record:
-                records.append(record)
+            # 暂存量可能很大，按上限拆成多条通知
+            for batch in self.__chunk(items, MAX_AGGREGATE_ITEMS):
+                record = self.__send_batch(rule_map[rule_id], cname, batch)
+                if record:
+                    records.append(record)
         if groups:
             flushed = sum(len(v) for v in groups.values())
             logger.info(f"免打扰时段结束，已汇总推送暂存的 {flushed} 条消息")
         self.save_data("pending", keep)
         return records
+
+    def __flush_retry(self) -> List[dict]:
+        """重投上轮发送失败的批次"""
+        queue: List[dict] = self.get_data("retry_queue") or []
+        if not queue:
+            return []
+        # 先清空，失败的批次会在 __send_batch 里重新入队
+        self.save_data("retry_queue", [])
+        rule_map = {r["id"]: r for r in self._rules}
+        records = []
+        for entry in queue:
+            rule = rule_map.get(entry.get("rule_id"))
+            if not rule or not rule.get("enabled"):
+                logger.info(f"重试队列中规则 {entry.get('rule_id')} 已删除或停用，丢弃 {len(entry.get('items') or [])} 条消息")
+                continue
+            record = self.__send_batch(rule, entry.get("cname") or "未知频道",
+                                       entry.get("items") or [],
+                                       attempts=int(entry.get("attempts") or 1))
+            if record:
+                records.append(record)
+        logger.info(f"已重投 {len(queue)} 个上轮发送失败的批次")
+        return records
+
+    def __queue_retry(self, rule: dict, cname: str, items: List[dict], attempts: int):
+        """把发送失败的批次放回重试队列，超过次数上限则丢弃并告警"""
+        if attempts >= MAX_SEND_ATTEMPTS:
+            logger.error(f"规则 [{rule.get('name')}] 频道 [{cname}] 的 {len(items)} 条消息"
+                         f"连续 {attempts} 次发送失败，已放弃")
+            return
+        queue: List[dict] = self.get_data("retry_queue") or []
+        queue.append({
+            "rule_id": rule.get("id"),
+            "cname": cname,
+            "items": items,
+            "attempts": attempts,
+        })
+        self.save_data("retry_queue", self.__cap_queue(queue, "发送重试"))
+        logger.warning(f"规则 [{rule.get('name')}] 频道 [{cname}] 的 {len(items)} 条消息发送失败，"
+                       f"已入重试队列（第 {attempts} 次）")
 
     @staticmethod
     def __log_api_error(cid: str, cname: str, resp) -> str:
@@ -500,7 +689,32 @@ class DiscordMsgForward(_PluginBase):
         logger.error(error)
         return error
 
-    def __send_batch(self, rule: dict, cname: str, items: List[dict]) -> Optional[dict]:
+    @staticmethod
+    def __truncate(content: str, count: int) -> str:
+        """限制通知正文长度，避免超出下游渠道上限导致整条发送失败"""
+        if len(content) <= MAX_CONTENT_LENGTH:
+            return content
+        return content[:MAX_CONTENT_LENGTH] + f"\n\n…（共 {count} 条消息，内容过长已截断）"
+
+    def __dispatch(self, mtype, title: str, text: str, image: Optional[str],
+                   link: Optional[str], targets: List[str]) -> Tuple[int, List[str]]:
+        """按渠道逐个发送，单个渠道异常不影响其它渠道。返回 (成功数, 失败渠道列表)"""
+        sent = 0
+        failed = []
+        for target in (targets or [None]):
+            try:
+                kwargs = {"mtype": mtype, "title": title, "text": text, "image": image, "link": link}
+                if target:
+                    kwargs["source"] = target
+                self.post_message(**kwargs)
+                sent += 1
+            except Exception as e:
+                failed.append(target or "全部渠道")
+                logger.error(f"发送到渠道 [{target or '全部渠道'}] 失败: {e}")
+        return sent, failed
+
+    def __send_batch(self, rule: dict, cname: str, items: List[dict],
+                     attempts: int = 0) -> Optional[dict]:
         """将一批消息渲染为一条通知并发送到规则指定的渠道，返回历史记录项"""
         if not items:
             return None
@@ -518,6 +732,7 @@ class DiscordMsgForward(_PluginBase):
             content = "\n━━━━━━━━━━\n".join(i["text"] for i in items)
         else:
             content = items[0]["text"]
+        content = self.__truncate(content, len(items))
         image = next((i["image"] for i in items if i.get("image")), None)
         link = next((i["link"] for i in reversed(items) if i.get("link")), None)
 
@@ -534,12 +749,15 @@ class DiscordMsgForward(_PluginBase):
 
         targets = rule.get("notify_channels") or []
         mtype = getattr(NotificationType, self._msgtype, None) or NotificationType.Plugin
-        if targets:
-            for target in targets:
-                self.post_message(mtype=mtype, title=title, text=text, image=image,
-                                  link=link, source=target)
-        else:
-            self.post_message(mtype=mtype, title=title, text=text, image=image, link=link)
+        sent, failed = self.__dispatch(mtype, title, text, image, link, targets)
+
+        if not sent:
+            # 全部渠道都失败：入重试队列，下轮轮询重投
+            self.__queue_retry(rule, cname, items, attempts + 1)
+            return None
+        if failed:
+            logger.warning(f"规则 [{rule.get('name')}] 频道 [{cname}] 部分渠道发送失败: {failed}")
+
         logger.info(f"规则 [{rule.get('name')}] 频道 [{cname}] {len(items)} 条消息已转发到 "
                     f"{targets or '全部渠道'}" + (f"，提取内容: {codes}" if codes else ""))
         return {
@@ -560,15 +778,18 @@ class DiscordMsgForward(_PluginBase):
             state["last_error"] = (last_error or "")[:200]
             if self._fail_alert and state["streak"] >= FAIL_ALERT_THRESHOLD and not state.get("alerted"):
                 mtype = getattr(NotificationType, self._msgtype, None) or NotificationType.Plugin
-                self.post_message(
-                    mtype=mtype,
-                    title="【Discord消息转发告警】",
-                    text=(f"已连续 {state['streak']} 次轮询全部失败，插件可能无法正常工作。\n"
-                          f"请检查 Bot Token、系统代理和频道配置。\n"
-                          f"最近错误：{(last_error or '未知')[:200]}"),
-                )
-                state["alerted"] = True
-                logger.warning("已发送连续失败告警通知")
+                try:
+                    self.post_message(
+                        mtype=mtype,
+                        title="【Discord消息转发告警】",
+                        text=(f"已连续 {state['streak']} 次轮询全部失败，插件可能无法正常工作。\n"
+                              f"请检查 Bot Token、系统代理和频道配置。\n"
+                              f"最近错误：{(last_error or '未知')[:200]}"),
+                    )
+                    state["alerted"] = True
+                    logger.warning("已发送连续失败告警通知")
+                except Exception as e:
+                    logger.error(f"发送失败告警通知出错: {e}")
         else:
             state = {"streak": 0, "alerted": False, "last_error": ""}
         self.save_data("fail_state", state)
@@ -580,15 +801,19 @@ class DiscordMsgForward(_PluginBase):
             history = [history]
         history.extend(items)
 
-        retain_seconds = int(self._history_days or 30) * 24 * 60 * 60
-        expired_timestamp = time.time() - retain_seconds
+        tz = pytz.timezone(settings.TZ)
+        # 写入时按 settings.TZ 格式化，过期判断也必须按同一时区解析，否则容器时区不同会算错
+        expired_before = datetime.now(tz=tz) - timedelta(days=self._history_days)
         cleaned = []
         for record in history:
             try:
-                if datetime.strptime(record["date"], '%Y-%m-%d %H:%M:%S').timestamp() >= expired_timestamp:
+                dt = tz.localize(datetime.strptime(record["date"], '%Y-%m-%d %H:%M:%S'))
+                if dt >= expired_before:
                     cleaned.append(record)
             except Exception:
                 logger.debug(f"忽略格式异常的转发历史记录: {record}")
+        if len(cleaned) > MAX_HISTORY_SIZE:
+            cleaned = cleaned[-MAX_HISTORY_SIZE:]
         self.save_data(key="history", value=cleaned)
 
     # ---------------- 远程命令 ----------------
@@ -617,7 +842,8 @@ class DiscordMsgForward(_PluginBase):
         """获取已启用的通知渠道选项"""
         try:
             options = [{"title": conf.name, "value": conf.name}
-                       for conf in NotificationHelper().get_configs().values()]
+                       for conf in NotificationHelper().get_configs().values()
+                       if getattr(conf, "enabled", True)]
         except Exception as e:
             logger.error(f"获取通知渠道列表出错: {e}")
             options = []
@@ -645,6 +871,7 @@ class DiscordMsgForward(_PluginBase):
         """获取运行状态"""
         fail_state = self.get_data("fail_state") or {}
         pending = self.get_data("pending") or []
+        retry_queue = self.get_data("retry_queue") or []
         return {
             "enabled": self._enabled,
             "token_set": bool(self._token),
@@ -653,17 +880,17 @@ class DiscordMsgForward(_PluginBase):
             "fail_streak": int(fail_state.get("streak") or 0),
             "last_error": fail_state.get("last_error") or "",
             "pending_count": len(pending),
+            "retry_count": len(retry_queue),
+            "checking": self._check_lock.locked(),
         }
 
     def api_check_now(self) -> dict:
         """立即执行一次检查（后台运行）"""
         if not self._token:
             return {"message": "未配置 Bot Token"}
-        scheduler = BackgroundScheduler(timezone=settings.TZ)
-        scheduler.add_job(func=self.check_messages, trigger='date',
-                          run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=1),
-                          name="Discord消息转发-手动检查")
-        scheduler.start()
+        if self._check_lock.locked():
+            return {"message": "上一次检查仍在进行中，请稍候"}
+        self.__run_once(self.check_messages, "Discord消息转发-手动检查", delay=1)
         return {"message": "已触发检查，稍后查看历史记录"}
 
     # ---------------- MoviePilot 接口 ----------------
@@ -736,10 +963,17 @@ class DiscordMsgForward(_PluginBase):
     def stop_service(self):
         """退出插件"""
         try:
-            if self._scheduler:
-                self._scheduler.remove_all_jobs()
-                if self._scheduler.running:
-                    self._scheduler.shutdown()
-                self._scheduler = None
+            with self._scheduler_lock:
+                if self._scheduler:
+                    self._scheduler.remove_all_jobs()
+                    if self._scheduler.running:
+                        self._scheduler.shutdown(wait=False)
+                    self._scheduler = None
         except Exception as e:
             logger.error(f"停止Discord消息转发服务出错: {e}")
+        try:
+            if self._session:
+                self._session.close()
+                self._session = None
+        except Exception as e:
+            logger.debug(f"关闭 HTTP 会话出错: {e}")

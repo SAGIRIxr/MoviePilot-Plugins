@@ -26,6 +26,9 @@
 - 消息模板变量：`{channel}` `{author}` `{content}` `{codes}` `{time}` `{count}`
 - 连续 3 次轮询全部失败推送告警，恢复自动重置
 - 远程命令 `/discord_check` 手动触发；首次监听只记录基线不刷历史消息
+- 发送失败自动重投：通知渠道临时故障时消息进入重试队列下轮重发（最多 3 次），单个渠道异常不影响其它渠道
+- 积压消息分页拉取（单轮最多 500 条）；命中 Discord 限流（429）按 `Retry-After` 自动退避重试
+- 单条聚合通知最多 20 条消息 / 3000 字，超出自动拆分与截断，避免下游渠道因超长拒收
 
 ## Bot 准备
 
@@ -44,6 +47,12 @@ cd frontend
 npm install
 npm run build
 # 将 dist/assets 下的 remoteEntry.js、__federation_*、_plugin-vue_export-helper-* 复制到 ../dist/assets/
+```
+
+后端单测在仓库根 [`tests/v2/discordmsgforward/`](../../tests/v2/discordmsgforward/)，`conftest.py` 里桩掉了 MoviePilot 主程序依赖，无需 MP 环境即可运行：
+
+```bash
+python3 -m pytest tests/v2/discordmsgforward -q
 ```
 
 ## 常见问题
