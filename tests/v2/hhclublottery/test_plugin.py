@@ -263,7 +263,7 @@ def test_export_is_userscript_backup(plugin):
         "draws": 20, "cost": 40000, "gains": {"beans": 13900},
         "prizes": {"beans": {"count": 15, "value": 13900, "tiers": {"100 憨豆": 9}}},
     })
-    payload = plugin.api_export()
+    payload = plugin.build_backup()
     assert payload["kind"] == "hhclub-lottery-backup"
     assert payload["version"] == 4
     assert payload["total"]["draws"] == 20
@@ -490,7 +490,7 @@ def test_saved_stats_have_no_float_tails(plugin, instant):
     # 非整数的照旧保留：512MB 折算成 0.5GB
     assert total["gains"]["upload"] == 0.5
 
-    payload = plugin.api_export()
+    payload = plugin.build_backup()
     assert floats(payload["total"], "export.total") == []
 
 
@@ -521,8 +521,8 @@ def test_stop_switches_default_off(plugin):
 def test_export_origin_id_is_stable(plugin):
     """记录线编号头一次导出时生成，之后每次导出都得是同一个 ——
     油猴版靠它认出这些文件同出一源。"""
-    first = plugin.api_export()
-    second = plugin.api_export()
+    first = plugin.build_backup()
+    second = plugin.build_backup()
 
     assert first["originId"], "一轮没跑过也要带上记录线编号"
     assert second["originId"] == first["originId"]
@@ -542,7 +542,7 @@ def test_run_stamps_origin_id(plugin, instant):
 
     origin = plugin.get_data("total")["originId"]
     assert origin, "跑完落盘时就该盖上编号"
-    assert plugin.api_export()["originId"] == origin, "导出沿用已有编号，不另起一条"
+    assert plugin.build_backup()["originId"] == origin, "导出沿用已有编号，不另起一条"
 
 
 # ============================================================
@@ -668,7 +668,7 @@ def test_status_card_states(plugin):
     # 没启用：开始按钮点不动
     page = plugin.get_page()
     assert "插件未启用" in str(page)
-    assert _buttons(page) == {"开始抽奖": True, "停止": True}
+    assert _buttons(page) == {"开始抽奖": True, "停止": True, "导出备份": None}
 
     # 启用了、没设周期：只能手动开
     plugin._enabled = True
@@ -676,7 +676,7 @@ def test_status_card_states(plugin):
     page = plugin.get_page()
     assert "空闲中" in str(page)
     assert "只在点「开始抽奖」时跑" in str(page)
-    assert _buttons(page) == {"开始抽奖": False, "停止": True}
+    assert _buttons(page) == {"开始抽奖": False, "停止": True, "导出备份": None}
 
     # 设了周期：两条路都说清楚
     plugin._cron = "5 9 * * *"
@@ -703,7 +703,7 @@ def test_status_card_while_running(plugin, monkeypatch):
 
     assert "正在抽 · 本轮已抽 2 次" in str(seen["page"])
     # 跑着的时候只能停，不能再开一轮
-    assert _buttons(seen["page"]) == {"开始抽奖": True, "停止": False}
+    assert _buttons(seen["page"]) == {"开始抽奖": True, "停止": False, "导出备份": None}
     assert "空闲中" in str(plugin.get_page()), "跑完要回到空闲"
 
 
@@ -723,7 +723,7 @@ def test_action_buttons_call_plugin_api(plugin):
                 walk(item)
 
     walk(plugin.get_page())
-    assert len(events) == 2
+    assert len(events) == 2, "导出走的是 href 直链，不该也挂 events"
     registered = {item["path"] for item in plugin.get_api()}
     for text, click in events:
         assert click["method"] == "get"
@@ -818,3 +818,219 @@ def test_draw_to_bottom_is_announced(plugin, instant, monkeypatch):
 
     assert any("一抽到底" in w for w in warnings)
     assert plugin.get_data("total")["draws"] == 2, "6000 → 4000 → 2000 触及保留线"
+
+
+# ============================================================
+# 备份导入导出
+# ============================================================
+
+def _backup(draws=10, cost=20000, beans=5000, origin="browserline",
+            export_id="file0001", jackpots=None, first=1000, last=2000):
+    """一份油猴版格式的备份。"""
+    return {
+        "kind": "hhclub-lottery-backup", "version": 4,
+        "exportedAt": "2026-08-20T00:00:00.000Z", "source": "tampermonkey",
+        "originId": origin, "exportId": export_id,
+        "current": {"draws": 0},
+        "total": {
+            "version": 4, "draws": draws, "cost": cost,
+            "gains": {"beans": beans, "rainbow": 7},
+            "prizes": {
+                "beans": {"count": draws - 1, "value": beans,
+                          "tiers": {"1,000 憨豆": draws - 1}},
+                "rainbow": {"count": 1, "value": 7, "tiers": {"7 天": 1}},
+            },
+            "raw": {"魔力 1000": draws - 1},
+            "originId": origin, "firstAt": first, "lastAt": last,
+            "jackpots": jackpots if jackpots is not None else [],
+        },
+    }
+
+
+def _import_config(payload, mode="merge", **overrides):
+    # notify 开着，导入结果的通知才发得出来 —— 那是用户唯一看得见结果的地方
+    overrides.setdefault("notify", True)
+    return _config_for("hhanclub.net", import_data=json.dumps(payload, ensure_ascii=False),
+                       import_mode=mode, do_import=True, **overrides)
+
+
+def _seed_total(plugin, draws=100, beans=125900, origin="mpline", **extra):
+    total = {
+        "version": 4, "draws": draws, "cost": draws * 2000,
+        "gains": {"beans": beans},
+        "prizes": {"beans": {"count": draws, "value": beans,
+                             "tiers": {"1,000 憨豆": draws}}},
+        "raw": {"魔力 1000": draws},
+        "originId": origin, "firstAt": 5000, "lastAt": 9000,
+    }
+    total.update(extra)
+    plugin.save_data("total", total)
+
+
+def test_import_merge(plugin):
+    _seed_total(plugin, draws=100, beans=125900)
+    plugin.init_plugin(_import_config(_backup(draws=10, cost=20000, beans=5000)))
+
+    total = plugin.get_data("total")
+    assert total["draws"] == 110
+    assert total["cost"] == 220000
+    assert total["gains"]["beans"] == 130900
+    assert total["gains"]["rainbow"] == 7
+    assert total["prizes"]["beans"]["tiers"]["1,000 憨豆"] == 109
+    assert total["prizes"]["rainbow"]["count"] == 1
+    # 自己的记录线保住，对方的记进台账
+    assert total["originId"] == "mpline"
+    assert total["imports"][-1]["exportId"] == "file0001"
+    assert total["imports"][-1]["originId"] == "browserline"
+    assert total["imports"][-1]["draws"] == 10
+
+
+def test_import_replace_takes_over_lineage(plugin):
+    _seed_total(plugin, draws=100)
+    plugin.init_plugin(_import_config(_backup(draws=10), mode="replace"))
+
+    total = plugin.get_data("total")
+    assert total["draws"] == 10, "覆盖就是取代，不是相加"
+    assert total["originId"] == "browserline", "覆盖之后这台机器是那条记录线的延续"
+
+
+def test_import_resets_switch_and_clears_box(plugin):
+    _seed_total(plugin)
+    plugin.init_plugin(_import_config(_backup()))
+    assert plugin._do_import is False, "一次性开关"
+    assert plugin._import_data == "", "导完要清空，免得下次保存又导一遍"
+    assert plugin._config["do_import"] is False
+    assert plugin._config["import_data"] == ""
+
+
+def test_import_does_not_start_a_round(plugin, monkeypatch):
+    started = []
+    monkeypatch.setattr(plugin, "run_lottery", lambda: started.append(1))
+    _seed_total(plugin)
+    plugin.init_plugin(_import_config(_backup(), onlyonce=True))
+    assert started == [], "导入就只做导入，不顺带开抽"
+    assert plugin._onlyonce is False
+
+
+def test_import_blocks_same_file_twice(plugin):
+    _seed_total(plugin, draws=100)
+    payload = _backup(draws=10, export_id="file0001")
+    plugin.init_plugin(_import_config(payload))
+    assert plugin.get_data("total")["draws"] == 110
+
+    # 同一个文件再来一次 —— 台账里有它，拦下
+    plugin.init_plugin(_import_config(payload))
+    assert plugin.get_data("total")["draws"] == 110, "重复导入必须被拦住"
+    assert plugin._import_data != "", "被拦下时别把人家贴的内容清掉"
+    assert any("已经导入过" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_force_merge_overrides_the_block(plugin):
+    _seed_total(plugin, draws=100)
+    payload = _backup(draws=10, export_id="file0001")
+    plugin.init_plugin(_import_config(payload))
+    plugin.init_plugin(_import_config(payload, mode="force"))
+    assert plugin.get_data("total")["draws"] == 120, "明确选了强制合并就照做"
+
+
+def test_import_blocks_same_lineage(plugin):
+    """备份和当前历史出自同一条记录线 —— 比如从这台 MP 导出去又导回来。"""
+    _seed_total(plugin, draws=100, origin="mpline")
+    plugin.init_plugin(_import_config(_backup(draws=10, origin="mpline", export_id="other")))
+    assert plugin.get_data("total")["draws"] == 100, "同源要拦"
+    assert any("同源" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_import_blocks_overlapping_jackpots(plugin):
+    """老备份没有编号，只能拿大奖时刻对表 —— 同一毫秒同一个奖不会是巧合。"""
+    shared = [{"at": 1755000000123, "text": "VIP 7 Day(s)"}]
+    _seed_total(plugin, draws=100, origin="mpline", jackpots=shared)
+    payload = _backup(draws=10, origin=None, export_id=None, jackpots=shared)
+    payload.pop("originId")
+    payload.pop("exportId")
+    payload["total"]["originId"] = None
+    plugin.init_plugin(_import_config(payload))
+    assert plugin.get_data("total")["draws"] == 100
+    assert any("大奖记录" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_soft_overlap_still_imports(plugin):
+    """「时间区间被罩住」只是看着像，不是证据 —— 提醒一句，照常导。
+
+    两个人在同一段时间里各刷各的，抽得少的那份区间本来就会被罩住。"""
+    _seed_total(plugin, draws=100, origin="mpline")   # firstAt 5000 lastAt 9000
+    plugin.init_plugin(_import_config(
+        _backup(draws=10, origin="otherline", export_id="f2", first=6000, last=8000)))
+    assert plugin.get_data("total")["draws"] == 110, "软提示不该拦"
+
+
+def test_import_rejects_garbage(plugin):
+    _seed_total(plugin, draws=100)
+    for bad in ("这不是 JSON", "{}", '{"foo": 1}', "[]"):
+        plugin.init_plugin(_config_for("hhanclub.net", import_data=bad, notify=True,
+                                       import_mode="merge", do_import=True))
+        assert plugin.get_data("total")["draws"] == 100, f"{bad!r} 不该动到数据"
+    assert any("读不出" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_import_empty_box(plugin):
+    _seed_total(plugin, draws=100)
+    plugin.init_plugin(_config_for("hhanclub.net", import_data="  ", notify=True,
+                                   import_mode="merge", do_import=True))
+    assert plugin.get_data("total")["draws"] == 100
+    assert any("是空的" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_import_keeps_foreign_jackpots(plugin):
+    """油猴版的大奖名册要带过来 —— 那是这边产生不了、也补不回来的东西。"""
+    _seed_total(plugin, draws=100, origin="mpline")
+    payload = _backup(draws=10, origin="browserline", export_id="f9",
+                      jackpots=[{"at": 1755000000001, "text": "VIP 7 Day(s)"},
+                                {"at": 1755000000002, "text": "憨豆 780000"}])
+    plugin.init_plugin(_import_config(payload))
+    total = plugin.get_data("total")
+    assert len(total["jackpots"]) == 2
+    assert total["jackpots"][0]["at"] == 1755000000002, "名册按时间倒序"
+
+
+def test_export_button_is_a_direct_link(plugin):
+    """导出必须走 href —— events.click 是 axios 调用，拿不到响应体、存不成文件。"""
+    def find(node):
+        if isinstance(node, dict):
+            if node.get("component") == "VBtn" and node.get("text") == "导出备份":
+                return node
+            for value in node.values():
+                hit = find(value)
+                if hit:
+                    return hit
+        elif isinstance(node, list):
+            for item in node:
+                hit = find(item)
+                if hit:
+                    return hit
+        return None
+
+    button = find(plugin.get_page())
+    assert button is not None
+    assert "events" not in button
+    href = button["props"]["href"]
+    assert href.startswith(f"/api/v1/plugin/{plugin.__class__.__name__}/export?apikey=")
+    assert button["props"]["target"] == "_blank"
+
+
+def test_export_is_downloadable(plugin):
+    _seed_total(plugin, draws=42)
+    response = plugin.api_export()
+    disposition = response.headers.get("content-disposition")
+    assert disposition and disposition.startswith("attachment;")
+    assert "42draws.json" in disposition
+    assert disposition.isascii(), "文件名带中文要走 RFC 5987，这里避开了"
+    assert json.loads(response.body)["total"]["draws"] == 42
+
+
+def test_round_trip(plugin):
+    """导出再导回去，应当被当场认出是同一份，而不是把自己算两遍。"""
+    _seed_total(plugin, draws=100)
+    payload = plugin.build_backup()
+    plugin.init_plugin(_import_config(payload))
+    assert plugin.get_data("total")["draws"] == 100, "自己导出的自己导回来必须被拦"

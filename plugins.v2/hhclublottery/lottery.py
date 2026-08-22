@@ -61,6 +61,9 @@ RUNTIME = {
     # 抽奖途中每多少抽顺手清一次（和油猴版节奏一致）
     "mail_clean_every_draws": 25,
     "lottery_mail_keyword": "幸运大转盘",
+    # 大奖名册和导入台账的条数上限，和油猴版一致
+    "jackpot_log_limit": 100,
+    "import_ledger_limit": 60,
     # 单个 HTTP 请求超时
     "connect_timeout": 10,
     "read_timeout": 30,
@@ -437,6 +440,144 @@ def stamp_origin(total: Dict) -> Dict:
     if not total.get("originId"):
         total["originId"] = random_id()
     return total
+
+
+def lineage_of(stats: Dict) -> set:
+    """这份统计里含有哪些记录线：自己的，加上历次并进来的。
+    两份统计的记录线一旦有交集，就说明它们共享过历史。"""
+    ids = set()
+    if stats.get("originId"):
+        ids.add(stats["originId"])
+    for item in stats.get("imports") or []:
+        if isinstance(item, dict) and item.get("originId"):
+            ids.add(item["originId"])
+    return ids
+
+
+def merge_stats(base: Dict, extra: Dict) -> Dict:
+    """两份统计相加。和油猴版 mergeStats 同一套口径。"""
+    result = normalize_stats(base)
+    other = normalize_stats(extra)
+
+    result["draws"] += other["draws"]
+    result["cost"] += other["cost"]
+    for key in _GAIN_KEYS:
+        result["gains"][key] += other["gains"].get(key, 0)
+
+    for prize_type, bucket in other["prizes"].items():
+        target = ensure_bucket(result, prize_type)
+        target["count"] += bucket["count"]
+        target["value"] += bucket["value"]
+        swapped = _num(bucket.get("swappedBeans"))
+        if swapped:
+            target["swappedBeans"] = _num(target.get("swappedBeans")) + swapped
+        for label, count in bucket["tiers"].items():
+            target["tiers"][label] = _num(target["tiers"].get(label)) + count
+
+    for text, count in other["raw"].items():
+        result["raw"][text] = _num(result["raw"].get(text)) + count
+
+    # 名册按时间倒序合并；同一条记录（时刻 + 文案都一样）只留一份，
+    # 免得同一份备份导两次多出一堆重影
+    seen = set()
+    jackpots = []
+    for item in (result.get("jackpots") or []) + (other.get("jackpots") or []):
+        key = f"{(item or {}).get('at')}|{(item or {}).get('text')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        jackpots.append(item)
+    jackpots.sort(key=lambda item: _num((item or {}).get("at")), reverse=True)
+    if jackpots:
+        result["jackpots"] = jackpots[:RUNTIME["jackpot_log_limit"]]
+
+    # 台账要一起并过来：合并之后这份统计就「含有」对方的历史了。哪天对方那台
+    # 机器把这份导回去，靠台账就能认出转了一圈的自己。
+    ledger = {}
+    for item in (result.get("imports") or []) + (other.get("imports") or []):
+        if isinstance(item, dict):
+            ledger[f"{item.get('exportId') or ''}|{item.get('originId') or ''}"] = item
+    if ledger:
+        entries = sorted(ledger.values(), key=lambda item: _num(item.get("at")))
+        result["imports"] = entries[-RUNTIME["import_ledger_limit"]:]
+
+    firsts = [value for value in [(base or {}).get("firstAt"), (extra or {}).get("firstAt")] if value]
+    if firsts:
+        result["firstAt"] = min(firsts)
+    result["lastAt"] = max(_num((base or {}).get("lastAt")), _num((extra or {}).get("lastAt"))) or None
+    return result
+
+
+def detect_overlap(existing: Dict, incoming: Dict, export_id: Optional[str]) -> Optional[Dict]:
+    """统计存的是累加值，没有逐抽流水，所以合并没法真去重 —— 重叠的部分一定会被
+    算两遍。既然改不了这一点，那就在按下去之前认出来、说清楚。
+
+    sure=True 是铁证，sure=False 只是「看着像」。返回 None 表示没查出问题。"""
+    for item in existing.get("imports") or []:
+        if export_id and isinstance(item, dict) and item.get("exportId") == export_id:
+            when = item.get("at")
+            when_text = (datetime.fromtimestamp(when / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                         if isinstance(when, (int, float)) and when else "之前")
+            return {"sure": True, "title": "这个文件已经导入过一次了",
+                    "detail": f"{when_text} 并进来过同一份备份。再合一次，里面每一抽都会被算两遍。"}
+
+    mine = lineage_of(existing)
+    if mine & lineage_of(incoming):
+        return {"sure": True, "title": "两份记录同源",
+                "detail": "这份备份和当前历史出自同一条记录线（同一台设备，"
+                          "或者两边互相导过），重叠的部分合并后会被算两遍。"}
+
+    # 老备份没有编号，只能拿大奖时刻对表。时刻精确到毫秒，同一毫秒中同一个奖
+    # 不可能是巧合。
+    stamps = {f"{(i or {}).get('at')}|{(i or {}).get('text')}"
+              for i in existing.get("jackpots") or []}
+    hit = [i for i in incoming.get("jackpots") or []
+           if f"{(i or {}).get('at')}|{(i or {}).get('text')}" in stamps]
+    if hit:
+        return {"sure": True, "title": f"有 {len(hit)} 条大奖记录跟当前历史完全重合",
+                "detail": "同一毫秒中同一个奖不会是巧合，这两份记录是重叠的。"}
+
+    # 再退一步：时间区间整个被罩住，抽数也不更多，多半是旧快照。
+    # 这一条只是「看着像」，不是证据 —— 两个人在同一段时间里各刷各的，抽得少的
+    # 那份区间自然被罩住。所以 sure 留 False：提醒一句，但不拦。
+    if (incoming["draws"] > 0 and existing["draws"] >= incoming["draws"]
+            and incoming.get("firstAt") and incoming.get("lastAt")
+            and existing.get("firstAt") and existing.get("lastAt")
+            and incoming["firstAt"] >= existing["firstAt"]
+            and incoming["lastAt"] <= existing["lastAt"]):
+        return {"sure": False, "title": "看着像是同一批记录的旧快照",
+                "detail": "这份备份的时间区间整个落在当前历史里，抽数也不比现在多。"
+                          "要是确实来自另一个号 / 另一个人，那就是巧合，导入没问题。"}
+    return None
+
+
+def parse_backup(payload) -> Tuple[Dict, Optional[str]]:
+    """读一份备份，返回 (统计, exportId)。备份文件和裸的统计对象都收。"""
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, dict):
+        raise ValueError("认不出这个文件的格式")
+
+    incoming = payload.get("total") or payload.get("current") or payload
+    if not isinstance(incoming, dict) or incoming.get("draws") is None:
+        raise ValueError("认不出这个文件的格式：没找到 draws")
+
+    parsed = normalize_stats(incoming)
+    # 编号在备份文件的外层，裸统计对象里也认
+    if not parsed.get("originId") and isinstance(payload.get("originId"), str):
+        parsed["originId"] = payload["originId"]
+    export_id = payload.get("exportId") if isinstance(payload.get("exportId"), str) else None
+    return parsed, export_id
+
+
+def record_import(merged: Dict, parsed: Dict, export_id: Optional[str]) -> Dict:
+    """把这次导入记进台账，下次同一个文件再进来就认得出。"""
+    stamp_origin(merged)
+    ledger = list(merged.get("imports") or [])
+    ledger.append({"exportId": export_id, "originId": parsed.get("originId"),
+                   "draws": parsed["draws"], "at": int(time.time() * 1000)})
+    merged["imports"] = ledger[-RUNTIME["import_ledger_limit"]:]
+    return merged
 
 
 def backup_payload(current: Dict, total: Dict) -> Dict:

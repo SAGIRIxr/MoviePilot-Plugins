@@ -2,6 +2,8 @@
 import threading
 import time
 from datetime import datetime, timedelta
+
+from fastapi.responses import JSONResponse
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytz
@@ -17,6 +19,10 @@ from app.schemas.types import EventType
 
 from .lottery import (
     CookieInvalid,
+    detect_overlap,
+    merge_stats,
+    parse_backup,
+    record_import,
     LotteryOptions,
     LotteryRunner,
     PRIZE_META,
@@ -109,7 +115,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -159,6 +165,11 @@ class HHClubLottery(_PluginBase):
     # 「停止当前抽奖」：一次性开关，保存后立刻复位（和 onlyonce 一个路子）
     _stop_current = False
 
+    # 备份导入：粘贴 JSON + 方式 + 一次性执行开关
+    _import_data = ""
+    _import_mode = "merge"
+    _do_import = False
+
     # 运行时
     _scheduler: Optional[BackgroundScheduler] = None
     # 全程只有这一个 Event，绝不在 init_plugin 里换新的 —— 换了的话，
@@ -182,6 +193,9 @@ class HHClubLottery(_PluginBase):
             self._enabled = config.get("enabled") or False
             self._onlyonce = config.get("onlyonce") or False
             self._stop_current = config.get("stop_current") or False
+            self._import_data = config.get("import_data") or ""
+            self._import_mode = (config.get("import_mode") or "merge").strip()
+            self._do_import = config.get("do_import") or False
             self._notify = config.get("notify") if config.get("notify") is not None else True
             self._cron = (config.get("cron") or "").strip()
 
@@ -210,6 +224,23 @@ class HHClubLottery(_PluginBase):
             self._use_proxy = config.get("use_proxy") or False
             self._user_agent = (config.get("user_agent") or "").strip()
             self._history_days = _number(config.get("history_days"), 90, int)
+
+        # 导入备份：一次性，导完即复位，不顺带开抽
+        if self._do_import:
+            self._do_import = False
+            ok, message = self.__run_import()
+            if ok:
+                self._import_data = ""       # 导完清空，免得下次保存又导一遍
+                logger.info(f"📥 {message}")
+            else:
+                logger.error(f"📥 导入未执行：{message}")
+            if self._notify:
+                self.post_message(mtype=NotificationType.SiteMessage,
+                                  title="【HHCLUB 幸运大转盘】备份导入",
+                                  text=("✅ " if ok else "⛔ ") + message)
+            self._onlyonce = False
+            self.__update_config()
+            return
 
         # 停止当前抽奖：只停不启。和「立即运行一次」同时勾上时，停优先 ——
         # 一次保存里既要停又要开，只能是勾错了，宁可什么都不启
@@ -246,6 +277,9 @@ class HHClubLottery(_PluginBase):
             "enabled": self._enabled,
             "onlyonce": self._onlyonce,
             "stop_current": self._stop_current,
+            "import_data": self._import_data,
+            "import_mode": self._import_mode,
+            "do_import": self._do_import,
             "notify": self._notify,
             "cron": self._cron,
             "cookie_source": self._cookie_source,
@@ -352,6 +386,55 @@ class HHClubLottery(_PluginBase):
             logger.warning(f"取到的 Cookie 里缺少 {'、'.join(missing)}，"
                            "多半不是已登录状态，抽奖大概率会失败")
         return cookie, note
+
+    # ---------------- 备份导入导出 ----------------
+
+    def __run_import(self) -> Tuple[bool, str]:
+        """把粘进来的备份并进历史。
+
+        统计存的是累加值、没有逐抽流水，所以合并没法真去重 —— 重叠的部分一定会被
+        算两遍。改不了这一点，那就在动手之前认出来：铁证（同一个文件导过、两份
+        记录同源、大奖时刻完全重合）直接拦下，只是「看着像」的提醒一句照做。"""
+        raw = (self._import_data or "").strip()
+        if not raw:
+            return False, "「导入备份」框是空的"
+
+        try:
+            parsed, export_id = parse_backup(raw)
+        except Exception as err:
+            return False, f"读不出这份备份：{err}"
+
+        existing = normalize_stats(self.get_data("total"))
+        overlap = detect_overlap(existing, parsed, export_id)
+
+        if overlap and overlap["sure"] and self._import_mode == "merge":
+            return False, (f"{overlap['title']} —— {overlap['detail']}"
+                           "确认要合就把「导入方式」改成「强制合并」再存一次；"
+                           "想让这份备份取代当前历史就选「覆盖」。")
+        if overlap and not overlap["sure"]:
+            logger.warning(f"📥 {overlap['title']}：{overlap['detail']}照常导入")
+
+        if self._import_mode == "replace":
+            # 覆盖之后这台机器就是那条记录线的延续，血脉跟着备份走
+            merged = parsed
+        else:
+            merged = merge_stats(existing, parsed)
+
+        record_import(merged, parsed, export_id)
+        self.save_data("total", tidy_stats(merged))
+
+        action = "覆盖" if self._import_mode == "replace" else "合并"
+        return True, (f"已{action}导入 {fmt(parsed['draws'])} 抽 · "
+                      f"历史共 {fmt(merged['draws'])} 抽")
+
+    def build_backup(self) -> dict:
+        """油猴版「📥 导入备份」认这个格式。"""
+        total = normalize_stats(self.get_data("total"))
+        payload = backup_payload(empty_stats(), total)
+        # 记录线编号可能是这次现生成的（一轮没跑过就先导出）。存回去，
+        # 之后每次导出都沿用同一个，油猴版才认得出这些文件同出一源。
+        self.save_data("total", tidy_stats(total))
+        return payload
 
     # ---------------- 主流程 ----------------
 
@@ -531,14 +614,16 @@ class HHClubLottery(_PluginBase):
             },
         ]
 
-    def api_export(self) -> dict:
-        """油猴版「📥 导入备份」认这个格式，选「合并」就能把 MP 上的战绩带回浏览器。"""
-        total = normalize_stats(self.get_data("total"))
-        payload = backup_payload(empty_stats(), total)
-        # 记录线编号可能是这次现生成的（一轮没跑过就先导出）。存回去，
-        # 之后每次导出都沿用同一个，油猴版才认得出这些文件同出一源。
-        self.save_data("total", tidy_stats(total))
-        return payload
+    def api_export(self):
+        """导出备份。带 Content-Disposition，点一下浏览器直接存成文件，
+        不用在页面上盯着一堆 JSON 自己另存为。"""
+        payload = self.build_backup()
+        stamp = datetime.now(pytz.timezone(settings.TZ)).strftime("%Y%m%d-%H%M%S")
+        draws = int(payload["total"].get("draws") or 0)
+        # 文件名只用 ASCII —— 中文要走 RFC 5987 那套编码，不值当
+        name = f"hhclub-lottery-backup-{stamp}-{draws}draws.json"
+        return JSONResponse(content=payload,
+                            headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     def api_run(self) -> dict:
         if self._running:
@@ -694,6 +779,37 @@ class HHClubLottery(_PluginBase):
                         ]},
                     ]),
 
+                    card("mdi-backup-restore", "purple", "备份导入", [
+                        {"component": "VRow", "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                                {"component": "VTextarea", "props": {
+                                    "model": "import_data", "label": "把备份 JSON 粘在这里",
+                                    "rows": 4, "auto-grow": False, "clearable": True,
+                                    "placeholder": '{"kind": "hhclub-lottery-backup", ...}',
+                                    "hint": "油猴版面板「💾 备份 JSON」导出的文件，或本插件导出的备份，内容整段贴进来",
+                                    "persistent-hint": True}},
+                            ]},
+                        ]},
+                        {"component": "VRow", "content": [
+                            col(6, {"component": "VSelect", "props": {
+                                "model": "import_mode", "label": "导入方式",
+                                "items": [
+                                    {"title": "合并（两边记录相加，换设备用这个）", "value": "merge"},
+                                    {"title": "覆盖（用这份备份取代当前历史）", "value": "replace"},
+                                    {"title": "强制合并（我知道会算两遍）", "value": "force"},
+                                ]}}),
+                            col(6, {"component": "VSwitch", "props": {
+                                "model": "do_import", "label": "执行导入", "color": "purple",
+                                "hint": "勾上保存即导入一次，随后自动复位并清空上面的框",
+                                "persistent-hint": True}}),
+                        ]},
+                        {"component": "VAlert", "props": {
+                            "type": "warning", "variant": "tonal", "class": "mt-2",
+                            "text": "统计存的是累加值、没有逐抽流水，所以合并没法真去重 —— 重叠的部分一定会被算两遍。"
+                                    "所以同一个文件导过第二次、两份记录同源、大奖时刻完全重合这三种铁证会直接拦下来，"
+                                    "确认无误再改成「强制合并」。导出在「数据页」上，点「导出备份」直接下文件。"}},
+                    ]),
+
                     card("mdi-tune", "grey", "其他", [
                         {"component": "VRow", "content": [
                             col(3, {"component": "VSwitch", "props": {
@@ -735,6 +851,9 @@ class HHClubLottery(_PluginBase):
             "enabled": False,
             "onlyonce": False,
             "stop_current": False,
+            "import_data": "",
+            "import_mode": "merge",
+            "do_import": False,
             "notify": True,
             "cron": "",
             "cookie_source": "manual",
@@ -811,6 +930,15 @@ class HHClubLottery(_PluginBase):
                                          disabled=running or not self._enabled),
                     self.__action_button("stop", "停止", "mdi-stop", "error",
                                          disabled=not running),
+                    # 导出必须走 href：events.click 是 axios 调用，拿不到响应体，
+                    # 也就存不成文件
+                    {"component": "VBtn", "props": {
+                        "color": "purple", "variant": "tonal", "class": "mr-2",
+                        "prepend-icon": "mdi-download",
+                        "href": (f"/api/v1/plugin/{self.__class__.__name__}"
+                                 f"/export?apikey={settings.API_TOKEN}"),
+                        "target": "_blank"},
+                     "text": "导出备份"},
                 ]},
             ]}],
         }
