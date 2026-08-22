@@ -1441,7 +1441,7 @@ def test_history_days_is_at_least_one(plugin):
 
 
 def test_out_of_range_values_are_announced(plugin, instant, monkeypatch):
-    """实机上有人把「定时结束」填成了 600000 分钟，静悄悄按 1440 跑了，
+    """实机上有人把「定时结束」填成了 600000 分钟，静悄悄按上限跑了，
     配置页上还显示 600000 —— 那就等于没人知道。"""
     warnings = []
     monkeypatch.setattr(HH.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
@@ -1455,7 +1455,7 @@ def test_out_of_range_values_are_announced(plugin, instant, monkeypatch):
     finally:
         stop_site(server)
 
-    assert any("定时结束(分钟)" in w and "600,000" in w and "1,440" in w for w in warnings)
+    assert any("定时结束(分钟)" in w and "600,000" in w and "4,320" in w for w in warnings)
 
 
 # ============================================================
@@ -2328,3 +2328,31 @@ def test_status_api_reports_remaining(plugin, monkeypatch):
     assert "分" in seen["timed"]["remaining"], f"设了 30 分钟：{seen['timed']['remaining']!r}"
     assert seen["open"]["remaining"] is None, "不限时给 null，别拿 0 顶替"
     assert "remaining" not in plugin.api_status()["data"], "空闲时整块运行数据都不摆"
+
+
+def _find_prop(node, model, prop):
+    """在配置页里找到某个控件的某个属性。"""
+    if isinstance(node, dict):
+        props = node.get("props") or {}
+        if props.get("model") == model and prop in props:
+            return props[prop]
+        for value in node.values():
+            found = _find_prop(value, model, prop)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_prop(item, model, prop)
+            if found is not None:
+                return found
+    return None
+
+
+def test_deadline_field_says_blank_means_no_limit(plugin):
+    """「留空 = 不限制」得写在常驻提示里 —— 只写进 placeholder 的话，
+    填过一次再清空就再也看不见了。"""
+    form, defaults = plugin.get_form()
+    hint = _find_prop(form, "max_minutes", "hint")
+    assert "留空 = 不限制" in hint
+    assert "4320" in hint and "3 天" in hint, f"上限要说清楚：{hint!r}"
+    assert defaults["max_minutes"] == ""

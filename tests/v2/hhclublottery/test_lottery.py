@@ -764,3 +764,13 @@ def test_big_prize_notice_tail():
 
     plain, _, _ = make_runner("127.0.0.1:1", draws=1)
     check("不限时 只说挂机中", plain.running_tail(), "🌟 后台持续挂机抽奖中")
+
+
+def test_deadline_cap_is_three_days():
+    """挂机跑通宵不该被 24 小时腰斩；再长就交给抽数和保留线自己收。"""
+    check("3 天照收", L.LotteryOptions(max_minutes=4320).max_minutes, 4320.0)
+    check("上限就是 3 天", L.MAX_DEADLINE_MINUTES, 4320)
+    check("超了收敛到 3 天", L.LotteryOptions(max_minutes=600000).max_minutes, 4320.0)
+    check("留空 = 不限制", L.LotteryOptions(max_minutes="").max_minutes, 0.0)
+    check("0 也是不限制", L.LotteryOptions(max_minutes=0).max_minutes, 0.0)
+    check("填太小收敛到 1 分钟", L.LotteryOptions(max_minutes=0.2).max_minutes, 1.0)

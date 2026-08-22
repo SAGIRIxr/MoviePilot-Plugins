@@ -122,7 +122,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.13.0"
+    plugin_version = "1.14.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -629,7 +629,7 @@ class HHClubLottery(_PluginBase):
             self._runner = runner
 
             # 数值被收敛时说一声。实机上有人把「定时结束」填成了 600000 分钟，
-            # 静悄悄按 1440 跑了，配置页上还显示 600000 —— 那就等于没人知道
+            # 静悄悄按上限跑了，配置页上还显示 600000 —— 那就等于没人知道
             for name, filled, used in (("定时结束(分钟)", self._max_minutes, options.max_minutes),
                                        ("固定间隔(秒)", self._interval, options.interval),
                                        ("自适应缓冲(ms)", self._duration_buffer, options.duration_buffer_ms)):

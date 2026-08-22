@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 
 from app.core.config import settings
 
-from .lottery import BIG_PRIZE_KINDS
+from .lottery import BIG_PRIZE_KINDS, MAX_DEADLINE_MINUTES
 
 
 def build_form() -> Tuple[List[dict], Dict[str, Any]]:
@@ -98,8 +98,11 @@ def build_form() -> Tuple[List[dict], Dict[str, Any]]:
                             "hint": "一抽到底时留多少不动", "persistent-hint": True}}),
                         col(3, {"component": "VTextField", "props": {
                             "model": "max_minutes", "label": "定时结束(分钟)", "type": "number",
-                            "placeholder": "留空 = 不限时",
-                            "hint": "到点收工，最多 1440（24 小时）", "persistent-hint": True}}),
+                            "placeholder": "不填 = 不限制",
+                            "hint": f"留空 = 不限制；填了就到点收工，"
+                                    f"最多 {MAX_DEADLINE_MINUTES}"
+                                    f"（{MAX_DEADLINE_MINUTES // 1440} 天）",
+                            "persistent-hint": True}}),
                         col(3, {"component": "VSwitch", "props": {
                             "model": "clean_mail", "label": "清理抽奖站内信", "color": "warning",
                             "hint": "只删主题带「幸运大转盘」的", "persistent-hint": True}}),

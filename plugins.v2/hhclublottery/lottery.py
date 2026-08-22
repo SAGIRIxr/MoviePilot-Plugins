@@ -186,6 +186,10 @@ _PRIZE_RULES: List[Tuple[str, Callable[[str], bool]]] = [
 
 # 大奖通知能挑哪几样。憨豆这一档用的就是名册口径（JACKPOT_BEANS 以上）——
 # 通知和名册走同一条线，省得出现「推了一条大奖、名册里却没有」。
+# 定时结束最多设到 3 天。再长就没意义了 —— 挂机跑几天的话，让它按抽数 /
+# 保留线自己收更靠谱，硬压一个上限只会把长跑莫名腰斩。
+MAX_DEADLINE_MINUTES = 3 * 24 * 60
+
 BIG_PRIZE_KINDS: Dict[str, str] = {
     "vip": "⭐ VIP",
     "beans": "💰 780,000 以上憨豆",
@@ -772,8 +776,9 @@ class LotteryOptions:
         # 数值收敛，填错类型不至于炸
         self.interval = min(max(self.interval, 3.0), 3600.0)
         self.duration_buffer_ms = int(min(max(self.duration_buffer_ms, -500), 5000))
-        # 定时结束留空 = 不限时；填了才收敛到 1 分钟 ~ 24 小时
-        self.max_minutes = min(max(self.max_minutes, 1.0), 1440.0) if self.max_minutes > 0 else 0.0
+        # 定时结束留空 = 不限制；填了才收敛到 1 分钟 ~ 3 天
+        self.max_minutes = (min(max(self.max_minutes, 1.0), MAX_DEADLINE_MINUTES)
+                            if self.max_minutes > 0 else 0.0)
         self.draws = max(self.draws, 0)
         self.reserve = max(self.reserve, 0)
 
