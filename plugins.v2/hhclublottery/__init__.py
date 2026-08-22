@@ -119,7 +119,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.7.1"
+    plugin_version = "1.7.2"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1318,6 +1318,9 @@ class HHClubLottery(_PluginBase):
         if not jackpots and not total_hits:
             return None
 
+        # 名册条数可能多过按档位算出来的次数 —— 油猴版在能读到爆率时，
+        # 会把别的低概率奖也记进名册。名册是直接证据，以大的为准
+        total_hits = max(total_hits, len(jackpots))
         missing = max(0, total_hits - len(jackpots))
         title = f"大奖名册（中过 {fmt(total_hits)} 次"
         title += f"，{fmt(len(jackpots))} 条有时间记录）" if jackpots else "）"

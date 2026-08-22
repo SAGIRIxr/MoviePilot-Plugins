@@ -350,13 +350,23 @@ def normalize_stats(data) -> Dict:
     stats["raw"] = dict(data.get("raw") or {})
     stats["originId"] = data["originId"] if isinstance(data.get("originId"), str) else None
 
-    # 大奖名册和导入台账是油猴版那边的东西，这边既不产生也不读 —— 但这份统计
-    # 是双向的：真有人会把油猴版的备份导进 MP 让它接着记。原样带过去，
-    # 别下次覆写就把人家攒了几个月的名册抹了。
+    # 大奖名册和导入台账是油猴版那边的东西 —— 但这份统计是双向的，真有人会把
+    # 油猴版的备份导进 MP 让它接着记。收下来，别下次覆写就把人家攒了几个月的
+    # 名册抹了；同时按油猴版那边的规矩收一遍（只留有 text 的、字段收成
+    # {at, text}、新的在前、封顶 jackpot_log_limit），免得手改坏的文件
+    # 一路带到页面上。
     if isinstance(data.get("jackpots"), list):
-        stats["jackpots"] = data["jackpots"]
+        roster = [{"at": int(_num(item.get("at"))), "text": str(item["text"])}
+                  for item in data["jackpots"]
+                  if isinstance(item, dict) and item.get("text")]
+        roster.sort(key=lambda item: item["at"], reverse=True)
+        if roster:
+            stats["jackpots"] = roster[:RUNTIME["jackpot_log_limit"]]
+
     if isinstance(data.get("imports"), list):
-        stats["imports"] = data["imports"]
+        ledger = [item for item in data["imports"] if isinstance(item, dict)]
+        if ledger:
+            stats["imports"] = ledger[-RUNTIME["import_ledger_limit"]:]
 
     return stats
 

@@ -638,7 +638,7 @@ def test_foreign_fields_survive():
     incoming = {
         "draws": 5, "cost": 10000, "originId": "browserline",
         "gains": {"beans": 100},
-        "jackpots": [{"label": "VIP 7 天", "at": 1755000000000}],
+        "jackpots": [{"at": 1755000000000, "text": "VIP 7 Day(s)"}],
         "imports": [{"exportId": "abc", "originId": "xyz", "draws": 3, "at": 1}],
     }
     stats = L.normalize_stats(incoming)
@@ -654,3 +654,29 @@ def test_foreign_fields_survive():
     # 没有这两个字段的普通统计不该凭空长出来
     plain = L.normalize_stats({"draws": 1})
     check_true("普通统计不长名册", "jackpots" not in plain and "imports" not in plain)
+
+
+def test_jackpot_roster_is_normalized():
+    """油猴版存的就是 {at, text}、新的在前、封顶 100 条。收进来时按同样的规矩
+    收一遍 —— 手改坏的文件不该一路带到页面上。"""
+    messy = L.normalize_stats({"draws": 1, "jackpots": [
+        {"at": 1000, "text": "憨豆 780000"},
+        {"at": 3000, "text": "VIP 7 Day(s)"},
+        {"at": "2000", "text": "憨豆 1000000"},   # at 是字符串
+        {"at": 4000},                              # 没 text，丢掉
+        {"text": "补签卡 1"},                       # 没 at，补 0
+        "这不是个对象",
+        None,
+    ]})
+    roster = messy["jackpots"]
+    check("坏条目被丢掉", len(roster), 4)
+    check("新的在前", [item["at"] for item in roster], [3000, 2000, 1000, 0])
+    check_true("字段收成 at/text", all(set(item) == {"at", "text"} for item in roster))
+    check_true("at 收成数字", all(isinstance(item["at"], int) for item in roster))
+
+    over = L.normalize_stats({"draws": 1, "jackpots": [
+        {"at": i, "text": f"憨豆 780000 #{i}"} for i in range(150)]})
+    check("封顶 100 条", len(over["jackpots"]), 100)
+    check("留的是最新的", over["jackpots"][0]["at"], 149)
+
+    check_true("空名册不写进去", "jackpots" not in L.normalize_stats({"draws": 1, "jackpots": []}))

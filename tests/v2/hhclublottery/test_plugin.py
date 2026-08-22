@@ -1453,3 +1453,109 @@ def test_out_of_range_values_are_announced(plugin, instant, monkeypatch):
         stop_site(server)
 
     assert any("单次运行上限(分钟)" in w and "600,000" in w and "1,440" in w for w in warnings)
+
+
+# ============================================================
+# 油猴版导出的大奖时间线
+# ============================================================
+
+def _userscript_backup(jackpot_count=5, draws=8000):
+    """一份油猴版 backupStats() 会吐出来的东西。
+
+    名册是 total.jackpots，条目 {at, text}、新的在前，封顶 100 条 ——
+    照着 hhclub-auto-lottery.user.js 的 emptyStats / recordDraw 写的。"""
+    base = 1787000000000
+    jackpots = [{"at": base - i * 3600_000,
+                 "text": "VIP 7 Day(s)" if i % 3 == 0 else "憨豆 780000"}
+                for i in range(jackpot_count)]
+    vip = len([j for j in jackpots if "VIP" in j["text"]])
+    big = jackpot_count - vip
+    return {
+        "kind": "hhclub-lottery-backup", "version": 4,
+        "exportedAt": "2026-08-22T02:00:00.000Z", "source": "tampermonkey",
+        "originId": "browserline01", "exportId": "browserfile01",
+        "current": {"draws": 0},
+        "total": {
+            "version": 4, "draws": draws, "cost": draws * 2000,
+            "gains": {"beans": big * 780000 + 500000, "rainbow": 70, "vip": vip * 7},
+            "prizes": {
+                "beans": {"count": draws - 20, "value": big * 780000 + 500000,
+                          "tiers": {"780,000 憨豆": big, "100 憨豆": draws - 20 - big}},
+                "vip": {"count": vip, "value": vip * 7, "tiers": {"7 天": vip}},
+                "rainbow": {"count": 10, "value": 70, "tiers": {"7 天": 10}},
+            },
+            "raw": {"魔力 100": draws - 20},
+            "originId": "browserline01",
+            "firstAt": 1786000000000, "lastAt": base,
+            "jackpots": jackpots,
+            "imports": [],
+        },
+    }
+
+
+def test_userscript_backup_carries_the_roster(plugin):
+    """油猴版导出带不带大奖时间线 —— 带。导进 MP 能不能成 —— 能。"""
+    payload = _userscript_backup(jackpot_count=5)
+    plugin.init_plugin(_import_config(payload))
+
+    total = plugin.get_data("total")
+    assert total["draws"] == 8000, "统计进来了"
+    assert len(total["jackpots"]) == 5, "名册一条不少"
+    assert total["jackpots"][0]["text"] == "VIP 7 Day(s)"
+    assert all(set(item) == {"at", "text"} for item in total["jackpots"])
+    # 新的在前
+    stamps = [item["at"] for item in total["jackpots"]]
+    assert stamps == sorted(stamps, reverse=True)
+
+    text = str(plugin.get_page())
+    assert "大奖名册（中过 5 次，5 条有时间记录）" in text
+    assert "没有时间记录" not in text, "名册齐了就别提这句"
+    assert "2026-" in text
+
+
+def test_merging_two_rosters_dedupes(plugin):
+    """两边各有名册时合并：同一条（时刻 + 文案都一样）只留一份，
+    否则同一份备份导两次就多出一堆重影。"""
+    first = _userscript_backup(jackpot_count=5)
+    plugin.init_plugin(_import_config(first))
+    assert len(plugin.get_data("total")["jackpots"]) == 5
+
+    # 另一台设备的备份，前三条大奖是同一批（两边互相导过），后两条是它自己的
+    second = _userscript_backup(jackpot_count=3)
+    second["originId"] = "browserline02"
+    second["exportId"] = "browserfile02"
+    second["total"]["originId"] = "browserline02"
+    second["total"]["jackpots"] = second["total"]["jackpots"] + [
+        {"at": 1786500000000, "text": "憨豆 780000"},
+        {"at": 1786400000000, "text": "VIP 7 Day(s)"},
+    ]
+    plugin.init_plugin(_import_config(second, mode="force"))
+
+    roster = plugin.get_data("total")["jackpots"]
+    assert len(roster) == 7, "5 条原有 + 2 条新的，重合那 3 条不重复计"
+    stamps = [item["at"] for item in roster]
+    assert len(set(stamps)) == len(stamps)
+    assert stamps == sorted(stamps, reverse=True)
+
+
+def test_roster_survives_export_clear_import(plugin):
+    """名册跟着备份走完整个来回。"""
+    plugin.init_plugin(_import_config(_userscript_backup(jackpot_count=5)))
+    before = plugin.get_data("total")["jackpots"]
+
+    backup = plugin.build_backup()
+    assert len(backup["total"]["jackpots"]) == 5, "MP 导出也要带名册"
+
+    plugin.init_plugin(_clear_config("all"))
+    plugin.init_plugin(_import_config(backup, mode="replace"))
+
+    assert plugin.get_data("total")["jackpots"] == before
+
+
+def test_roster_beyond_hundred_is_capped(plugin):
+    """油猴版自己就封顶 100 条，这边也一样。"""
+    payload = _userscript_backup(jackpot_count=100, draws=50000)
+    payload["total"]["jackpots"] += [
+        {"at": 1780000000000 - i, "text": "憨豆 780000"} for i in range(30)]
+    plugin.init_plugin(_import_config(payload))
+    assert len(plugin.get_data("total")["jackpots"]) == 100
