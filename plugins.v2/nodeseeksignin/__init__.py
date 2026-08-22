@@ -1,0 +1,1064 @@
+# -*- coding: utf-8 -*-
+import random
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from typing import Any, List, Dict, Tuple, Optional
+
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app.core.config import settings
+from app.plugins import _PluginBase
+from app.log import logger
+from app.schemas import NotificationType
+
+from .yescaptcha import YesCaptchaSolver, YesCaptchaSolverError
+
+# NodeSeek 站点常量
+SIGNIN_PAGE = "https://www.nodeseek.com/signIn.html"
+SIGNIN_API = "https://www.nodeseek.com/api/account/signIn"
+ATTENDANCE_API = "https://www.nodeseek.com/api/attendance"
+CREDIT_API = "https://www.nodeseek.com/api/account/credit/page-"
+SITEKEY = "0x4AAAAAAAaNy7leGjewpVyR"
+
+
+class NodeSeekSignin(_PluginBase):
+    # 插件名称
+    plugin_name = "NodeSeek签到"
+    # 插件描述
+    plugin_desc = "NodeSeek 论坛自动签到，支持多账号 Cookie / 账密登录、随机签到、收益统计与通知。"
+    # 插件图标
+    plugin_icon = "nodeseeksignin.png"
+    # 插件版本
+    plugin_version = "1.6.0"
+    # 插件作者
+    plugin_author = "SAGIRIxr"
+    # 作者主页
+    author_url = "https://github.com/SAGIRIxr"
+    # 插件配置项ID前缀
+    plugin_config_prefix = "nodeseeksignin_"
+    # 加载顺序
+    plugin_order = 24
+    # 可使用的用户级别
+    auth_level = 2
+
+    # ---------------- 私有属性 ----------------
+    _enabled = False
+    _onlyonce = False
+    _notify = True
+    _cron = None
+    # NS_COOKIE：多账号用 & 或换行分隔
+    _cookie = ""
+    # 账密：每行一个，格式 用户名----密码
+    _accounts = ""
+    # NS_RANDOM
+    _ns_random = True
+    # 随机延迟（分钟）：定时触发时先随机延迟 0~N 分钟再签到，0 为关闭
+    _random_delay = 0
+    # 多账号随机间隔（秒）：每个账号签完后随机等待 1~N 秒再签下一个，0 为关闭
+    _account_delay = 0
+    # SOLVER_TYPE：yescaptcha / 2captcha
+    _solver_type = "yescaptcha"
+    # API_BASE_URL（自定义验证码服务节点，留空用官方）
+    _api_base_url = ""
+    # CLIENTT_KEY
+    _client_key = ""
+    # 收益统计周期（天）
+    _stats_days = 30
+    # 历史记录保留天数
+    _history_days = 30
+    # 是否使用 MoviePilot 系统代理
+    _use_proxy = False
+    # 登录成功后是否把新 Cookie 写回插件配置
+    _auto_save_cookie = True
+
+    # 定时器
+    _scheduler: Optional[BackgroundScheduler] = None
+
+    def init_plugin(self, config: dict = None):
+        # 停止现有任务
+        self.stop_service()
+
+        if config:
+            self._enabled = config.get("enabled") or False
+            self._onlyonce = config.get("onlyonce") or False
+            self._notify = config.get("notify") if config.get("notify") is not None else True
+            self._cron = config.get("cron")
+            self._cookie = config.get("cookie") or ""
+            self._accounts = config.get("accounts") or ""
+            self._ns_random = config.get("ns_random") if config.get("ns_random") is not None else True
+            self._random_delay = int(config.get("random_delay") or 0)
+            self._account_delay = int(config.get("account_delay") or 0)
+            self._solver_type = (config.get("solver_type") or "yescaptcha").strip()
+            self._api_base_url = (config.get("api_base_url") or "").strip()
+            self._client_key = (config.get("client_key") or "").strip()
+            self._stats_days = int(config.get("stats_days") or 30)
+            self._history_days = int(config.get("history_days") or 30)
+            self._use_proxy = config.get("use_proxy") or False
+            self._auto_save_cookie = config.get("auto_save_cookie") if config.get("auto_save_cookie") is not None else True
+
+        # 立即运行一次
+        if self._onlyonce:
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            logger.info("NodeSeek签到服务启动，立即运行一次")
+            self._scheduler.add_job(func=self.signin, trigger='date',
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                    name="NodeSeek签到", kwargs={"manual": True})
+            self._onlyonce = False
+            self.__update_config()
+            if self._scheduler.get_jobs():
+                self._scheduler.print_jobs()
+                self._scheduler.start()
+
+    def __update_config(self):
+        """将当前配置写回插件配置（用于重置 onlyonce / 回写刷新后的 Cookie）"""
+        self.update_config({
+            "enabled": self._enabled,
+            "onlyonce": self._onlyonce,
+            "notify": self._notify,
+            "cron": self._cron,
+            "cookie": self._cookie,
+            "accounts": self._accounts,
+            "ns_random": self._ns_random,
+            "random_delay": self._random_delay,
+            "account_delay": self._account_delay,
+            "solver_type": self._solver_type,
+            "api_base_url": self._api_base_url,
+            "client_key": self._client_key,
+            "stats_days": self._stats_days,
+            "history_days": self._history_days,
+            "use_proxy": self._use_proxy,
+            "auto_save_cookie": self._auto_save_cookie,
+        })
+
+    # ---------------- 工具方法 ----------------
+    def __get_proxies(self):
+        """获取系统代理"""
+        if not self._use_proxy:
+            return None
+        try:
+            if hasattr(settings, "PROXY") and settings.PROXY:
+                return settings.PROXY
+        except Exception as e:
+            logger.error(f"获取代理设置出错: {e}")
+        return None
+
+    @staticmethod
+    def _is_cloudflare_challenge(text: str) -> bool:
+        if not text:
+            return False
+        t = text.lower()
+        return ("just a moment" in t) or ("cf-chl" in t) or ("challenge" in t and "cloudflare" in t)
+
+    @staticmethod
+    def _is_challenged(resp) -> bool:
+        """判断响应是否被 Cloudflare 挑战拦下。"""
+        if resp is None:
+            return False
+        try:
+            if resp.headers.get("cf-mitigated"):
+                return True
+        except Exception:
+            pass
+        return resp.status_code == 403 and NodeSeekSignin._is_cloudflare_challenge(resp.text)
+
+    # ---------------- Cloudflare 通行证 ----------------
+    def __browser_fetch_cf(self) -> Tuple[Optional[str], Optional[str]]:
+        """用【干净】的 CloakBrowser 上下文过一次 CF，取回 cf_clearance 与配套 UA。
+
+        切记不要向该上下文注入任何站点 Cookie：NodeSeek 的 WAF 对携带失效 session 的
+        请求一律下发挑战，注入旧 Cookie 会让浏览器永远停在 "Just a moment" 页。
+        """
+        try:
+            from cloakbrowser import launch_context
+        except Exception as e:
+            logger.error(f"未安装 CloakBrowser 浏览器仿真环境：{e}")
+            return None, None
+
+        proxy = None
+        try:
+            if self._use_proxy and hasattr(settings, "PROXY_SERVER") and settings.PROXY_SERVER:
+                proxy = settings.PROXY_SERVER
+        except Exception:
+            pass
+
+        context = None
+        page = None
+        try:
+            logger.info("[CF] 启动浏览器获取 Cloudflare 通行证...")
+            context = launch_context(headless=True, proxy=proxy)
+            page = context.new_page()
+            page.goto(SIGNIN_PAGE, timeout=60 * 1000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=60 * 1000)
+            except Exception:
+                pass
+            clearance = None
+            deadline = time.time() + 40
+            while time.time() < deadline:
+                clearance = next((c.get("value") for c in (context.cookies() or [])
+                                  if c.get("name") == "cf_clearance"), None)
+                if clearance:
+                    break
+                time.sleep(3)
+            ua = None
+            try:
+                ua = page.evaluate("()=>navigator.userAgent")
+            except Exception:
+                pass
+            if clearance and ua:
+                logger.info("[CF] 已取得 Cloudflare 通行证")
+                self.save_data("cf", {"clearance": clearance, "ua": ua, "ts": time.time()})
+                return clearance, ua
+            logger.warning("[CF] 未能取得 cf_clearance（可能仍卡在挑战页）")
+            return None, None
+        except Exception as e:
+            logger.error(f"[CF] 获取通行证异常：{e}")
+            return None, None
+        finally:
+            try:
+                if page:
+                    page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+
+    def __ensure_cf(self, force: bool = False) -> Tuple[Optional[str], Optional[str], bool]:
+        """取得可用的 (cf_clearance, UA, 是否来自缓存)。force 或缓存过期时用浏览器重取。"""
+        if not force:
+            cached = self.get_data("cf") or {}
+            clearance, ua, ts = cached.get("clearance"), cached.get("ua"), cached.get("ts") or 0
+            # cf_clearance 有效期通常较长，这里保守按 6 小时复用
+            if clearance and ua and (time.time() - ts) < 6 * 3600:
+                return clearance, ua, True
+        clearance, ua = self.__browser_fetch_cf()
+        return clearance, ua, False
+
+    def __ns_request(self, method: str, url: str, ns_cookie: str, json_data=None, timeout: int = 25):
+        """带 CF 通行证访问 NodeSeek。返回 (response, 被挑战?, 异常)。
+
+        curl 无法执行 JS，独力过不了 Cloudflare，必须借助浏览器取得的 cf_clearance
+        （且 UA 必须与取证时一致，否则通行证无效）。
+        """
+        from curl_cffi import requests as cffi_requests
+        proxies = self.__get_proxies()
+        last_resp = None
+        for attempt in (1, 2):
+            clearance, ua, from_cache = self.__ensure_cf(force=(attempt == 2))
+            cookie = f"cf_clearance={clearance}; {ns_cookie}" if clearance else ns_cookie
+            headers = {
+                'User-Agent': ua or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                'origin': "https://www.nodeseek.com",
+                'referer': "https://www.nodeseek.com/board",
+                'Content-Type': 'application/json',
+                'Cookie': cookie,
+            }
+            try:
+                resp = cffi_requests.request(method, url, headers=headers, json=json_data,
+                                             impersonate="chrome131", timeout=timeout, proxies=proxies)
+            except Exception as e:
+                return None, False, e
+            last_resp = resp
+            if not self._is_challenged(resp):
+                return resp, False, None
+            # 通行证本就是刚取的还被挑战 → 问题出在 Cookie 而非通行证，再刷也是白费一分钟
+            if attempt == 2 or not from_cache:
+                break
+            logger.warning("[CF] 请求被挑战，刷新通行证后重试一次...")
+        # 仍被挑战：通常意味着 Cookie 里的 session 已失效（NodeSeek 会挑战携带无效 session 的请求）
+        return last_resp, True, None
+
+    # ---------------- 登录逻辑 ----------------
+
+    def __solve_captcha(self) -> Tuple[Optional[str], str]:
+        """调用验证码服务解出 Turnstile 令牌，返回 (token, 失败原因)。成功时原因为空。"""
+        if not self._client_key:
+            return None, "未配置验证码密钥（CLIENTT_KEY）；账密登录必须配验证码服务"
+        try:
+            solver_type = (self._solver_type or "yescaptcha").lower()
+            proxies = self.__get_proxies()
+            if solver_type in ("2captcha", "twocaptcha"):
+                # 2Captcha 新版 API 与 YesCaptcha 同为 anti-captcha 协议，复用同一解决器
+                logger.info(f"正在使用 2Captcha 解决验证码（节点：{self._api_base_url or 'https://api.2captcha.com'}）...")
+                solver = YesCaptchaSolver(
+                    api_base_url=self._api_base_url or "https://api.2captcha.com",
+                    client_key=self._client_key,
+                    soft_id=None,
+                    proxies=proxies,
+                )
+            else:
+                # CloudFreed/TurnstileSolver 已移除，历史配置 turnstile 静默按 YesCaptcha 处理
+                base_url = self._api_base_url or "https://api.yescaptcha.com"
+                if solver_type == "turnstile":
+                    logger.warning("TurnstileSolver（CloudFreed）已移除，自动改用 YesCaptcha；请在配置页重新选择验证码服务")
+                    # 旧配置的 API_BASE_URL 是 CloudFreed 地址，不能沿用
+                    base_url = "https://api.yescaptcha.com"
+                logger.info(f"正在使用 YesCaptcha 解决验证码（节点：{base_url}）...")
+                solver = YesCaptchaSolver(
+                    api_base_url=base_url,
+                    client_key=self._client_key,
+                    proxies=proxies,
+                )
+            token = solver.solve(url=SIGNIN_PAGE, sitekey=SITEKEY, verbose=True)
+            if not token:
+                return None, "验证码解析失败（检查服务类型/密钥/余额/节点）"
+            return token, ""
+        except YesCaptchaSolverError as e:
+            return None, f"验证码服务错误：{e}"
+        except Exception as e:
+            return None, f"验证码服务异常：{e}"
+
+    def __browser_signin(self, user: str, password: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
+        """账密 → 浏览器仿真：登录 + 签到 + 收益统计，全程在 CloakBrowser 内完成。
+
+        返回 (结果状态, 消息, 收益统计dict 或 None, 登录成功取得的会话Cookie 或 None)。
+        """
+        token, reason = self.__solve_captcha()
+        if not token:
+            return "loginfail", f"登录失败：{reason}", None, None
+        return self.__run_browser_flow(user, password, token)
+
+    def __run_browser_flow(self, user: str, password: str, token: str) -> Tuple[str, str, Optional[dict], Optional[str]]:
+        """在 CloakBrowser 内执行：登录 → 写入 localStorage 令牌 → 构造鉴权头 → 签到 + 收益统计。
+
+        浏览器上下文必须保持干净：一旦注入失效的 session Cookie，NodeSeek 的 WAF 会持续
+        下发 Cloudflare 挑战，登录页永远加载不出来（preLogin 模块缺失），导致无法刷新 Cookie。
+        """
+        try:
+            from cloakbrowser import launch_context
+        except Exception as e:
+            return "loginfail", f"登录失败：未安装 CloakBrowser 浏览器仿真环境：{e}", None, None
+
+        proxy = None
+        try:
+            if self._use_proxy and hasattr(settings, "PROXY_SERVER") and settings.PROXY_SERVER:
+                proxy = settings.PROXY_SERVER
+        except Exception:
+            pass
+
+        context = None
+        page = None
+        try:
+            logger.info("[浏览器仿真] 启动 CloakBrowser 登录并签到...")
+            context = launch_context(headless=True, proxy=proxy)
+            page = context.new_page()
+            page.goto(SIGNIN_PAGE)
+            try:
+                page.wait_for_load_state("networkidle", timeout=60 * 1000)
+            except Exception:
+                pass
+
+            js = r"""
+            async ({token, username, password, statsDays}) => {
+                const out = {phase: 'start'};
+                // 复用前端 preLogin 模块构造鉴权头（首次只有指纹算出的 x-integrity-token）
+                let preMod = null;
+                async function authHeaders() {
+                    try {
+                        const urls = performance.getEntriesByType('resource').map(e => e.name);
+                        const preUrl = urls.find(u => /\/assets\/preLogin-[^/]*\.js/.test(u));
+                        if (!preMod) preMod = await import(preUrl);
+                        return await preMod.g();
+                    } catch (e) { out.vErr = String(e); return {}; }
+                }
+                // 1) 登录（与前端一致：请求头带上 x-integrity-token）
+                let vh = await authHeaders();
+                out.vKeysLogin = Object.keys(vh);
+                const lr = await fetch('/api/account/signIn', {
+                    method: 'POST', credentials: 'include',
+                    headers: Object.assign({'Content-Type': 'application/json', 'x-captcha-token': token, 'x-captcha-source': 'turnstile'}, vh),
+                    body: JSON.stringify({username: username, password: password})
+                });
+                out.loginStatus = lr.status;
+                try { out.loginHeaderKeys = [...lr.headers.keys()]; } catch (e) {}
+                const sec = lr.headers.get('x-security-token');
+                const csrf = lr.headers.get('x-csrf-token');
+                out.hasSec = !!sec;
+                try { out.loginBody = await lr.json(); } catch (e) { out.loginBody = null; }
+                if (!out.loginBody || !out.loginBody.success) { out.phase = 'login-fail'; return out; }
+                // 2) 像前端 postLogin 一样把令牌写入 localStorage
+                try { if (sec) localStorage.setItem('security_token', sec); } catch (e) {}
+                try { if (csrf) localStorage.setItem('csrf_token', csrf); } catch (e) {}
+                try { out.docCookieAfterLogin = document.cookie; } catch (e) {}
+                // 3) 重新构造鉴权头（此时含 x-security-token + x-integrity-token）
+                vh = await authHeaders();
+                out.vKeys = Object.keys(vh);
+                // 4) 签到
+                const ar = await fetch('/api/attendance?random=true', {
+                    method: 'POST', credentials: 'include',
+                    headers: Object.assign({'Content-Type': 'application/json'}, vh), body: '{}'
+                });
+                out.attStatus = ar.status;
+                try { out.attBody = await ar.json(); } catch (e) { out.attBody = null; }
+                // 5) 收益统计（积分流水分页）
+                try {
+                    const minMs = Date.now() - statsDays * 86400 * 1000;
+                    let total = 0, cnt = 0, page = 1, stop = false;
+                    while (page <= 20 && !stop) {
+                        const cr = await fetch('/api/account/credit/page-' + page, {credentials: 'include', headers: vh});
+                        let cb = null; try { cb = await cr.json(); } catch (e) {}
+                        if (!cb || !cb.success || !cb.data || !cb.data.length) break;
+                        for (const rec of cb.data) {
+                            const amt = rec[0], desc = rec[2], ts = rec[3];
+                            const t = new Date(ts).getTime();
+                            if (t < minMs) { stop = true; continue; }
+                            if (typeof desc === 'string' && desc.indexOf('签到收益') >= 0 && desc.indexOf('鸡腿') >= 0) { total += amt; cnt++; }
+                        }
+                        page++;
+                    }
+                    out.stats = {total: total, cnt: cnt};
+                } catch (e) { out.statsErr = String(e); }
+                out.phase = 'done';
+                return out;
+            }
+            """
+            res = page.evaluate(js, {"token": token, "username": user, "password": password,
+                                     "statsDays": int(self._stats_days or 30)}) or {}
+            logger.info(f"[浏览器仿真] 登录HTTP={res.get('loginStatus')} hasSecToken={res.get('hasSec')} "
+                        f"登录头={res.get('vKeysLogin')} 鉴权头={res.get('vKeys')} vErr={res.get('vErr')} 签到HTTP={res.get('attStatus')}")
+            logger.info(f"[浏览器仿真] 登录响应头清单：{res.get('loginHeaderKeys')}")
+            logger.info(f"[浏览器仿真] 登录响应体：{res.get('loginBody')}")
+            logger.info(f"[浏览器仿真] 登录后 document.cookie：{res.get('docCookieAfterLogin')}")
+            try:
+                cks = context.cookies()
+                logger.info(f"[浏览器仿真] 登录后浏览器Cookie仓库：{[(c.get('name'), c.get('domain'), 'HttpOnly' if c.get('httpOnly') else '') for c in (cks or [])]}")
+            except Exception as e:
+                logger.warning(f"[浏览器仿真] 读取浏览器Cookie失败：{e}")
+
+            login_body = res.get("loginBody") or {}
+            if res.get("phase") == "login-fail" or not login_body.get("success"):
+                msg = login_body.get("message") or f"HTTP {res.get('loginStatus')}"
+                return "loginfail", f"登录失败：{msg}", None, None
+
+            # 风控：登录被重定向到邮箱验证 → 拿不到会话，给出明确提示
+            redirect = str(login_body.get("redirect") or "")
+            if "emailSignIn" in redirect or "email" in redirect.lower():
+                logger.warning(f"[浏览器仿真] 登录被风控要求邮箱验证：redirect={redirect}")
+                return ("loginfail",
+                        "登录被风控拦截：NodeSeek 要求邮箱验证码（常因 MP 机房 IP 触发）。"
+                        "请改用现成 Cookie 签到，或为登录配置干净IP代理后重试。", None, None)
+
+            # 登录真正成功：从浏览器 cookie 仓库取出会话 Cookie（供回写复用）
+            session_cookie = None
+            try:
+                cks = context.cookies()
+                pairs = {c.get("name"): c.get("value") for c in (cks or [])
+                         if "nodeseek.com" in (c.get("domain") or "") and c.get("name")}
+                # cf_clearance 归通行证缓存单独保管，不混进业务 Cookie
+                clearance = pairs.pop("cf_clearance", None)
+                if clearance:
+                    try:
+                        ua = page.evaluate("()=>navigator.userAgent")
+                        self.save_data("cf", {"clearance": clearance, "ua": ua, "ts": time.time()})
+                        logger.info("[浏览器仿真] 已同步刷新 Cloudflare 通行证")
+                    except Exception:
+                        pass
+                if pairs:
+                    session_cookie = "; ".join(f"{k}={v}" for k, v in pairs.items())
+                    logger.info(f"[浏览器仿真] 登录成功，取得会话Cookie字段：{list(pairs.keys())}")
+            except Exception:
+                pass
+
+            att = res.get("attBody") or {}
+            amsg = att.get("message") or ""
+            logger.info(f"[浏览器仿真] 签到响应：HTTP {res.get('attStatus')}，message={amsg}")
+            if "鸡腿" in amsg or att.get("success"):
+                result = "success"
+            elif "已完成" in amsg or "已经签到" in amsg or "已签到" in amsg:
+                result = "already"
+            else:
+                result = "fail"
+
+            stats = None
+            s = res.get("stats")
+            if isinstance(s, dict):
+                cnt = int(s.get("cnt") or 0)
+                total = s.get("total") or 0
+                period = "今天" if int(self._stats_days or 30) == 1 else f"近{self._stats_days}天"
+                stats = {
+                    "total_amount": total,
+                    "average": round(total / cnt, 2) if cnt else 0,
+                    "days_count": cnt,
+                    "records": [],
+                    "period": period,
+                }
+            return result, (amsg or "签到完成"), stats, session_cookie
+        except Exception as e:
+            logger.error(f"[浏览器仿真] 流程异常：{e}")
+            return "error", f"浏览器流程异常：{e}", None, None
+        finally:
+            try:
+                if page:
+                    page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+
+    # ---------------- 签到逻辑 ----------------
+    def __sign(self, ns_cookie: str) -> Tuple[str, str]:
+        """单个 Cookie 签到，返回 (结果状态, 消息)。"""
+        if not ns_cookie:
+            return "invalid", "无有效Cookie"
+        ns_random = "true" if self._ns_random else "false"
+        try:
+            url = f"{ATTENDANCE_API}?random={ns_random}"
+            response, challenged, req_err = self.__ns_request("POST", url, ns_cookie, json_data={})
+            if req_err is not None:
+                return "error", f"请求异常: {req_err}"
+            if response is None:
+                return "error", "请求失败：无响应"
+            if challenged:
+                # 持有效通行证仍被挑战 → Cookie 里的 session 已失效，交给账密登录刷新
+                return "invalid", "Cookie 已失效（请求被 Cloudflare 挑战），需重新登录"
+            if response.status_code == 403:
+                return "forbidden", "403 Forbidden"
+            data = response.json()
+            msg = data.get("message", "")
+            if "鸡腿" in msg or data.get("success"):
+                return "success", msg
+            elif "已完成签到" in msg:
+                return "already", msg
+            elif data.get("status") == 404:
+                return "invalid", msg
+            return "fail", msg
+        except Exception as e:
+            return "error", str(e)
+
+    # ---------------- 收益统计 ----------------
+    def __get_signin_stats(self, ns_cookie: str, days: int = 30) -> Tuple[Optional[dict], str]:
+        """查询前 days 天内的签到收益统计。"""
+        if not ns_cookie:
+            return None, "无有效Cookie"
+        if days <= 0:
+            days = 1
+        try:
+            shanghai_tz = ZoneInfo("Asia/Shanghai")
+            now_shanghai = datetime.now(shanghai_tz)
+            query_start_time = now_shanghai - timedelta(days=days)
+
+            all_records = []
+            page = 1
+            while page <= 20:
+                url = f"{CREDIT_API}{page}"
+                response, challenged, req_err = self.__ns_request("GET", url, ns_cookie)
+                if req_err is not None:
+                    return None, f"请求异常: {req_err}"
+                if response is None:
+                    return None, "请求失败：无响应"
+                if challenged:
+                    return None, "查询被 Cloudflare 挑战（Cookie 可能已失效）"
+
+                data = response.json()
+                if not data.get("success") or not data.get("data"):
+                    break
+                records = data.get("data", [])
+                if not records:
+                    break
+
+                last_record_time = datetime.fromisoformat(records[-1][3].replace('Z', '+00:00'))
+                last_record_time_shanghai = last_record_time.astimezone(shanghai_tz)
+                if last_record_time_shanghai < query_start_time:
+                    for record in records:
+                        record_time = datetime.fromisoformat(record[3].replace('Z', '+00:00'))
+                        if record_time.astimezone(shanghai_tz) >= query_start_time:
+                            all_records.append(record)
+                    break
+                else:
+                    all_records.extend(records)
+                page += 1
+                time.sleep(0.5)
+
+            signin_records = []
+            for record in all_records:
+                amount, balance, description, timestamp = record
+                record_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                record_time_shanghai = record_time.astimezone(shanghai_tz)
+                if (record_time_shanghai >= query_start_time and
+                        "签到收益" in description and "鸡腿" in description):
+                    signin_records.append({
+                        'amount': amount,
+                        'date': record_time_shanghai.strftime('%Y-%m-%d'),
+                        'description': description,
+                    })
+
+            period_desc = "今天" if days == 1 else f"近{days}天"
+            if not signin_records:
+                return {
+                    'total_amount': 0, 'average': 0, 'days_count': 0,
+                    'records': [], 'period': period_desc,
+                }, f"查询成功，但没有找到{period_desc}的签到记录"
+
+            total_amount = sum(r['amount'] for r in signin_records)
+            days_count = len(signin_records)
+            average = round(total_amount / days_count, 2) if days_count > 0 else 0
+            return {
+                'total_amount': total_amount, 'average': average, 'days_count': days_count,
+                'records': signin_records, 'period': period_desc,
+            }, "查询成功"
+        except Exception as e:
+            return None, f"查询异常: {e}"
+
+    # ---------------- 账号解析 ----------------
+    def __parse_cookies(self) -> List[str]:
+        """解析 Cookie 字符串：支持 & 与换行分隔。"""
+        raw = (self._cookie or "").replace("\r", "\n")
+        parts = []
+        for chunk in raw.split("\n"):
+            for c in chunk.split("&"):
+                c = c.strip()
+                if c:
+                    parts.append(c)
+        return parts
+
+    def __parse_accounts(self) -> List[Dict[str, str]]:
+        """解析账密：每行一个，支持 用户名----密码 / 用户名,密码 / 用户名:密码。"""
+        accounts = []
+        for line in (self._accounts or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            user = password = None
+            for sep in ["----", ",", "，", ":", "：", "|", "\t"]:
+                if sep in line:
+                    user, password = line.split(sep, 1)
+                    break
+            if user is not None and password is not None:
+                user, password = user.strip(), password.strip()
+                if user and password:
+                    accounts.append({"user": user, "password": password})
+        return accounts
+
+    # ---------------- 主签到流程 ----------------
+    def signin(self, manual: bool = False):
+        """执行 NodeSeek 签到主流程。manual=True 为手动「立即运行」，不做随机延迟。"""
+        # 随机延迟：定时触发时在 0~N 分钟内浮动，避免每天固定时刻签到
+        if not manual and self._random_delay and self._random_delay > 0:
+            delay = random.randint(0, int(self._random_delay) * 60)
+            if delay > 0:
+                logger.info(f"随机延迟 {delay} 秒（{round(delay / 60, 1)} 分钟）后开始签到...")
+                time.sleep(delay)
+
+        if not self._cookie and not self._accounts:
+            logger.warning("未配置 Cookie / 账密，跳过签到")
+            return
+
+        accounts = self.__parse_accounts()
+        cookie_list = self.__parse_cookies()
+        logger.info(f"共发现 {len(accounts)} 个账密配置，{len(cookie_list)} 个现有Cookie")
+
+        # 仅有 Cookie、无账密时，为每个 Cookie 补一个空账密占位
+        if len(accounts) == 0 and len(cookie_list) > 0:
+            accounts = [{"user": "", "password": ""} for _ in cookie_list]
+
+        max_count = max(len(accounts), len(cookie_list))
+        while len(accounts) < max_count:
+            accounts.append({"user": "", "password": ""})
+        while len(cookie_list) < max_count:
+            cookie_list.append("")
+
+        cookies_updated = False
+        notify_lines = []
+        history_items = []
+
+        for i in range(max_count):
+            account_index = i + 1
+            user = accounts[i]["user"]
+            password = accounts[i]["password"]
+            cookie = cookie_list[i]
+            display_user = user if user else f"账号{account_index}"
+
+            # 多账号随机间隔：签完上一个账号后随机等待 1~N 秒再签下一个
+            if i > 0 and self._account_delay and self._account_delay > 0:
+                gap = random.randint(1, int(self._account_delay))
+                logger.info(f"多账号随机间隔，等待 {gap} 秒后签下一个账号...")
+                time.sleep(gap)
+
+            logger.info(f"==== 账号 {display_user} 开始签到 ====")
+
+            stats = None
+            if cookie:
+                result, msg = self.__sign(cookie)
+            else:
+                result, msg = "invalid", "无Cookie"
+
+            used_cookie = cookie
+            if result in ["success", "already"]:
+                logger.info(f"账号 {display_user} 签到成功: {msg}")
+            else:
+                # Cookie 失效/无 Cookie → 重新登录刷新
+                new_cookie = None
+                if user and password:
+                    logger.info(f"账号 {display_user} 使用浏览器账密登录刷新 Cookie...")
+                    result, msg, stats, new_cookie = self.__browser_signin(user, password)
+                else:
+                    logger.error(f"账号 {display_user} 签到失败且未配置账密: {msg}")
+
+                # 统一回写刷新后的会话 Cookie
+                if new_cookie and "session" in new_cookie:
+                    cookie_list[i] = new_cookie
+                    used_cookie = new_cookie
+                    cookies_updated = True
+                    logger.info(f"账号 {display_user} 已取得并回写会话 Cookie")
+                if result in ["success", "already"]:
+                    logger.info(f"账号 {display_user} 签到成功: {msg}")
+                else:
+                    logger.error(f"账号 {display_user} 重新登录签到失败: {msg}")
+
+            # 收益统计（浏览器路径已带回 stats；cookie 路径在此查询）
+            if stats is None and result in ["success", "already"] and used_cookie:
+                stats, stats_msg = self.__get_signin_stats(used_cookie, self._stats_days)
+                if not stats:
+                    logger.warning(f"统计查询失败: {stats_msg}")
+
+            # 汇总通知文本
+            status_emoji = "✅" if result in ["success", "already"] else "❌"
+            line = f"{status_emoji} {display_user}：{msg}"
+            if stats and stats.get("days_count"):
+                line += (f"\n   └ {stats['period']}签到{stats['days_count']}天，"
+                         f"共{stats['total_amount']}鸡腿，均{stats['average']}/天")
+            notify_lines.append(line)
+
+            history_items.append({
+                "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "account": display_user,
+                "result": result,
+                "message": msg,
+                "total_amount": (stats or {}).get("total_amount", 0),
+                "days_count": (stats or {}).get("days_count", 0),
+                "average": (stats or {}).get("average", 0),
+            })
+
+        # 回写刷新后的 Cookie
+        if cookies_updated and self._auto_save_cookie:
+            new_cookie_str = "\n".join([c for c in cookie_list if c.strip()])
+            if new_cookie_str != self._cookie:
+                self._cookie = new_cookie_str
+                self.__update_config()
+                logger.info("已将刷新后的 Cookie 写回插件配置")
+
+        # 保存历史
+        self.__save_history(history_items)
+
+        # 发送通知
+        if self._notify and notify_lines:
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title="【NodeSeek 签到】",
+                text="━━━━━━━━━━━━━━\n" + "\n".join(notify_lines) +
+                     "\n━━━━━━━━━━━━━━\n"
+                     f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            )
+
+    def __save_history(self, items: List[dict]):
+        """保存签到历史并清理过期记录。"""
+        if not items:
+            return
+        history = self.get_data('history') or []
+        if not isinstance(history, list):
+            history = [history]
+        history.extend(items)
+
+        retain_seconds = int(self._history_days or 30) * 24 * 60 * 60
+        expired_timestamp = time.time() - retain_seconds
+        cleaned = []
+        for record in history:
+            try:
+                if datetime.strptime(record["date"], '%Y-%m-%d %H:%M:%S').timestamp() >= expired_timestamp:
+                    cleaned.append(record)
+            except Exception:
+                logger.debug(f"忽略格式异常的签到历史记录: {record}")
+        self.save_data(key="history", value=cleaned)
+
+    # ---------------- MoviePilot 接口 ----------------
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        pass
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        pass
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        """注册定时签到服务。"""
+        if self._enabled and self._cron:
+            return [{
+                "id": "NodeSeekSignin",
+                "name": "NodeSeek签到服务",
+                "trigger": CronTrigger.from_crontab(self._cron),
+                "func": self.signin,
+                "kwargs": {},
+            }]
+        return []
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """拼装插件配置页面：返回 (页面配置, 默认数据结构)。"""
+        version = getattr(settings, "VERSION_FLAG", "v1")
+        cron_field_component = "VCronField" if version == "v2" else "VTextField"
+        return [
+            {
+                'component': 'VForm',
+                'content': [
+                    # 基础设置
+                    {
+                        'component': 'VCard',
+                        'props': {'class': 'mt-0'},
+                        'content': [
+                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
+                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-cog'},
+                                {'component': 'span', 'text': '基础设置'}
+                            ]},
+                            {'component': 'VDivider'},
+                            {'component': 'VCardText', 'content': [
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件', 'color': 'primary'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VSwitch', 'props': {'model': 'notify', 'label': '开启通知', 'color': 'info'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次', 'color': 'success'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VSwitch', 'props': {
+                                            'model': 'ns_random', 'label': '随机鸡腿奖励', 'color': 'warning',
+                                            'hint': '开=随机1~11个鸡腿，关=固定5个', 'persistent-hint': True}}]},
+                                ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VSwitch', 'props': {'model': 'use_proxy', 'label': '使用系统代理', 'color': 'warning'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': cron_field_component, 'props': {
+                                            'model': 'cron', 'label': '签到周期', 'placeholder': '0 8 * * *',
+                                            'prepend-inner-icon': 'mdi-clock-outline'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VTextField', 'props': {
+                                            'model': 'random_delay', 'label': '签到时间随机延迟(分钟)', 'type': 'number',
+                                            'placeholder': '0=关闭', 'prepend-inner-icon': 'mdi-timer-sand',
+                                            'hint': '定时触发后随机延迟0~N分钟再签到，时间不固定', 'persistent-hint': True}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VTextField', 'props': {
+                                            'model': 'stats_days', 'label': '收益统计周期(天)', 'type': 'number',
+                                            'placeholder': '30', 'prepend-inner-icon': 'mdi-chart-line'}}]},
+                                ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                        {'component': 'VTextField', 'props': {
+                                            'model': 'account_delay', 'label': '多账号随机间隔(秒)', 'type': 'number',
+                                            'placeholder': '0=关闭', 'prepend-inner-icon': 'mdi-account-clock',
+                                            'hint': '签完一个账号后随机等1~N秒再签下一个', 'persistent-hint': True}}]},
+                                ]},
+                            ]}
+                        ]
+                    },
+                    # 账号设置
+                    {
+                        'component': 'VCard',
+                        'props': {'class': 'mt-3'},
+                        'content': [
+                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
+                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-account-key'},
+                                {'component': 'span', 'text': '账号设置'}
+                            ]},
+                            {'component': 'VDivider'},
+                            {'component': 'VCardText', 'content': [
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
+                                        {'component': 'VTextarea', 'props': {
+                                            'model': 'cookie', 'label': 'NS_COOKIE',
+                                            'placeholder': '论坛 Cookie，多账号用 & 或换行分隔',
+                                            'prepend-inner-icon': 'mdi-cookie', 'rows': 3,
+                                            'persistent-placeholder': True, 'clearable': True}}]},
+                                ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
+                                        {'component': 'VTextarea', 'props': {
+                                            'model': 'accounts', 'label': '账号密码（可选，用于Cookie失效时重新登录）',
+                                            'placeholder': '每行一个账号，格式：用户名----密码（顺序与 Cookie 一一对应）',
+                                            'prepend-inner-icon': 'mdi-account', 'rows': 2,
+                                            'persistent-placeholder': True, 'clearable': True}}]},
+                                ]},
+                            ]}
+                        ]
+                    },
+                    # 验证码设置
+                    {
+                        'component': 'VCard',
+                        'props': {'class': 'mt-3'},
+                        'content': [
+                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
+                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-shield-key'},
+                                {'component': 'span', 'text': '验证码服务（登录拿验证码时需要）'}
+                            ]},
+                            {'component': 'VDivider'},
+                            {'component': 'VCardText', 'content': [
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                        {'component': 'VSelect', 'props': {
+                                            'model': 'solver_type', 'label': '验证码服务',
+                                            'prepend-inner-icon': 'mdi-puzzle',
+                                            'items': [
+                                                {'title': 'YesCaptcha', 'value': 'yescaptcha'},
+                                                {'title': '2Captcha', 'value': '2captcha'},
+                                            ]}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                        {'component': 'VTextField', 'props': {
+                                            'model': 'api_base_url', 'label': 'API_BASE_URL（可选）',
+                                            'placeholder': '自定义节点（如国内中转），留空用官方',
+                                            'prepend-inner-icon': 'mdi-link', 'clearable': True}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                        {'component': 'VTextField', 'props': {
+                                            'model': 'client_key', 'label': 'CLIENTT_KEY（验证码密钥）',
+                                            'placeholder': '验证码服务 client key',
+                                            'prepend-inner-icon': 'mdi-key', 'type': 'password',
+                                            'autocomplete': 'new-password', 'clearable': True}}]},
+                                ]},
+                            ]}
+                        ]
+                    },
+                    # 使用说明
+                    {
+                        'component': 'VCard',
+                        'props': {'class': 'mt-3'},
+                        'content': [
+                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
+                                {'component': 'VIcon', 'props': {'color': 'info', 'class': 'mr-2'}, 'text': 'mdi-information'},
+                                {'component': 'span', 'text': '使用说明'}
+                            ]},
+                            {'component': 'VDivider'},
+                            {'component': 'VCardText', 'content': [
+                                {'component': 'VAlert', 'props': {
+                                    'type': 'error', 'variant': 'elevated', 'prominent': True,
+                                    'icon': 'mdi-alert-decagram', 'class': 'mb-3',
+                                    'title': '⚠️ 首次务必填入一份有效 Cookie',
+                                    'text': 'NodeSeek 对机房 IP 有风控：无可信会话历史时，账密登录会被要求邮箱验证码而失败。请首次浏览器登录 nodeseek.com 后复制整段 Cookie 填入，让本机 IP 成为可信会话，之后账密登录刷新才能绕开邮箱验证。'}},
+                                {'component': 'VAlert', 'props': {
+                                    'type': 'success', 'variant': 'tonal', 'class': 'mb-2',
+                                    'text': '【用法】优先用 Cookie 签到，有效就一直用；Cookie 失效时才用「账号密码」自动登录刷新并写回。多账号用 & 或换行分隔，账密顺序与 Cookie 一一对应。'}},
+                                {'component': 'VAlert', 'props': {
+                                    'type': 'info', 'variant': 'tonal', 'class': 'mb-2',
+                                    'text': '验证码服务：YesCaptcha / 2Captcha 填 CLIENTT_KEY 即可，API_BASE_URL 留空用官方节点；开启「使用系统代理」后验证码 API 也走代理。'}},
+                                {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
+                                    {'component': 'span', 'props': {'class': 'text-caption text-medium-emphasis mr-3'},
+                                     'text': 'YesCaptcha 新人注册后联系客服可领免费额度：'},
+                                    {'component': 'VBtn', 'props': {
+                                        'color': 'primary', 'variant': 'flat', 'size': 'small',
+                                        'prepend-icon': 'mdi-gift-outline',
+                                        'href': 'https://yescaptcha.com/i/OYvdts', 'target': '_blank',
+                                        'text': '领取 YesCaptcha 免费额度'}},
+                                ]},
+                            ]}
+                        ]
+                    }
+                ]
+            }
+        ], {
+            "enabled": False,
+            "onlyonce": False,
+            "notify": True,
+            "ns_random": True,
+            "random_delay": 0,
+            "account_delay": 0,
+            "use_proxy": False,
+            "cron": "0 8 * * *",
+            "cookie": "",
+            "accounts": "",
+            "solver_type": "yescaptcha",
+            "api_base_url": "",
+            "client_key": "",
+            "stats_days": 30,
+        }
+
+    def get_page(self) -> List[dict]:
+        """签到历史记录页面。"""
+        historys = self.get_data('history')
+        if not historys:
+            return [
+                {
+                    'component': 'VCard',
+                    'props': {'variant': 'flat', 'class': 'mb-4'},
+                    'content': [
+                        {'component': 'VCardItem', 'props': {'class': 'pa-6'}, 'content': [
+                            {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center text-h6'}, 'content': [
+                                {'component': 'VIcon', 'props': {'color': 'primary', 'class': 'mr-3'}, 'text': 'mdi-database-remove'},
+                                {'component': 'span', 'text': '暂无签到记录'}
+                            ]}
+                        ]}
+                    ]
+                }
+            ]
+        if not isinstance(historys, list):
+            historys = [historys]
+        historys = sorted(historys, key=lambda x: x.get("date") or "", reverse=True)
+
+        rows = []
+        for h in historys:
+            success = h.get("result") in ["success", "already"]
+            rows.append({
+                'component': 'tr',
+                'content': [
+                    {'component': 'td', 'text': h.get("date", "")},
+                    {'component': 'td', 'text': h.get("account", "")},
+                    {'component': 'td', 'content': [
+                        {'component': 'VChip', 'props': {
+                            'color': 'success' if success else 'error', 'size': 'small', 'variant': 'tonal'},
+                         'text': '成功' if success else '失败'}
+                    ]},
+                    {'component': 'td', 'text': str(h.get("message", ""))},
+                    {'component': 'td', 'text': str(h.get("total_amount", 0))},
+                    {'component': 'td', 'text': str(h.get("days_count", 0))},
+                    {'component': 'td', 'text': str(h.get("average", 0))},
+                ]
+            })
+
+        return [
+            {
+                'component': 'VCard',
+                'props': {'variant': 'flat', 'class': 'mb-4'},
+                'content': [
+                    {'component': 'VCardItem', 'props': {'class': 'pa-4'}, 'content': [
+                        {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center text-h6'}, 'content': [
+                            {'component': 'VIcon', 'props': {'color': 'primary', 'class': 'mr-3'}, 'text': 'mdi-history'},
+                            {'component': 'span', 'text': '签到历史记录'}
+                        ]}
+                    ]},
+                    {'component': 'VCardText', 'content': [
+                        {'component': 'VTable', 'props': {'hover': True}, 'content': [
+                            {'component': 'thead', 'content': [
+                                {'component': 'tr', 'content': [
+                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '时间'},
+                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '账号'},
+                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '状态'},
+                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '消息'},
+                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': f'近{self._stats_days}天鸡腿'},
+                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '签到天数'},
+                                    {'component': 'th', 'props': {'class': 'text-start'}, 'text': '日均鸡腿'},
+                                ]}
+                            ]},
+                            {'component': 'tbody', 'content': rows}
+                        ]}
+                    ]}
+                ]
+            }
+        ]
+
+    def stop_service(self):
+        """退出插件。"""
+        try:
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as e:
+            logger.error("退出插件失败：%s" % str(e))
