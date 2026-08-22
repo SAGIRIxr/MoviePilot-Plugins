@@ -384,8 +384,8 @@ def test_page_jackpot_roster(plugin):
 
 
 def test_page_jackpot_counts_without_roster(plugin):
-    """名册只在油猴版面板上产生。MP 这边中过的那些没有时刻，
-    但「中过几次」是准的 —— 只摆名册的话，中过 31 次却显示 1 条，看着像丢了数据。"""
+    """名册是后来才加的，在那之前中的只剩次数、没有时刻。
+    但「中过几次」一直是准的 —— 只摆名册的话，中过 31 次却显示 1 条，看着像丢了数据。"""
     plugin.save_data("total", {
         "draws": 34228, "cost": 68456000, "gains": {"beans": 72451900},
         "prizes": {
@@ -2092,3 +2092,33 @@ def test_roster_shows_up_on_the_page(plugin, instant):
     assert "大奖名册（中过 1 次，1 条有时间记录）" in text
     assert "憨豆 780000" in text
     assert "没有时间记录" not in text, "这条是 MP 自己记的，时刻齐全"
+
+
+def test_roster_is_live_mid_run(plugin, monkeypatch):
+    """中完当场就该看得见 —— 名册跟着运行中那份统计走，不用等这一轮跑完落盘。
+
+    `total` 只在收尾时写库。名册要是只认落盘的那份，挂机抽几千次的中途中了
+    780,000，页面上要等到整轮结束才认，看着像没记上。"""
+    site = FakeSite()
+    site.balance = 5000000
+    site.draw_queue = [win("憨豆 100", credit=100), win("憨豆 780000", credit=780000),
+                       win("补签卡 1"), win("补签卡 1")]
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 2 and "page" not in seen:
+            seen["stored"] = plugin.get_data("total")
+            seen["page"] = str(plugin.get_page())
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=4)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert seen["stored"] is None, "这一轮还没落盘 —— 页面上看到的只能是运行中那份"
+    assert "🏆 本轮大奖：💰 780,000 憨豆 ×1" in seen["page"], "状态卡当场拎出来"
+    assert "大奖名册（中过 1 次，1 条有时间记录）" in seen["page"], "名册卡也跟着动"
