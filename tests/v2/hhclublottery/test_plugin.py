@@ -1730,3 +1730,94 @@ def test_live_stats_failure_falls_back(plugin, monkeypatch):
         plugin._running = False
         plugin._runner = None
     assert "777 抽" in text
+
+
+# ============================================================
+# 抽奖途中动统计（会重复落盘 / 丢数据的两条路）
+# ============================================================
+
+def _do_while_running(plugin, monkeypatch, at_draw, action, draws=6):
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(20)]
+    server, host = start_site(site)
+    out = {}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == at_draw and "done" not in out:
+            out["done"] = True
+            out["result"] = action(host)
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=draws)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+    assert out.get("done"), "钩子没触发，这个用例没测到东西"
+    return out.get("result")
+
+
+def test_import_while_running_is_refused(plugin, monkeypatch):
+    """跑着的那一轮手里攥着自己那份统计，收尾时整份写回库。这时候导入，
+    几秒后就会被那一份盖掉 —— 悄无声息地白干。"""
+    _seed_total(plugin, draws=100, origin="mpline")
+    payload = _backup(draws=9999, origin="otherline", export_id="f1")
+
+    _do_while_running(plugin, monkeypatch, 2, lambda host: plugin.init_plugin(
+        _config_for(host, notify=True, do_import=True,
+                    import_data=json.dumps(payload))))
+
+    assert any("正在抽奖" in (m.get("text") or "") for m in plugin.messages), "要拦下来并说清楚"
+    assert plugin.get_data("total")["draws"] == 106, "100 + 这轮 6 抽；导入的 9,999 一个都不该进来"
+
+
+@pytest.mark.parametrize("switch,extra", [
+    ("do_clear", {"clear_scope": "all"}),
+    ("do_restore", {}),
+])
+def test_clear_and_restore_while_running_are_refused(plugin, monkeypatch, switch, extra):
+    _seed_total(plugin, draws=100)
+    _do_while_running(plugin, monkeypatch, 2, lambda host: plugin.init_plugin(
+        _config_for(host, notify=True, **{switch: True}, **extra)))
+
+    assert any("正在抽奖" in (m.get("text") or "") for m in plugin.messages)
+    assert plugin.get_data("total")["draws"] == 106, "统计不该被动过"
+
+
+def test_export_while_running_keeps_one_lineage(plugin, monkeypatch):
+    """跑到一半点导出，编号是那会儿现生成的。不写回运行中那份的话，收尾落盘
+    会另起一个，这份备份就成了孤儿 —— 以后导回来认不出同源，会被当成别人的
+    记录合进去，等于把自己算两遍。"""
+    _seed_total(plugin, draws=50)
+    plugin.del_data("total")
+    plugin.save_data("total", {"draws": 50, "cost": 100000, "gains": {"beans": 20000},
+                               "prizes": {"beans": {"count": 50, "value": 20000,
+                                                    "tiers": {"400 憨豆": 50}}}})
+
+    backup = _do_while_running(plugin, monkeypatch, 2, lambda host: plugin.build_backup())
+
+    after = plugin.get_data("total")
+    assert backup["originId"], "导出必须带记录线编号"
+    assert backup["originId"] == after["originId"], "收尾落盘要沿用同一个编号，不能另起"
+    assert backup["total"]["draws"] == 52, "导的是含这一轮在内的实时统计，和页面上看到的一致"
+    assert after["draws"] == 56
+
+    # 把这份备份导回来，必须被同源拦住 —— 这就是「重复落盘」真正的入口
+    plugin.init_plugin(_import_config(backup))
+    assert plugin.get_data("total")["draws"] == 56, "自己导出的自己导回来不能被算两遍"
+    assert any("同源" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_one_round_writes_history_once(plugin, instant):
+    """一轮只落一条运行记录。"""
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(5)]
+    server, host = start_site(site)
+    try:
+        _configure(plugin, host, draws=3)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+    assert len(plugin.get_data("history")) == 1
+    assert plugin.get_data("total")["draws"] == 3, "这一轮只该被计一次"

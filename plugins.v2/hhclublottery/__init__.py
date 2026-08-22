@@ -119,7 +119,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.9.0"
+    plugin_version = "1.9.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -256,7 +256,14 @@ class HHClubLottery(_PluginBase):
                 setattr(self, f"_{key}", False)
             self._onlyonce = False
 
-            if len(picked) > 1:
+            if self._running:
+                # 跑着的那一轮手里攥着自己那份统计，收尾时整份写回库。这时候
+                # 动库里的数据，几秒后就会被那一份盖掉 —— 悄无声息地白干
+                names = "、".join(name for _, name, _ in picked)
+                ok, title, message = False, "操作未执行", (
+                    f"正在抽奖，{names} 都不能做 —— 这一轮收尾时会把统计整份写回，"
+                    "现在改的会被盖掉。等跑完，或先点「停止」。")
+            elif len(picked) > 1:
                 names = "、".join(name for _, name, _ in picked)
                 ok, title, message = False, "操作未执行", f"{names} 同时勾上了，一次只能做一件，都没执行"
             else:
@@ -524,6 +531,16 @@ class HHClubLottery(_PluginBase):
 
     def build_backup(self) -> dict:
         """油猴版「📥 导入备份」认这个格式。"""
+        live = self.__live_stats()
+        if live:
+            # 跑着的时候导出，导的是含这一轮在内的实时统计 —— 和页面上看到的
+            # 一致。编号要写回运行中那份，否则收尾落盘会另起一个，这份备份
+            # 就成了孤儿：以后导回来认不出同源，会被当成别人的记录合进去
+            total = normalize_stats(live["total"])
+            payload = backup_payload(empty_stats(), total)
+            self._runner.set_origin_id(total["originId"])
+            return payload
+
         total = normalize_stats(self.get_data("total"))
         payload = backup_payload(empty_stats(), total)
         # 记录线编号可能是这次现生成的（一轮没跑过就先导出）。存回去，

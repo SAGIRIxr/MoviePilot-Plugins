@@ -937,6 +937,15 @@ class LotteryRunner:
             for stats in (self.current, self.total, self.interval_stats):
                 apply_prize(stats, prize_text, self.cost, prize)
 
+    def set_origin_id(self, origin_id: str):
+        """把记录线编号写进运行中那份统计。
+
+        跑到一半点导出时，编号是那会儿现生成的；不写回来的话，收尾落盘会
+        另起一个，导出的那份备份就成了「孤儿」—— 以后导回来认不出同源，
+        会被当成别人的记录合进去，等于把自己算两遍。"""
+        with self._stats_lock:
+            self.total["originId"] = origin_id
+
     def stats_snapshot(self) -> Dict:
         """给数据页用的一致快照：本轮、累计、余额是同一时刻的。
 
