@@ -1883,3 +1883,90 @@ def test_get_form_delegates_to_the_form_module(plugin, monkeypatch):
     sentinel = ([{"component": "VForm", "content": []}], {"enabled": False})
     monkeypatch.setattr(HH, "build_form", lambda: sentinel)
     assert plugin.get_form() is sentinel
+
+
+# ============================================================
+# 本轮大奖单拎一行
+# ============================================================
+
+def test_jackpot_line_surfaces_big_beans(plugin, monkeypatch):
+    """中了 780,000 混在类别汇总里根本看不出来 —— 只不过让「憨豆 ×10」
+    变成「×11」，而那一注顶得上三百多抽的消耗。"""
+    site = FakeSite()
+    site.balance = 2000000
+    site.draw_queue = [win("憨豆 100", credit=100), win("憨豆 780000", credit=780000),
+                       win("憨豆 100", credit=100), win("补签卡 1")] +                       [win("憨豆 100", credit=100) for _ in range(10)]
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 4 and "page" not in seen:
+            seen["page"] = str(plugin.get_page())
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=6)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert "🏆 本轮大奖：💰 780,000 憨豆 ×1" in seen["page"]
+    # 类别汇总照旧给总数，两行不冲突
+    assert "本轮奖品：💰 憨豆 ×3" in seen["page"]
+
+
+def test_jackpot_line_shows_vip_with_swap(plugin, monkeypatch):
+    site = FakeSite()
+    site.user_class = "VIP"
+    site.draw_queue = [win("补签卡 1"), win("VIP 7 Day(s)", credit=1000000),
+                       win("补签卡 1")] + [win("补签卡 1") for _ in range(5)]
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 3 and "page" not in seen:
+            seen["page"] = str(plugin.get_page())
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=5)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert "🏆 本轮大奖：⭐ VIP ×1（折算 1,000,000 憨豆）" in seen["page"]
+    # VIP 已经在大奖那行说全了，别在类别汇总里再重复一遍
+    assert "⭐ VIP ×1 ·" not in seen["page"].split("本轮奖品：")[1][:80]
+
+
+def test_no_jackpot_line_when_nothing_big(plugin, monkeypatch):
+    text = _page_while_running(plugin, monkeypatch, at_draw=3, draws=10)
+    assert "本轮大奖" not in text, "没中就别占地方"
+    assert "本轮奖品：" in text
+
+
+def test_jackpot_parts():
+    parts = HH.jackpot_parts(HH.normalize_stats({
+        "draws": 5000,
+        "prizes": {
+            "beans": {"count": 4000, "tiers": {
+                "100 憨豆": 3000, "780,000 憨豆": 3, "1,000,000 憨豆": 1, "5,000 憨豆": 996}},
+            "vip": {"count": 2, "swappedBeans": 2000000, "tiers": {"已转换为憨豆 1,000,000": 2}},
+            "makeup": {"count": 998, "tiers": {"1 个": 998}},
+        }}))
+    assert parts == ["⭐ VIP ×2（折算 2,000,000 憨豆）",
+                     "💰 1,000,000 憨豆 ×1",
+                     "💰 780,000 憨豆 ×3"], "VIP 在前，憨豆按档位从大到小"
+
+    # 门槛以下的一个都不该混进来
+    assert HH.jackpot_parts(HH.normalize_stats({
+        "draws": 10, "prizes": {"beans": {"count": 10, "tiers": {"779,999 憨豆": 10}}}})) == []
+
+
+def test_jackpot_parts_without_swap():
+    """没被折算时不该凭空写个「折算 0 憨豆」。"""
+    parts = HH.jackpot_parts(HH.normalize_stats({
+        "draws": 10, "prizes": {"vip": {"count": 1, "value": 7, "tiers": {"7 天": 1}}}}))
+    assert parts == ["⭐ VIP ×1"]

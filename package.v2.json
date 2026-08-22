@@ -49,7 +49,7 @@
     "labels": "签到"
   },
   "HHClubLottery": {
-    "version": "1.9.2",
+    "version": "1.10.0",
     "level": 2,
     "name": "HHCLUB幸运大转盘",
     "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png",
@@ -58,6 +58,7 @@
     "authorUrl": "https://github.com/SAGIRIxr",
     "system_version": ">=2.12.0",
     "history": {
+      "v1.10.0": "抽奖时中的大奖单独一行显示，不再混在奖品汇总里。",
       "v1.9.2": "插件未启用时不再能通过接口触发抽奖；修正几处提示文案。",
       "v1.9.1": "修复抽奖途中导入备份会被这一轮覆盖、以及途中导出的备份日后导回来会被重复计入的问题。",
       "v1.9.0": "抽奖时状态栏新增进度条、本轮盈亏、已跑时长与预计剩余、奖品小结；点刷新时整页统计一起更新。",

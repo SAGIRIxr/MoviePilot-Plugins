@@ -24,6 +24,7 @@ from .lottery import (
     first_number,
     JACKPOT_BEANS,
     jackpot_counts,
+    jackpot_parts,
     detect_overlap,
     merge_stats,
     parse_backup,
@@ -120,7 +121,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.9.2"
+    plugin_version = "1.10.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -846,16 +847,17 @@ class HHClubLottery(_PluginBase):
             return None
 
     @staticmethod
-    def __prize_brief(prizes: dict, limit: int = 6) -> str:
+    def __prize_brief(prizes: dict, skip: tuple = (), limit: int = 6) -> str:
         parts = []
         for prize_type, bucket in sorted(prizes.items(),
                                          key=lambda item: _num(item[1].get("count")),
-                                         reverse=True)[:limit]:
-            count = _num(bucket.get("count"))
-            if not count:
+                                         reverse=True):
+            if prize_type in skip or not _num(bucket.get("count")):
                 continue
             meta = PRIZE_META.get(prize_type, PRIZE_META["unknown"])
-            parts.append(f"{meta['icon']} {meta['name']} ×{fmt(count)}")
+            parts.append(f"{meta['icon']} {meta['name']} ×{fmt(bucket['count'])}")
+            if len(parts) >= limit:
+                break
         return " · ".join(parts)
 
     def __running_lines(self, live: dict) -> List[dict]:
@@ -897,9 +899,18 @@ class HHClubLottery(_PluginBase):
         lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
                       "text": timing})
 
-        brief = self.__prize_brief(current["prizes"])
+        # 大奖单拎一行摆最前面。混在类别汇总里根本看不出来 —— 中了 780,000
+        # 只不过让「💰 憨豆 ×10」变成「×11」，而那一注顶得上三百多抽的消耗
+        jackpots = jackpot_parts(current)
+        if jackpots:
+            lines.append({"component": "div",
+                          "props": {"class": "text-body-1 font-weight-bold mt-2 text-amber"},
+                          "text": f"🏆 本轮大奖：{' · '.join(jackpots)}"})
+
+        # VIP 已经在大奖那行说全了，别再重复一遍；憨豆保留类别总数
+        brief = self.__prize_brief(current["prizes"], skip=("vip",) if jackpots else ())
         if brief:
-            lines.append({"component": "div", "props": {"class": "text-body-2 mt-2"},
+            lines.append({"component": "div", "props": {"class": "text-body-2 mt-1"},
                           "text": f"本轮奖品：{brief}"})
 
         lines.append({"component": "div", "props": {"class": "text-caption text-disabled mt-1"},

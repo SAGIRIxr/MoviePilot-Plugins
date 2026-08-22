@@ -471,6 +471,30 @@ def jackpot_counts(stats: Dict) -> Tuple[int, int, int]:
     return vip + big_beans, vip, big_beans
 
 
+def jackpot_parts(stats: Dict) -> List[str]:
+    """本轮 / 历史里中过的大奖，逐档列出来。
+
+    混在类别汇总里是看不出来的：中了 780,000 只不过让「💰 憨豆 ×10」变成
+    「×11」，而那一注顶得上三百多抽的消耗。VIP 更是被按次数排到了最后一位。"""
+    prizes = stats.get("prizes") or {}
+    parts = []
+
+    vip = prizes.get("vip") or {}
+    if _num(vip.get("count")):
+        text = f"{PRIZE_META['vip']['icon']} VIP ×{fmt(vip['count'])}"
+        swapped = _num(vip.get("swappedBeans"))
+        if swapped:
+            text += f"（折算 {fmt(swapped)} 憨豆）"
+        parts.append(text)
+
+    tiers = ((prizes.get("beans") or {}).get("tiers") or {}).items()
+    for label, count in sorted(tiers, key=lambda item: first_number(item[0]) or 0, reverse=True):
+        if (first_number(label) or 0) >= JACKPOT_BEANS and _num(count):
+            parts.append(f"{PRIZE_META['beans']['icon']} {label} ×{fmt(count)}")
+
+    return parts
+
+
 def lineage_of(stats: Dict) -> set:
     """这份统计里含有哪些记录线：自己的，加上历次并进来的。
     两份统计的记录线一旦有交集，就说明它们共享过历史。"""
