@@ -754,3 +754,67 @@ def test_cron_is_optional(plugin):
 
     plugin.init_plugin(_config_for("hhanclub.net", cron="5 9 * * *"))
     assert len(plugin.get_service()) == 1
+
+
+# ============================================================
+# 配置页交上来的数字（实机上踩到的）
+# ============================================================
+
+def test_empty_draws_is_not_draw_to_bottom(plugin):
+    """空输入框不等于 0。
+
+    实机上把插件更新到新版后打开配置页点保存，存进去的 draws 是 0 ——
+    而 0 在这儿是「一抽到底」，等于一个空输入框就能让它把余额抽干。
+    根因是 `int(config.get("draws") or 0)`：前端交上来的 "" 被折成了 0。"""
+    for blank in ("", "   ", None, "abc"):
+        plugin.init_plugin(_config_for("hhanclub.net", draws=blank))
+        assert plugin._draws == 10, f"draws={blank!r} 应当退回默认 10，而不是一抽到底"
+
+    # 明明白白填的 0 才算一抽到底
+    plugin.init_plugin(_config_for("hhanclub.net", draws=0))
+    assert plugin._draws == 0
+    plugin.init_plugin(_config_for("hhanclub.net", draws="0"))
+    assert plugin._draws == 0
+    plugin.init_plugin(_config_for("hhanclub.net", draws="100"))
+    assert plugin._draws == 100
+
+
+@pytest.mark.parametrize("field,default", [
+    ("reserve", 0), ("interval", 6.8), ("duration_buffer", 0), ("max_minutes", 60),
+    ("big_prize_min_beans", 780000), ("periodic_minutes", 30), ("history_days", 90),
+])
+def test_blank_numbers_fall_back_to_defaults(plugin, field, default):
+    plugin.init_plugin(_config_for("hhanclub.net", **{field: ""}))
+    assert getattr(plugin, f"_{field}") == default
+
+
+def test_number_helper():
+    n = HH._number
+    assert n("", 10, int) == 10
+    assert n(None, 10, int) == 10
+    assert n("  ", 10, int) == 10
+    assert n("坏值", 10, int) == 10
+    assert n(0, 10, int) == 0
+    assert n("0", 10, int) == 0
+    assert n("7", 10, int) == 7
+    assert n(6.8, 1.0) == 6.8
+    assert n("-500", 0, int) == -500
+
+
+def test_draw_to_bottom_is_announced(plugin, instant, monkeypatch):
+    """真进了一抽到底，日志里得说一声 —— 这是个会把余额抽干的决定。"""
+    warnings = []
+    monkeypatch.setattr(HH.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
+
+    site = FakeSite()
+    site.balance = 6000
+    site.draw_queue = [win("补签卡 1") for _ in range(5)]
+    server, host = start_site(site)
+    try:
+        _configure(plugin, host, draws=0, reserve=2000)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert any("一抽到底" in w for w in warnings)
+    assert plugin.get_data("total")["draws"] == 2, "6000 → 4000 → 2000 触及保留线"

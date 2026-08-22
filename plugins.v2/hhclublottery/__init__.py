@@ -35,6 +35,26 @@ from .lottery import (
 REQUIRED_COOKIE_KEYS = ("c_secure_uid", "c_secure_pass")
 
 
+def _number(value, default, cast=float):
+    """把配置页交上来的值收成数字。
+
+    **空不等于 0。** 界面上的输入框被清空时前端交的是 ""，`int(x or 0)` 会把它
+    变成 0 —— 对「每次抽多少次」来说 0 是「一抽到底」，一个空输入框就能让它
+    把余额抽干。所以空、None、认不出来的一律退回默认值，只有明明白白填了
+    数字才算数。
+    """
+    if value is None:
+        return default
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return default
+    try:
+        return cast(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _load_cookiecloud_helper():
     """CookieCloud 的模块路径在 MoviePilot 各版本间搬过家，挨个试。
 
@@ -89,7 +109,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -169,26 +189,27 @@ class HHClubLottery(_PluginBase):
             self._cookie = (config.get("cookie") or "").strip()
             self._host = (config.get("host") or "hhanclub.net").strip()
 
-            self._draws = int(config.get("draws") or 0)
-            self._reserve = float(config.get("reserve") or 0)
-            self._interval = float(config.get("interval") or 6.8)
+            # 这几个都不能写成 `x or 默认值` —— 见 _number 的说明
+            self._draws = _number(config.get("draws"), 10, int)
+            self._reserve = _number(config.get("reserve"), 0)
+            self._interval = _number(config.get("interval"), 6.8)
             self._follow_duration = (config.get("follow_duration")
                                      if config.get("follow_duration") is not None else True)
-            self._duration_buffer = int(config.get("duration_buffer") or 0)
-            self._max_minutes = float(config.get("max_minutes") or 60)
+            self._duration_buffer = _number(config.get("duration_buffer"), 0, int)
+            self._max_minutes = _number(config.get("max_minutes"), 60)
             self._clean_mail = config.get("clean_mail") or False
             self._stop_on_vip = config.get("stop_on_vip") or False
             self._stop_on_780k = config.get("stop_on_780k") or False
 
             self._notify_big_prize = (config.get("notify_big_prize")
                                       if config.get("notify_big_prize") is not None else True)
-            self._big_prize_min_beans = float(config.get("big_prize_min_beans") or 0)
+            self._big_prize_min_beans = _number(config.get("big_prize_min_beans"), 780000)
             self._notify_periodic = config.get("notify_periodic") or False
-            self._periodic_minutes = float(config.get("periodic_minutes") or 0)
+            self._periodic_minutes = _number(config.get("periodic_minutes"), 30)
 
             self._use_proxy = config.get("use_proxy") or False
             self._user_agent = (config.get("user_agent") or "").strip()
-            self._history_days = int(config.get("history_days") or 90)
+            self._history_days = _number(config.get("history_days"), 90, int)
 
         # 停止当前抽奖：只停不启。和「立即运行一次」同时勾上时，停优先 ——
         # 一次保存里既要停又要开，只能是勾错了，宁可什么都不启
@@ -385,8 +406,12 @@ class HHClubLottery(_PluginBase):
             )
             self._runner = runner
 
-            mode = ("一抽到底" if options.draws == 0
-                    else f"抽 {fmt(options.draws)} 次")
+            if options.draws == 0:
+                mode = f"一抽到底（保留 {fmt(options.reserve)} 憨豆）"
+                logger.warning("「每次抽多少次」是 0 —— 本轮一抽到底，"
+                               f"会一直抽到余额跌破保留线 {fmt(options.reserve)}")
+            else:
+                mode = f"抽 {fmt(options.draws)} 次"
             pace = ("自适应延迟 · 缓冲 %dms" % options.duration_buffer_ms
                     if options.follow_duration else f"固定间隔 {options.interval} 秒")
             logger.info(f"🎡 HHCLUB 幸运大转盘 · {mode} · {pace}")
