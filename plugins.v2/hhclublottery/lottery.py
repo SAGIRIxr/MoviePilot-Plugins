@@ -184,6 +184,15 @@ _PRIZE_RULES: List[Tuple[str, Callable[[str], bool]]] = [
 ]
 
 
+# 大奖通知能挑哪几样。憨豆这一档用的就是名册口径（JACKPOT_BEANS 以上）——
+# 通知和名册走同一条线，省得出现「推了一条大奖、名册里却没有」。
+BIG_PRIZE_KINDS: Dict[str, str] = {
+    "vip": "⭐ VIP",
+    "beans": "💰 780,000 以上憨豆",
+    "invite": "📧 邀请",
+}
+
+
 def parse_prize_text(text) -> Dict:
     compact = re.sub(r"\s+", " ", str(text or "").strip())
     fallback = {"type": "unknown", "value": 0, "label": compact or "未知奖品"}
@@ -744,11 +753,14 @@ class LotteryOptions:
         self.interval: float = float(kwargs.get("interval") or 6.8)
         self.follow_duration: bool = bool(kwargs.get("follow_duration", True))
         self.duration_buffer_ms: int = int(kwargs.get("duration_buffer_ms") or 0)
-        self.max_minutes: float = float(kwargs.get("max_minutes") or 60)
+        self.max_minutes: float = float(kwargs.get("max_minutes") or 0)
         self.clean_mail: bool = bool(kwargs.get("clean_mail"))
-        self.notify_big_prize: bool = bool(kwargs.get("notify_big_prize", True))
-        self.big_prize_min_beans: float = float(kwargs.get("big_prize_min_beans") or 0)
-        # 两个停止条件独立开关，都默认关。和上面的通知门槛互不影响 ——
+        # 没指定就三样都推 —— 和从前「中大奖即时推送」默认开着是一个意思。
+        # 明明白白给个空的才是一条都不推
+        picked = kwargs.get("big_prize_kinds")
+        self.big_prize_kinds = {kind for kind in (BIG_PRIZE_KINDS if picked is None else picked)
+                                if kind in BIG_PRIZE_KINDS}
+        # 两个停止条件独立开关，都默认关。和上面挑的通知项互不影响 ——
         # 通知想宽松点、停机想严格点，本来就是两回事。
         self.stop_on_vip: bool = bool(kwargs.get("stop_on_vip"))
         self.stop_on_780k: bool = bool(kwargs.get("stop_on_780k"))
@@ -760,7 +772,8 @@ class LotteryOptions:
         # 数值收敛，填错类型不至于炸
         self.interval = min(max(self.interval, 3.0), 3600.0)
         self.duration_buffer_ms = int(min(max(self.duration_buffer_ms, -500), 5000))
-        self.max_minutes = min(max(self.max_minutes, 1.0), 1440.0)
+        # 定时结束留空 = 不限时；填了才收敛到 1 分钟 ~ 24 小时
+        self.max_minutes = min(max(self.max_minutes, 1.0), 1440.0) if self.max_minutes > 0 else 0.0
         self.draws = max(self.draws, 0)
         self.reserve = max(self.reserve, 0)
 
@@ -827,7 +840,9 @@ class LotteryRunner:
         self.last_draw_sent_at = 0.0
         # 被限流后的单次等待覆盖值，用过即清
         self.quick_retry_ms = 0
-        self.deadline = self.started_at + options.max_minutes * 60
+        # 没设定时结束就没有终点 —— 一抽到底 / 抽够次数自己会收
+        self.deadline = (self.started_at + options.max_minutes * 60
+                         if options.max_minutes else None)
 
     # ---------------- 基础设施 ----------------
 
@@ -1103,12 +1118,12 @@ class LotteryRunner:
     # ---------------- 通知 ----------------
 
     def is_big_prize(self, prize: Dict) -> bool:
-        """够不够格推一条大奖通知。门槛可配，和「中奖就停」那两个开关互不影响。"""
-        return prize["type"] == "vip" or (
-            self.options.big_prize_min_beans > 0
-            and prize["type"] == "beans"
-            and prize["value"] >= self.options.big_prize_min_beans
-        )
+        """够不够格推一条大奖通知。推哪几样在配置页上勾，和「中奖就停」那两个
+        开关互不影响。憨豆这一档跟名册同一条线：JACKPOT_BEANS 以上才算。"""
+        kind = prize["type"]
+        if kind not in self.options.big_prize_kinds:
+            return False
+        return kind != "beans" or prize["value"] >= JACKPOT_BEANS
 
     def should_stop_for_prize(self, prize: Dict) -> bool:
         """中了就收工。VIP 已折算成憨豆的那一注 type 仍是 vip，照样按 VIP 判；
@@ -1119,7 +1134,7 @@ class LotteryRunner:
 
     def push_big_prize(self, prize: Dict, prize_text: str, will_stop: bool = False):
         """挂机跑一晚上，中了大奖当场推一条 —— 不然要等跑完才知道。"""
-        if not self.options.notify_big_prize or not self.is_big_prize(prize):
+        if not self.is_big_prize(prize):
             return
 
         # label 只是档位（VIP 那档就是「7 天」），单独拿出来看不出中的是什么奖，
@@ -1215,8 +1230,8 @@ class LotteryRunner:
         if self.stopping():
             self.stop_reason = self.stop_reason or "插件停用 / 手动停止"
             return False
-        if time.time() > self.deadline:
-            self.stop_reason = f"到达单次运行时间上限（{interval_text(self.options.max_minutes)} 分钟）"
+        if self.deadline and time.time() > self.deadline:
+            self.stop_reason = f"到了定时结束的点（{interval_text(self.options.max_minutes)} 分钟）"
             self.report(f"⏰ {self.stop_reason}，收工")
             return False
         if self.options.draws > 0:

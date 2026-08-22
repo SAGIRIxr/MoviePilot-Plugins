@@ -129,6 +129,9 @@ def test_config_roundtrip():
     assert instance._notify is False
     assert instance._clean_mail is True
     assert instance._periodic_minutes == 15
+    assert instance._max_minutes == 120
+    # 这份是升级前存下来的老配置：推送关着 —— 翻过来就该一样都不推
+    assert instance._big_prize_kinds == []
 
 
 # ============================================================
@@ -534,7 +537,7 @@ def test_run_lottery_big_prize_pushes_immediately(plugin, instant):
     site.draw_queue = [win("憨豆 780000", credit=780000), win("补签卡 1")]
     server, host = start_site(site)
     try:
-        _configure(plugin, host, draws=2, big_prize_min_beans=780000)
+        _configure(plugin, host, draws=2)
         plugin.run_lottery()
     finally:
         stop_site(server)
@@ -550,7 +553,7 @@ def test_notify_switch_silences_everything(plugin, instant):
     site.draw_queue = [win("憨豆 780000", credit=780000)]
     server, host = start_site(site)
     try:
-        _configure(plugin, host, draws=1, notify=False, big_prize_min_beans=780000)
+        _configure(plugin, host, draws=1, notify=False)
         plugin.run_lottery()
     finally:
         stop_site(server)
@@ -668,9 +671,9 @@ def _config_for(host, **overrides):
         "cron": "5 9 * * *", "cookie_source": "manual",
         "cookie": "c_secure_uid=1; c_secure_pass=2", "host": host,
         "draws": 10, "reserve": 0, "interval": 6.8, "follow_duration": True,
-        "duration_buffer": 0, "max_minutes": 60, "clean_mail": False,
+        "duration_buffer": 0, "max_minutes": "", "clean_mail": False,
         "stop_on_vip": False, "stop_on_780k": False,
-        "notify_big_prize": True, "big_prize_min_beans": 780000,
+        "big_prize_kinds": ["vip", "beans", "invite"],
         "notify_periodic": False, "periodic_minutes": 30,
         "use_proxy": False, "user_agent": "", "history_days": 90,
     }
@@ -892,8 +895,8 @@ def test_empty_draws_is_not_draw_to_bottom(plugin):
 
 
 @pytest.mark.parametrize("field,default", [
-    ("reserve", 0), ("interval", 6.8), ("duration_buffer", 0), ("max_minutes", 60),
-    ("big_prize_min_beans", 780000), ("periodic_minutes", 30), ("history_days", 90),
+    ("reserve", 0), ("interval", 6.8), ("duration_buffer", 0), ("max_minutes", 0),
+    ("periodic_minutes", 30), ("history_days", 90),
 ])
 def test_blank_numbers_fall_back_to_defaults(plugin, field, default):
     plugin.init_plugin(_config_for("hhanclub.net", **{field: ""}))
@@ -1438,7 +1441,7 @@ def test_history_days_is_at_least_one(plugin):
 
 
 def test_out_of_range_values_are_announced(plugin, instant, monkeypatch):
-    """实机上有人把「单次运行上限」填成了 600000 分钟，静悄悄按 1440 跑了，
+    """实机上有人把「定时结束」填成了 600000 分钟，静悄悄按 1440 跑了，
     配置页上还显示 600000 —— 那就等于没人知道。"""
     warnings = []
     monkeypatch.setattr(HH.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
@@ -1452,7 +1455,7 @@ def test_out_of_range_values_are_announced(plugin, instant, monkeypatch):
     finally:
         stop_site(server)
 
-    assert any("单次运行上限(分钟)" in w and "600,000" in w and "1,440" in w for w in warnings)
+    assert any("定时结束(分钟)" in w and "600,000" in w and "1,440" in w for w in warnings)
 
 
 # ============================================================
@@ -2066,13 +2069,14 @@ def test_small_prizes_are_not_recorded(plugin, instant):
     assert roster == []
 
 
-def test_roster_口径_ignores_the_notification_threshold(plugin, instant):
-    """「大奖通知门槛」是可配的，有人调到 100 图个热闹。名册不能跟着走，
-    不然就成流水账了。"""
+def test_roster_口径_ignores_the_notification_picks(plugin, instant):
+    """「中大奖即时推送」勾什么是通知的事，名册不跟着走。
+    邀请值得推一条，但名册只收 VIP 和 780,000 以上的憨豆。"""
     roster = _run_and_get_roster(plugin, [
-        win("憨豆 5000", credit=5000), win("憨豆 100", credit=100),
-    ], draws=2, big_prize_min_beans=100)
-    assert roster == [], "门槛调到 100 也不该往名册里塞"
+        win("邀请 1"), win("憨豆 5000", credit=5000),
+    ], draws=2, big_prize_kinds=["vip", "beans", "invite"])
+    assert roster == [], "推了通知的不等于进名册"
+    assert any("命中大奖" in (m.get("title") or "") for m in plugin.messages), "邀请该推一条"
 
 
 def test_roster_accumulates_across_rounds(plugin, instant):
@@ -2122,3 +2126,127 @@ def test_roster_is_live_mid_run(plugin, monkeypatch):
     assert seen["stored"] is None, "这一轮还没落盘 —— 页面上看到的只能是运行中那份"
     assert "🏆 本轮大奖：💰 780,000 憨豆 ×1" in seen["page"], "状态卡当场拎出来"
     assert "大奖名册（中过 1 次，1 条有时间记录）" in seen["page"], "名册卡也跟着动"
+
+
+# ============================================================
+# 定时结束（原「单次运行上限」）
+# ============================================================
+
+def test_no_deadline_by_default(plugin, monkeypatch):
+    """留空 = 不限时。这一项默认就是留空 —— 抽多少次由「每次抽多少次」和
+    保留线说了算，再压一个 60 分钟的暗线只会让长跑莫名其妙被腰斩。"""
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(6)]
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        seen["deadline"] = self.deadline
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=5)
+        assert plugin._max_minutes == 0, "类属性默认就该是不限时"
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert seen["deadline"] is None, "没设定时结束就不该有终点"
+    assert plugin.get_data("history")[0]["draws"] == 5
+    assert "定时结束" not in (plugin.get_data("history")[0]["status"] or "")
+
+
+def test_blank_deadline_stays_blank_in_the_form(plugin):
+    """0 得回填成空的。配置页上写着「留空 = 不限时」，保存完却显示个 0，
+    没人知道那到底是不限时还是 0 分钟。"""
+    plugin.init_plugin(_config_for("hhanclub.net", max_minutes=""))
+    plugin._HHClubLottery__update_config()
+    assert plugin._config["max_minutes"] == ""
+    plugin.init_plugin(_config_for("hhanclub.net", max_minutes=90))
+    plugin._HHClubLottery__update_config()
+    assert plugin._config["max_minutes"] == 90
+
+
+def test_deadline_stops_the_round(plugin, instant, monkeypatch):
+    """填了就得真到点收工。"""
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(50)]
+    server, host = start_site(site)
+    clock = {"t": time.time()}
+    monkeypatch.setattr(HH.LotteryRunner, "sleep",
+                        lambda self, ms: (clock.__setitem__("t", clock["t"] + 60),
+                                          self.stop_event.is_set())[1])
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    try:
+        _configure(plugin, host, draws=0, reserve=0, max_minutes=3)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert "到了定时结束的点" in plugin.get_data("history")[0]["status"]
+    assert plugin.get_data("total")["draws"] < 10, "3 分钟、每抽 1 分钟，抽不了几次"
+
+
+# ============================================================
+# 中大奖即时推送：挑推哪几样
+# ============================================================
+
+def _run_and_get_titles(plugin, queue, **opts):
+    site = FakeSite()
+    site.balance = 5000000
+    site.user_class = "User"
+    site.draw_queue = queue
+    server, host = start_site(site)
+    try:
+        _configure(plugin, host, draws=len(queue), **opts)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+    return [m.get("title") or "" for m in plugin.messages]
+
+
+def test_big_prize_picks_are_a_whitelist(plugin, instant):
+    """只勾了邀请：中邀请推，中 780,000 不推。"""
+    titles = _run_and_get_titles(plugin, [win("憨豆 780000", credit=780000)],
+                                 big_prize_kinds=["invite"])
+    assert not any("命中大奖" in t for t in titles)
+
+    plugin.messages.clear()
+    titles = _run_and_get_titles(plugin, [win("邀请 1")], big_prize_kinds=["invite"])
+    assert any("命中大奖" in t for t in titles)
+
+
+def test_no_picks_means_no_push(plugin, instant):
+    """一样都不勾 = 不推 —— 这一项自己就是开关，不用再配个总闸。"""
+    titles = _run_and_get_titles(plugin, [win("VIP 7 Day(s)", credit=0),
+                                          win("憨豆 780000", credit=780000),
+                                          win("邀请 1")], big_prize_kinds=[])
+    assert not any("命中大奖" in t for t in titles)
+    assert plugin.get_data("total")["draws"] == 3, "不推归不推，成绩照记"
+
+
+def test_beans_pick_uses_the_roster_line(plugin, instant):
+    """憨豆这一档就是名册那条线（780,000 以上），5,000 那种不算大奖。"""
+    titles = _run_and_get_titles(plugin, [win("憨豆 5000", credit=5000)],
+                                 big_prize_kinds=["vip", "beans", "invite"])
+    assert not any("命中大奖" in t for t in titles)
+
+
+@pytest.mark.parametrize("legacy,expected", [
+    ({}, ["vip", "beans", "invite"]),
+    ({"notify_big_prize": False, "big_prize_min_beans": 780000}, []),
+    ({"notify_big_prize": True, "big_prize_min_beans": 780000}, ["vip", "beans"]),
+    ({"notify_big_prize": True, "big_prize_min_beans": 0}, ["vip"]),
+    ({"big_prize_kinds": []}, []),
+    ({"big_prize_kinds": ["invite", "vip", "乱填的"]}, ["vip", "invite"]),
+    ({"big_prize_kinds": "vip,beans"}, ["vip", "beans"]),
+])
+def test_legacy_notify_config_is_translated(plugin, legacy, expected):
+    """升级不该让通知悄悄变样：关掉推送的人不能突然开始收，
+    把门槛调到 0（只推 VIP）的人也不该多出憨豆那一档。"""
+    config = _config_for("hhanclub.net")
+    config.pop("big_prize_kinds")
+    config.update(legacy)
+    plugin.init_plugin(config)
+    assert plugin._big_prize_kinds == expected

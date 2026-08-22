@@ -250,7 +250,7 @@ def test_vip_swap_eligible():
     site.draw_queue = [win("VIP 7 Day(s)", credit=1000060)]
     server, host = start_site(site)
     try:
-        runner, logs, notices = make_runner(host, draws=1, notify_big_prize=True)
+        runner, logs, notices = make_runner(host, draws=1)
         runner.run()
     finally:
         stop_site(server)
@@ -554,11 +554,11 @@ def test_stop_on_vip_skips_double_calibration():
     check("不重复校准", site.lucky_calls, 2)
 
 
-def test_notify_threshold_and_stop_are_independent():
-    """通知门槛和停机条件是两回事：门槛调到只推 VIP，780k 照样能停。"""
+def test_notify_picks_and_stop_are_independent():
+    """推哪几样和停机条件是两回事：只勾了 VIP，780k 照样能停，只是不推通知。"""
     site, runner, _, notices = _run_with_stop(
         [win("憨豆 780000", credit=780000)],
-        stop_on_780k=True, big_prize_min_beans=0, notify_big_prize=True)
+        stop_on_780k=True, big_prize_kinds=["vip"])
     check("停了", runner.current["draws"], 1)
     check("没推大奖通知", notices, [])
 

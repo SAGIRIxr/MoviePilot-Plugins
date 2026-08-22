@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Tuple
 
 from app.core.config import settings
 
+from .lottery import BIG_PRIZE_KINDS
+
 
 def build_form() -> Tuple[List[dict], Dict[str, Any]]:
     version = getattr(settings, "VERSION_FLAG", "v1")
@@ -95,8 +97,9 @@ def build_form() -> Tuple[List[dict], Dict[str, Any]]:
                             "model": "reserve", "label": "保留憨豆", "type": "number",
                             "hint": "一抽到底时留多少不动", "persistent-hint": True}}),
                         col(3, {"component": "VTextField", "props": {
-                            "model": "max_minutes", "label": "单次运行上限(分钟)", "type": "number",
-                            "hint": "防止一抽到底把任务挂死", "persistent-hint": True}}),
+                            "model": "max_minutes", "label": "定时结束(分钟)", "type": "number",
+                            "placeholder": "留空 = 不限时",
+                            "hint": "到点收工，最多 1440（24 小时）", "persistent-hint": True}}),
                         col(3, {"component": "VSwitch", "props": {
                             "model": "clean_mail", "label": "清理抽奖站内信", "color": "warning",
                             "hint": "只删主题带「幸运大转盘」的", "persistent-hint": True}}),
@@ -126,17 +129,19 @@ def build_form() -> Tuple[List[dict], Dict[str, Any]]:
 
                 card("mdi-bell-ring", "success", "通知设置", [
                     {"component": "VRow", "content": [
-                        col(3, {"component": "VSwitch", "props": {
-                            "model": "notify_big_prize", "label": "中大奖即时推送", "color": "success"}}),
-                        col(3, {"component": "VTextField", "props": {
-                            "model": "big_prize_min_beans", "label": "大奖门槛(憨豆)", "type": "number",
-                            "hint": "填 0 则只有 VIP 才推", "persistent-hint": True}}),
+                        col(6, {"component": "VSelect", "props": {
+                            "model": "big_prize_kinds", "label": "中大奖即时推送",
+                            "multiple": True, "chips": True, "clearable": True,
+                            "items": [{"title": title, "value": value}
+                                      for value, title in BIG_PRIZE_KINDS.items()],
+                            "hint": "勾中的当场推一条，一样都不勾 = 不推",
+                            "persistent-hint": True}}),
                         col(3, {"component": "VSwitch", "props": {
                             "model": "notify_periodic", "label": "定时战报", "color": "info",
                             "hint": "长跑时中途也播报一次", "persistent-hint": True}}),
                         col(3, {"component": "VTextField", "props": {
                             "model": "periodic_minutes", "label": "战报间隔(分钟)", "type": "number",
-                            "hint": "别填得比运行上限还大", "persistent-hint": True}}),
+                            "hint": "别填得比这一轮跑的时间还长", "persistent-hint": True}}),
                     ]},
                 ]),
 
@@ -259,12 +264,11 @@ def build_form() -> Tuple[List[dict], Dict[str, Any]]:
         "interval": 6.8,
         "follow_duration": True,
         "duration_buffer": 0,
-        "max_minutes": 60,
+        "max_minutes": "",
         "clean_mail": False,
         "stop_on_vip": False,
         "stop_on_780k": False,
-        "notify_big_prize": True,
-        "big_prize_min_beans": 780000,
+        "big_prize_kinds": list(BIG_PRIZE_KINDS),
         "notify_periodic": False,
         "periodic_minutes": 30,
         "use_proxy": False,

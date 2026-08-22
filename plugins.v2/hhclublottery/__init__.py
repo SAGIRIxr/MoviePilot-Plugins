@@ -19,6 +19,7 @@ from app.schemas.types import EventType
 
 from .config_form import build_form
 from .lottery import (
+    BIG_PRIZE_KINDS,
     CookieInvalid,
     _num,
     first_number,
@@ -121,7 +122,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.11.0"
+    plugin_version = "1.12.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -151,15 +152,14 @@ class HHClubLottery(_PluginBase):
     _interval = 6.8
     _follow_duration = True
     _duration_buffer = 0
-    _max_minutes = 60
+    _max_minutes = 0          # 0 = 不设定时结束
     _clean_mail = False
     # 中大奖就收工，两个条件独立开关，都默认关
     _stop_on_vip = False
     _stop_on_780k = False
 
     # 通知
-    _notify_big_prize = True
-    _big_prize_min_beans = 780000
+    _big_prize_kinds = list(BIG_PRIZE_KINDS)
     _notify_periodic = False
     _periodic_minutes = 30
 
@@ -231,14 +231,12 @@ class HHClubLottery(_PluginBase):
             self._follow_duration = (config.get("follow_duration")
                                      if config.get("follow_duration") is not None else True)
             self._duration_buffer = _number(config.get("duration_buffer"), 0, int)
-            self._max_minutes = _number(config.get("max_minutes"), 60)
+            self._max_minutes = _number(config.get("max_minutes"), 0)
             self._clean_mail = config.get("clean_mail") or False
             self._stop_on_vip = config.get("stop_on_vip") or False
             self._stop_on_780k = config.get("stop_on_780k") or False
 
-            self._notify_big_prize = (config.get("notify_big_prize")
-                                      if config.get("notify_big_prize") is not None else True)
-            self._big_prize_min_beans = _number(config.get("big_prize_min_beans"), 780000)
+            self._big_prize_kinds = self.__big_prize_kinds(config)
             self._notify_periodic = config.get("notify_periodic") or False
             self._periodic_minutes = _number(config.get("periodic_minutes"), 30)
 
@@ -312,6 +310,31 @@ class HHClubLottery(_PluginBase):
                 self._scheduler.print_jobs()
                 self._scheduler.start()
 
+    @staticmethod
+    def __big_prize_kinds(config: dict) -> List[str]:
+        """配置页上勾的那几样。
+
+        老配置里是「中大奖即时推送」开关 + 一个憨豆门槛，得照着原来的意思翻一遍 ——
+        不然升级完通知会悄悄变样：关掉推送的人突然开始收通知，或者把门槛调到 100
+        的人一夜之间收几百条。翻不出来就按全新安装算（三样都推）。"""
+        picked = config.get("big_prize_kinds")
+        if picked is not None:
+            if isinstance(picked, str):
+                picked = [item.strip() for item in picked.split(",")]
+            chosen = set(picked or [])
+            return [kind for kind in BIG_PRIZE_KINDS if kind in chosen]
+
+        if "notify_big_prize" not in config and "big_prize_min_beans" not in config:
+            return list(BIG_PRIZE_KINDS)
+        if not (config.get("notify_big_prize")
+                if config.get("notify_big_prize") is not None else True):
+            return []
+        # 老口径：VIP 一直推；憨豆看门槛，填 0 就是不推。邀请那会儿还推不了
+        kinds = ["vip"]
+        if _number(config.get("big_prize_min_beans"), 780000) > 0:
+            kinds.append("beans")
+        return [kind for kind in BIG_PRIZE_KINDS if kind in set(kinds)]
+
     def __update_config(self):
         """把当前配置写回（主要用于复位 onlyonce）。"""
         self.update_config({
@@ -334,12 +357,12 @@ class HHClubLottery(_PluginBase):
             "interval": self._interval,
             "follow_duration": self._follow_duration,
             "duration_buffer": self._duration_buffer,
-            "max_minutes": self._max_minutes,
+            # 0 写成空的：配置页上「留空 = 不限时」，回填个 0 会让人以为是别的意思
+            "max_minutes": self._max_minutes or "",
             "clean_mail": self._clean_mail,
             "stop_on_vip": self._stop_on_vip,
             "stop_on_780k": self._stop_on_780k,
-            "notify_big_prize": self._notify_big_prize,
-            "big_prize_min_beans": self._big_prize_min_beans,
+            "big_prize_kinds": self._big_prize_kinds,
             "notify_periodic": self._notify_periodic,
             "periodic_minutes": self._periodic_minutes,
             "use_proxy": self._use_proxy,
@@ -587,8 +610,8 @@ class HHClubLottery(_PluginBase):
                 clean_mail=self._clean_mail,
                 stop_on_vip=self._stop_on_vip,
                 stop_on_780k=self._stop_on_780k,
-                notify_big_prize=self._notify_big_prize and self._notify,
-                big_prize_min_beans=self._big_prize_min_beans,
+                # 总开关关掉了就一条都不推，勾了哪几样也不算数
+                big_prize_kinds=self._big_prize_kinds if self._notify else [],
                 notify_periodic=self._notify_periodic and self._notify,
                 periodic_minutes=self._periodic_minutes,
                 proxies=self.__get_proxies(),
@@ -605,9 +628,9 @@ class HHClubLottery(_PluginBase):
             )
             self._runner = runner
 
-            # 数值被收敛时说一声。实机上有人把「单次运行上限」填成了 600000 分钟，
+            # 数值被收敛时说一声。实机上有人把「定时结束」填成了 600000 分钟，
             # 静悄悄按 1440 跑了，配置页上还显示 600000 —— 那就等于没人知道
-            for name, filled, used in (("单次运行上限(分钟)", self._max_minutes, options.max_minutes),
+            for name, filled, used in (("定时结束(分钟)", self._max_minutes, options.max_minutes),
                                        ("固定间隔(秒)", self._interval, options.interval),
                                        ("自适应缓冲(ms)", self._duration_buffer, options.duration_buffer_ms)):
                 if filled != used:
