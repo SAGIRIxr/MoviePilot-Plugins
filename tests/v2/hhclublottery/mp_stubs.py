@@ -102,6 +102,9 @@ class _PluginBase:
     def get_data(self, key=None, plugin_id=None):
         return self._store.get(key) if key else self._store
 
+    def del_data(self, key, plugin_id=None):
+        return self._store.pop(key, None)
+
     def post_message(self, **kwargs):
         self.messages.append(kwargs)
 

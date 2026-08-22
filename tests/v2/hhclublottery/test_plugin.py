@@ -1219,3 +1219,137 @@ def test_gain_card_keeps_unknown_prizes(plugin):
     })
     text = str(plugin.get_page())
     assert "其他奖品" in text and "站点新加的奖品？" in text
+
+
+# ============================================================
+# 清空 / 撤销 / 导出→清空→导入
+# ============================================================
+
+def _clear_config(scope="all", **overrides):
+    overrides.setdefault("notify", True)
+    return _config_for("hhanclub.net", clear_scope=scope, do_clear=True, **overrides)
+
+
+def test_clear_history_only(plugin):
+    _seed_total(plugin, draws=100)
+    plugin.save_data("history", [{"date": "2026-08-20 09:00:00", "draws": 100}])
+    plugin.init_plugin(_clear_config("history"))
+
+    assert plugin.get_data("history") is None
+    assert plugin.get_data("total")["draws"] == 100, "只清运行记录就别动统计"
+
+
+def test_clear_stats_only(plugin):
+    _seed_total(plugin, draws=100)
+    plugin.save_data("history", [{"date": "2026-08-20 09:00:00", "draws": 100}])
+    plugin.init_plugin(_clear_config("stats"))
+
+    assert plugin.get_data("total") is None
+    assert len(plugin.get_data("history")) == 1, "只清统计就别动运行记录"
+
+
+def test_clear_all(plugin):
+    _seed_total(plugin, draws=100)
+    plugin.save_data("history", [{"date": "2026-08-20 09:00:00", "draws": 100}])
+    plugin.init_plugin(_clear_config("all"))
+
+    assert plugin.get_data("total") is None
+    assert plugin.get_data("history") is None
+    assert "暂无抽奖记录" in str(plugin.get_page())
+
+
+def test_clear_resets_switch(plugin):
+    _seed_total(plugin, draws=100)
+    plugin.init_plugin(_clear_config("all"))
+    assert plugin._do_clear is False
+    assert plugin._config["do_clear"] is False
+
+
+def test_clear_empty_is_a_no_op(plugin):
+    plugin.init_plugin(_clear_config("all"))
+    assert any("本来就是空的" in (m.get("text") or "") for m in plugin.messages)
+    assert plugin.get_data("before_clear") is None, "什么都没清就别留快照"
+
+
+def test_restore_after_clear(plugin):
+    """清空是不可逆的操作，配置页上一个开关离手滑只有一下的距离 —— 得能撤。"""
+    _seed_total(plugin, draws=34228, beans=72451900)
+    plugin.save_data("history", [{"date": "2026-08-20 09:00:00", "draws": 100}])
+
+    plugin.init_plugin(_clear_config("all"))
+    assert plugin.get_data("total") is None
+
+    plugin.init_plugin(_config_for("hhanclub.net", do_restore=True, notify=True))
+    total = plugin.get_data("total")
+    assert total["draws"] == 34228
+    assert total["gains"]["beans"] == 72451900
+    assert len(plugin.get_data("history")) == 1
+    assert plugin.get_data("before_clear") is None, "撤过一次就该把快照消掉"
+    assert plugin._do_restore is False
+
+
+def test_restore_without_snapshot(plugin):
+    _seed_total(plugin, draws=100)
+    plugin.init_plugin(_config_for("hhanclub.net", do_restore=True, notify=True))
+    assert plugin.get_data("total")["draws"] == 100, "没快照就别动现有数据"
+    assert any("没有可撤销的快照" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_two_one_shot_switches_do_nothing(plugin):
+    """一次保存只做一件事。同时勾多个只能是勾错了，与其猜哪个优先，不如都不做。"""
+    _seed_total(plugin, draws=100)
+    plugin.init_plugin(_config_for(
+        "hhanclub.net", notify=True, do_clear=True, clear_scope="all",
+        do_import=True, import_data=json.dumps(_backup())))
+
+    assert plugin.get_data("total")["draws"] == 100, "谁都不该执行"
+    assert plugin._do_clear is False and plugin._do_import is False, "但开关都要复位"
+    assert any("一次只能做一件" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_export_clear_import_round_trip(plugin):
+    """导出 → 清空 → 把刚导出的那份导回来。这是最常用的搬家 / 重置流程，
+    必须能走通 —— 清空要把记录线一起清掉，否则导回来会被「两份记录同源」拦住。"""
+    _seed_total(plugin, draws=34228, beans=72451900, origin="mpline")
+    plugin.save_data("history", [{"date": "2026-08-20 09:00:00", "draws": 100,
+                                  "cost": 200000, "beans": 1125900, "profit": 925900}])
+    backup = plugin.build_backup()
+    assert backup["total"]["draws"] == 34228
+
+    # 清空（统计和运行记录都清）
+    plugin.init_plugin(_clear_config("all"))
+    assert plugin.get_data("total") is None
+
+    # 原样导回来
+    plugin.init_plugin(_import_config(backup))
+    total = plugin.get_data("total")
+    assert total["draws"] == 34228, "清空之后导回自己的备份必须成功"
+    assert total["cost"] == 34228 * 2000
+    assert total["gains"]["beans"] == 72451900
+    assert not any("⛔" in (m.get("text") or "") for m in plugin.messages), "不该被查重拦下"
+
+
+def test_export_clear_import_replace_keeps_lineage(plugin):
+    """用「覆盖」导回来的话，记录线也跟着回来 —— 恢复得更彻底。"""
+    _seed_total(plugin, draws=500, origin="mpline")
+    backup = plugin.build_backup()
+    origin = backup["originId"]
+
+    plugin.init_plugin(_clear_config("all"))
+    plugin.init_plugin(_import_config(backup, mode="replace"))
+
+    total = plugin.get_data("total")
+    assert total["draws"] == 500
+    assert total["originId"] == origin, "覆盖恢复应当连记录线一起回来"
+
+
+def test_clearing_only_history_still_blocks_reimport(plugin):
+    """只清了运行记录、统计还在 —— 这时候再导回自己的备份，仍然要被拦住，
+    不然就是把自己算两遍。"""
+    _seed_total(plugin, draws=500, origin="mpline")
+    backup = plugin.build_backup()
+    plugin.init_plugin(_clear_config("history"))
+
+    plugin.init_plugin(_import_config(backup))
+    assert plugin.get_data("total")["draws"] == 500, "统计还在，不该重复合并"
+    assert any("同源" in (m.get("text") or "") for m in plugin.messages)

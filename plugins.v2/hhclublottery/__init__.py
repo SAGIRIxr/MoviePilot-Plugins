@@ -119,7 +119,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -174,6 +174,11 @@ class HHClubLottery(_PluginBase):
     _import_mode = "merge"
     _do_import = False
 
+    # 清空 / 撤销：同样是一次性开关
+    _clear_scope = "history"
+    _do_clear = False
+    _do_restore = False
+
     # 运行时
     _scheduler: Optional[BackgroundScheduler] = None
     # 全程只有这一个 Event，绝不在 init_plugin 里换新的 —— 换了的话，
@@ -203,6 +208,9 @@ class HHClubLottery(_PluginBase):
             self._import_data = config.get("import_data") or ""
             self._import_mode = (config.get("import_mode") or "merge").strip()
             self._do_import = config.get("do_import") or False
+            self._clear_scope = (config.get("clear_scope") or "history").strip()
+            self._do_clear = config.get("do_clear") or False
+            self._do_restore = config.get("do_restore") or False
             self._notify = config.get("notify") if config.get("notify") is not None else True
             self._cron = (config.get("cron") or "").strip()
 
@@ -232,20 +240,31 @@ class HHClubLottery(_PluginBase):
             self._user_agent = (config.get("user_agent") or "").strip()
             self._history_days = _number(config.get("history_days"), 90, int)
 
-        # 导入备份：一次性，导完即复位，不顺带开抽
-        if self._do_import:
-            self._do_import = False
-            ok, message = self.__run_import()
-            if ok:
-                self._import_data = ""       # 导完清空，免得下次保存又导一遍
-                logger.info(f"📥 {message}")
+        # 一次性动作：导入 / 清空 / 撤销。一次保存只做一件，同时勾多个只能是
+        # 勾错了 —— 与其猜哪个优先，不如全都不做、把话说清楚
+        actions = [("do_import", "📥 备份导入", self.__run_import),
+                   ("do_clear", "🧹 清空记录", self.__run_clear),
+                   ("do_restore", "↩️ 撤销上次清空", self.__run_restore)]
+        picked = [item for item in actions if getattr(self, f"_{item[0]}")]
+        if picked:
+            for key, _, _ in actions:
+                setattr(self, f"_{key}", False)
+            self._onlyonce = False
+
+            if len(picked) > 1:
+                names = "、".join(name for _, name, _ in picked)
+                ok, title, message = False, "操作未执行", f"{names} 同时勾上了，一次只能做一件，都没执行"
             else:
-                logger.error(f"📥 导入未执行：{message}")
+                key, title, runner = picked[0]
+                ok, message = runner()
+                if ok and key == "do_import":
+                    self._import_data = ""   # 导完清空，免得下次保存又导一遍
+
+            (logger.info if ok else logger.error)(f"{title}：{message}")
             if self._notify:
                 self.post_message(mtype=NotificationType.SiteMessage,
-                                  title="【HHCLUB 幸运大转盘】备份导入",
+                                  title=f"【HHCLUB 幸运大转盘】{title.split(' ')[-1]}",
                                   text=("✅ " if ok else "⛔ ") + message)
-            self._onlyonce = False
             self.__update_config()
             return
 
@@ -288,6 +307,9 @@ class HHClubLottery(_PluginBase):
             "import_data": self._import_data,
             "import_mode": self._import_mode,
             "do_import": self._do_import,
+            "clear_scope": self._clear_scope,
+            "do_clear": self._do_clear,
+            "do_restore": self._do_restore,
             "notify": self._notify,
             "cron": self._cron,
             "cookie_source": self._cookie_source,
@@ -394,6 +416,64 @@ class HHClubLottery(_PluginBase):
             logger.warning(f"取到的 Cookie 里缺少 {'、'.join(missing)}，"
                            "多半不是已登录状态，抽奖大概率会失败")
         return cookie, note
+
+    # ---------------- 清空 / 撤销 ----------------
+
+    CLEAR_SCOPES = {
+        "history": "运行记录",
+        "stats": "统计（含大奖名册与记录线）",
+        "all": "统计和运行记录（回到刚装好的样子）",
+    }
+
+    def __run_clear(self) -> Tuple[bool, str]:
+        """清空记录。
+
+        清之前先把当前的整份快照存进 before_clear，用「撤销上次清空」能原样放回去。
+        这一步不是客气 —— 三万多抽的战绩清掉就再也回不来了，而配置页上一个开关
+        离手滑只有一下的距离。"""
+        scope = self._clear_scope if self._clear_scope in self.CLEAR_SCOPES else "history"
+        total = normalize_stats(self.get_data("total"))
+        history = self.get_data("history") or []
+        if not isinstance(history, list):
+            history = [history]
+
+        if not total["draws"] and not history:
+            return False, "本来就是空的，没什么可清"
+
+        self.save_data("before_clear", {
+            "at": datetime.now(pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S"),
+            "scope": scope,
+            "total": tidy_stats(total),
+            "history": history,
+        })
+
+        cleared = []
+        if scope in ("stats", "all"):
+            self.del_data("total")
+            cleared.append(f"统计 {fmt(total['draws'])} 抽")
+        if scope in ("history", "all"):
+            self.del_data("history")
+            cleared.append(f"运行记录 {fmt(len(history))} 条")
+
+        return True, (f"已清空{self.CLEAR_SCOPES[scope]}（{' · '.join(cleared)}）。"
+                      "清之前的快照已留存，勾「撤销上次清空」保存即可原样放回去。")
+
+    def __run_restore(self) -> Tuple[bool, str]:
+        snapshot = self.get_data("before_clear")
+        if not isinstance(snapshot, dict) or not snapshot.get("at"):
+            return False, "没有可撤销的快照 —— 从没清空过，或者已经撤销过了"
+
+        total = snapshot.get("total")
+        history = snapshot.get("history")
+        if total is not None:
+            self.save_data("total", total)
+        if history is not None:
+            self.save_data("history", history)
+        self.del_data("before_clear")
+
+        draws = normalize_stats(total)["draws"]
+        return True, (f"已恢复 {snapshot['at']} 清空前的记录"
+                      f"（统计 {fmt(draws)} 抽 · 运行记录 {fmt(len(history or []))} 条）")
 
     # ---------------- 备份导入导出 ----------------
 
@@ -821,6 +901,37 @@ class HHClubLottery(_PluginBase):
                             "text": "统计存的是累加值、没有逐抽流水，所以合并没法真去重 —— 重叠的部分一定会被算两遍。"
                                     "所以同一个文件导过第二次、两份记录同源、大奖时刻完全重合这三种铁证会直接拦下来，"
                                     "确认无误再改成「强制合并」。导出在「数据页」上，点「导出备份」直接下文件。"}},
+                        {"component": "VAlert", "props": {
+                            "type": "info", "variant": "tonal", "class": "mt-2",
+                            "text": "从自己导出的备份恢复（导出 → 清空 → 导回来）用「覆盖」更彻底：连记录线一起回来，"
+                                    "以后再导同一个文件还认得出。用「合并」也能恢复，只是会新起一条记录线。"
+                                    "注意：只清了运行记录、统计还留着的话，导回自己的备份会被「两份记录同源」拦住 —— "
+                                    "那是对的，不然就是把自己算两遍。"}},
+                    ]),
+
+                    card("mdi-broom", "error", "清空记录", [
+                        {"component": "VRow", "content": [
+                            col(4, {"component": "VSelect", "props": {
+                                "model": "clear_scope", "label": "清空范围",
+                                "items": [
+                                    {"title": "只清运行记录（统计不动）", "value": "history"},
+                                    {"title": "只清统计（含大奖名册与记录线）", "value": "stats"},
+                                    {"title": "统计和运行记录都清（回到刚装好的样子）", "value": "all"},
+                                ]}}),
+                            col(4, {"component": "VSwitch", "props": {
+                                "model": "do_clear", "label": "执行清空", "color": "error",
+                                "hint": "勾上保存即清一次，随后自动复位",
+                                "persistent-hint": True}}),
+                            col(4, {"component": "VSwitch", "props": {
+                                "model": "do_restore", "label": "撤销上次清空", "color": "success",
+                                "hint": "把上次清空前的快照原样放回去",
+                                "persistent-hint": True}}),
+                        ]},
+                        {"component": "VAlert", "props": {
+                            "type": "info", "variant": "tonal", "class": "mt-2",
+                            "text": "清之前会自动留一份快照，勾「撤销上次清空」就能原样放回来（只留最近一次）。"
+                                    "真要搬走或长期留档，还是先到数据页点「导出备份」下一份文件更稳。"
+                                    "「执行清空」「撤销上次清空」「执行导入」一次保存只能勾一个，同时勾会全都不执行。"}},
                     ]),
 
                     card("mdi-tune", "grey", "其他", [
@@ -867,6 +978,9 @@ class HHClubLottery(_PluginBase):
             "import_data": "",
             "import_mode": "merge",
             "do_import": False,
+            "clear_scope": "history",
+            "do_clear": False,
+            "do_restore": False,
             "notify": True,
             "cron": "",
             "cookie_source": "manual",
