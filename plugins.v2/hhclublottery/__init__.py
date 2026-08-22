@@ -89,7 +89,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -105,7 +105,8 @@ class HHClubLottery(_PluginBase):
     _enabled = False
     _onlyonce = False
     _notify = True
-    _cron = "5 9 * * *"
+    # 留空 = 不定时，只手动开始。抽奖花的是真憨豆，默认不该自己跑起来
+    _cron = ""
 
     # Cookie 来源：manual / cookiecloud / site
     _cookie_source = "manual"
@@ -162,7 +163,7 @@ class HHClubLottery(_PluginBase):
             self._onlyonce = config.get("onlyonce") or False
             self._stop_current = config.get("stop_current") or False
             self._notify = config.get("notify") if config.get("notify") is not None else True
-            self._cron = config.get("cron") or "5 9 * * *"
+            self._cron = (config.get("cron") or "").strip()
 
             self._cookie_source = (config.get("cookie_source") or "manual").strip()
             self._cookie = (config.get("cookie") or "").strip()
@@ -492,8 +493,16 @@ class HHClubLottery(_PluginBase):
                 "endpoint": self.api_run,
                 "methods": ["GET"],
                 "auth": "apikey",
-                "summary": "立即抽一轮",
+                "summary": "开始抽奖",
                 "description": "后台触发一轮抽奖，立即返回",
+            },
+            {
+                "path": "/stop",
+                "endpoint": self.api_stop,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "停止当前抽奖",
+                "description": "让正在跑的那一轮收工，已抽的成绩照常落盘",
             },
         ]
 
@@ -511,6 +520,13 @@ class HHClubLottery(_PluginBase):
             return {"code": 1, "message": "上一轮还在跑"}
         threading.Thread(target=self.run_lottery, daemon=True).start()
         return {"code": 0, "message": "已在后台开始抽奖"}
+
+    def api_stop(self) -> dict:
+        if not self._running:
+            return {"code": 1, "message": "当前没有正在跑的抽奖"}
+        if self._stop_event:
+            self._stop_event.set()
+        return {"code": 0, "message": "已通知收工，已抽的成绩会照常落盘"}
 
     def get_service(self) -> List[Dict[str, Any]]:
         if self._enabled and self._cron:
@@ -563,7 +579,10 @@ class HHClubLottery(_PluginBase):
                         ]},
                         {"component": "VRow", "content": [
                             col(3, {"component": cron_field, "props": {
-                                "model": "cron", "label": "抽奖周期", "placeholder": "5 9 * * *",
+                                "model": "cron", "label": "抽奖周期（可留空）",
+                                "placeholder": "留空 = 只手动开始",
+                                "hint": "留空就不定时，靠数据页上的「开始抽奖」按钮手动跑",
+                                "persistent-hint": True,
                                 "prepend-inner-icon": "mdi-clock-outline"}}),
                         ]},
                     ]),
@@ -692,7 +711,7 @@ class HHClubLottery(_PluginBase):
             "onlyonce": False,
             "stop_current": False,
             "notify": True,
-            "cron": "5 9 * * *",
+            "cron": "",
             "cookie_source": "manual",
             "cookie": "",
             "host": "hhanclub.net",
@@ -716,29 +735,59 @@ class HHClubLottery(_PluginBase):
 
     # ---------------- 数据页 ----------------
 
+    def __action_button(self, path: str, text: str, icon: str, color: str,
+                        disabled: bool) -> dict:
+        """数据页上的真按钮。MoviePilot 的 PageRender 认 events.click，
+        点下去它会带着前端的会话去调插件 API，不用自己拼 URL。"""
+        return {
+            "component": "VBtn",
+            "props": {"color": color, "variant": "flat", "class": "mr-2",
+                      "prepend-icon": icon, "disabled": disabled},
+            "events": {"click": {
+                "api": f"plugin/{self.__class__.__name__}/{path}",
+                "method": "get",
+                "params": {"apikey": settings.API_TOKEN},
+            }},
+            "text": text,
+        }
+
     def __status_card(self) -> dict:
-        """当前在不在跑。「停止当前抽奖」得有个东西给它照着，
-        不然点下去也不知道停没停、原本有没有在跑。"""
+        """在不在跑 + 开始 / 停止两个按钮。
+
+        抽奖花的是真憨豆，定时不该是唯一入口 —— 抽奖周期留空就纯靠这里手动开。"""
         runner = self._runner
-        if self._running and runner is not None:
-            icon, color = "mdi-play-circle", "success"
+        running = self._running and runner is not None
+
+        if running:
+            color = "success"
             text = (f"正在抽 · 本轮已抽 {fmt(runner.current['draws'])} 次"
                     f" · 消耗 {fmt(runner.current['cost'])}"
                     f" · 余额 {fmt(runner.balance)} 憨豆")
-            hint = "要收手就在配置页勾「停止当前抽奖」并保存，已抽的成绩会照常落盘"
+            hint = "点「停止」当场收工，已抽的成绩会照常落盘"
+        elif not self._enabled:
+            color = "warning"
+            text = "插件未启用"
+            hint = "先到配置页勾上「启用插件」并保存"
         else:
-            icon, color = "mdi-pause-circle-outline", "secondary"
+            color = "secondary"
             text = "空闲中"
-            hint = f"下次按抽奖周期 {self._cron} 触发" if self._enabled and self._cron                 else "插件未启用或未设置抽奖周期"
+            hint = (f"按抽奖周期 {self._cron} 自动触发；也可以直接点「开始抽奖」"
+                    if self._cron else "没设抽奖周期 —— 只在点「开始抽奖」时跑")
+
         return {
-            "component": "VAlert",
-            "props": {"type": "info", "variant": "tonal", "color": color,
-                      "icon": icon, "class": "mb-4"},
-            "content": [
+            "component": "VCard",
+            "props": {"variant": "tonal", "color": color, "class": "mb-4"},
+            "content": [{"component": "VCardText", "content": [
                 {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
                  "text": text},
-                {"component": "div", "props": {"class": "text-caption"}, "text": hint},
-            ],
+                {"component": "div", "props": {"class": "text-caption mb-3"}, "text": hint},
+                {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": [
+                    self.__action_button("run", "开始抽奖", "mdi-play", "primary",
+                                         disabled=running or not self._enabled),
+                    self.__action_button("stop", "停止", "mdi-stop", "error",
+                                         disabled=not running),
+                ]},
+            ]}],
         }
 
     def get_page(self) -> List[dict]:

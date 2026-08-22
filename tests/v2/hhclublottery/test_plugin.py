@@ -254,7 +254,7 @@ def test_command_and_api(plugin):
     assert command["data"]["action"] == "hh_lottery"
 
     paths = {item["path"]: item for item in plugin.get_api()}
-    assert set(paths) == {"/export", "/run"}
+    assert set(paths) == {"/export", "/run", "/stop"}
     assert all(item["auth"] == "apikey" for item in paths.values())
 
 
@@ -645,11 +645,45 @@ def test_stop_event_is_never_swapped(plugin):
     assert before.is_set(), "禁用插件仍然要能叫停"
 
 
-def test_status_card(plugin, monkeypatch):
-    """「停止当前抽奖」得有个东西给它照着 —— 数据页要看得出在不在跑。"""
-    idle = str(plugin.get_page())
-    assert "空闲中" in idle
+def _buttons(page_json):
+    """把状态卡上的按钮抠出来：{按钮文案: 是否禁用}。"""
+    found = {}
 
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("component") == "VBtn":
+                found[node["text"]] = node["props"].get("disabled")
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(page_json)
+    return found
+
+
+def test_status_card_states(plugin):
+    """抽奖周期可以留空，所以数据页上这两个按钮就是唯一入口，状态必须准。"""
+    # 没启用：开始按钮点不动
+    page = plugin.get_page()
+    assert "插件未启用" in str(page)
+    assert _buttons(page) == {"开始抽奖": True, "停止": True}
+
+    # 启用了、没设周期：只能手动开
+    plugin._enabled = True
+    plugin._cron = ""
+    page = plugin.get_page()
+    assert "空闲中" in str(page)
+    assert "只在点「开始抽奖」时跑" in str(page)
+    assert _buttons(page) == {"开始抽奖": False, "停止": True}
+
+    # 设了周期：两条路都说清楚
+    plugin._cron = "5 9 * * *"
+    assert "按抽奖周期 5 9 * * * 自动触发" in str(plugin.get_page())
+
+
+def test_status_card_while_running(plugin, monkeypatch):
     site = FakeSite()
     site.draw_queue = [win("补签卡 1") for _ in range(6)]
     server, host = start_site(site)
@@ -657,7 +691,7 @@ def test_status_card(plugin, monkeypatch):
 
     def sleep_hook(self, ms):
         if self.current["draws"] == 2 and "page" not in seen:
-            seen["page"] = str(plugin.get_page())
+            seen["page"] = plugin.get_page()
         return self.stop_event.is_set()
 
     monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
@@ -667,6 +701,56 @@ def test_status_card(plugin, monkeypatch):
     finally:
         stop_site(server)
 
-    assert "正在抽 · 本轮已抽 2 次" in seen["page"]
-    assert "停止当前抽奖" in seen["page"], "顺带告诉人怎么停"
+    assert "正在抽 · 本轮已抽 2 次" in str(seen["page"])
+    # 跑着的时候只能停，不能再开一轮
+    assert _buttons(seen["page"]) == {"开始抽奖": True, "停止": False}
     assert "空闲中" in str(plugin.get_page()), "跑完要回到空闲"
+
+
+def test_action_buttons_call_plugin_api(plugin):
+    """按钮走的是 MoviePilot PageRender 的 events.click，路径和参数得对上 get_api()。"""
+    plugin._enabled = True
+    events = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("events"):
+                events.append((node["text"], node["events"]["click"]))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(plugin.get_page())
+    assert len(events) == 2
+    registered = {item["path"] for item in plugin.get_api()}
+    for text, click in events:
+        assert click["method"] == "get"
+        assert click["params"]["apikey"], "不带 apikey 会被挡在门外"
+        prefix, plugin_id, path = click["api"].split("/")
+        assert prefix == "plugin"
+        # 分身之后类名会变，所以不能把插件 ID 写死
+        assert plugin_id == plugin.__class__.__name__
+        assert f"/{path}" in registered, f"{text} 指向了没注册的接口 /{path}"
+
+
+def test_api_stop(plugin):
+    assert plugin.api_stop()["code"] == 1, "没在跑就没什么好停的"
+    plugin._running = True
+    plugin._stop_event.clear()
+    result = plugin.api_stop()
+    assert result["code"] == 0
+    assert plugin._stop_event.is_set()
+    plugin._running = False
+
+
+def test_cron_is_optional(plugin):
+    _, defaults = plugin.get_form()
+    assert defaults["cron"] == "", "抽奖花的是真憨豆，默认不该自己跑起来"
+
+    plugin.init_plugin(_config_for("hhanclub.net", cron=""))
+    assert plugin.get_service() == [], "没设周期就不注册定时服务"
+
+    plugin.init_plugin(_config_for("hhanclub.net", cron="5 9 * * *"))
+    assert len(plugin.get_service()) == 1

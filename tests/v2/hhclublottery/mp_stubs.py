@@ -33,6 +33,8 @@ class _Settings:
     TZ = "Asia/Shanghai"
     PROXY = {"http": "http://127.0.0.1:7890"}
     VERSION_FLAG = "v2"
+    # 数据页上的按钮要带着它去调插件 API
+    API_TOKEN = "stub-api-token"
 
 
 class _NotificationType(enum.Enum):
