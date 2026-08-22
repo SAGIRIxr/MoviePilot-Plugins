@@ -119,7 +119,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.7.2"
+    plugin_version = "1.8.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -714,6 +714,14 @@ class HHClubLottery(_PluginBase):
                 "description": "后台触发一轮抽奖，立即返回",
             },
             {
+                "path": "/status",
+                "endpoint": self.api_status,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "当前状态",
+                "description": "数据页「刷新」按钮点的就是它；也可供外部轮询",
+            },
+            {
                 "path": "/stop",
                 "endpoint": self.api_stop,
                 "methods": ["GET"],
@@ -739,6 +747,28 @@ class HHClubLottery(_PluginBase):
             return {"code": 1, "message": "上一轮还在跑"}
         threading.Thread(target=self.run_lottery, daemon=True).start()
         return {"code": 0, "message": "已在后台开始抽奖"}
+
+    def api_status(self) -> dict:
+        """轻量、无副作用。数据页上的「刷新」按钮点它 —— MoviePilot 前端在
+        events.click 调完接口后会 emit('action')，容器收到就重新拉一遍整页，
+        所以「调一个什么都不做的接口」就是这里唯一能拿到的刷新手段。"""
+        runner = self._runner
+        total = normalize_stats(self.get_data("total"))
+        status = {
+            "running": bool(self._running and runner is not None),
+            "enabled": self._enabled,
+            "cron": self._cron,
+            "total_draws": total["draws"],
+        }
+        if status["running"]:
+            status.update({
+                "draws": runner.current["draws"],
+                "cost": runner.current["cost"],
+                "beans": runner.current["gains"]["beans"],
+                "balance": runner.balance,
+                "elapsed": format_duration((time.time() - runner.started_at) * 1000),
+            })
+        return {"code": 0, "message": "ok", "data": status}
 
     def api_stop(self) -> dict:
         if not self._running:
@@ -1045,13 +1075,19 @@ class HHClubLottery(_PluginBase):
         抽奖花的是真憨豆，定时不该是唯一入口 —— 抽奖周期留空就纯靠这里手动开。"""
         runner = self._runner
         running = self._running and runner is not None
+        # 起跑的头一两秒还没回站点读余额，这时候摆一排 0 出来会让人以为是坏了
+        warming_up = running and runner.balance <= 0 and not runner.current["draws"]
 
-        if running:
+        if warming_up:
+            color = "success"
+            text = "正在启动 · 读取余额与单抽消耗…"
+            hint = "点「刷新」看进度"
+        elif running:
             color = "success"
             text = (f"正在抽 · 本轮已抽 {fmt(runner.current['draws'])} 次"
                     f" · 消耗 {fmt(runner.current['cost'])}"
                     f" · 余额 {fmt(runner.balance)} 憨豆")
-            hint = "点「停止」当场收工，已抽的成绩会照常落盘"
+            hint = "页面不会自己刷新，点「刷新」看最新进度；点「停止」当场收工，成绩照常落盘"
         elif not self._enabled:
             color = "warning"
             text = "插件未启用"
@@ -1074,6 +1110,8 @@ class HHClubLottery(_PluginBase):
                                          disabled=running or not self._enabled),
                     self.__action_button("stop", "停止", "mdi-stop", "error",
                                          disabled=not running),
+                    self.__action_button("status", "刷新", "mdi-refresh", "secondary",
+                                         disabled=False),
                     # 导出必须走 href：events.click 是 axios 调用，拿不到响应体，
                     # 也就存不成文件
                     {"component": "VBtn", "props": {

@@ -255,7 +255,7 @@ def test_command_and_api(plugin):
     assert command["data"]["action"] == "hh_lottery"
 
     paths = {item["path"]: item for item in plugin.get_api()}
-    assert set(paths) == {"/export", "/run", "/stop"}
+    assert set(paths) == {"/export", "/run", "/stop", "/status"}
     assert all(item["auth"] == "apikey" for item in paths.values())
 
 
@@ -780,7 +780,7 @@ def test_status_card_states(plugin):
     # 没启用：开始按钮点不动
     page = plugin.get_page()
     assert "插件未启用" in str(page)
-    assert _buttons(page) == {"开始抽奖": True, "停止": True, "导出备份": None}
+    assert _buttons(page) == {"开始抽奖": True, "停止": True, "刷新": False, "导出备份": None}
 
     # 启用了、没设周期：只能手动开
     plugin._enabled = True
@@ -788,7 +788,7 @@ def test_status_card_states(plugin):
     page = plugin.get_page()
     assert "空闲中" in str(page)
     assert "只在点「开始抽奖」时跑" in str(page)
-    assert _buttons(page) == {"开始抽奖": False, "停止": True, "导出备份": None}
+    assert _buttons(page) == {"开始抽奖": False, "停止": True, "刷新": False, "导出备份": None}
 
     # 设了周期：两条路都说清楚
     plugin._cron = "5 9 * * *"
@@ -815,7 +815,7 @@ def test_status_card_while_running(plugin, monkeypatch):
 
     assert "正在抽 · 本轮已抽 2 次" in str(seen["page"])
     # 跑着的时候只能停，不能再开一轮
-    assert _buttons(seen["page"]) == {"开始抽奖": True, "停止": False, "导出备份": None}
+    assert _buttons(seen["page"]) == {"开始抽奖": True, "停止": False, "刷新": False, "导出备份": None}
     assert "空闲中" in str(plugin.get_page()), "跑完要回到空闲"
 
 
@@ -835,7 +835,7 @@ def test_action_buttons_call_plugin_api(plugin):
                 walk(item)
 
     walk(plugin.get_page())
-    assert len(events) == 2, "导出走的是 href 直链，不该也挂 events"
+    assert len(events) == 3, "开始 / 停止 / 刷新；导出走 href 直链，不该也挂 events"
     registered = {item["path"] for item in plugin.get_api()}
     for text, click in events:
         assert click["method"] == "get"
@@ -1559,3 +1559,76 @@ def test_roster_beyond_hundred_is_capped(plugin):
         {"at": 1780000000000 - i, "text": "憨豆 780000"} for i in range(30)]
     plugin.init_plugin(_import_config(payload))
     assert len(plugin.get_data("total")["jackpots"]) == 100
+
+
+# ============================================================
+# 刷新
+# ============================================================
+
+def test_refresh_button_is_a_no_op_call(plugin):
+    """MoviePilot 前端在 events.click 调完接口后会 emit(action)，容器收到就
+    重新拉一遍整页 —— 所以「调一个什么都不做的接口」就是这里唯一能拿到的
+    刷新手段。那这个接口就必须真的什么都不做。"""
+    _seed_total(plugin, draws=100)
+    before = json.dumps(plugin.get_data(), ensure_ascii=False, sort_keys=True)
+
+    result = plugin.api_status()
+    assert result["code"] == 0
+    assert result["data"]["running"] is False
+    assert result["data"]["total_draws"] == 100
+
+    after = json.dumps(plugin.get_data(), ensure_ascii=False, sort_keys=True)
+    assert after == before, "刷新不该改动任何数据"
+    assert plugin.messages == [], "更不该推通知"
+
+
+def test_status_api_while_running(plugin, monkeypatch):
+    site = FakeSite()
+    site.draw_queue = [win("憨豆 100", credit=100) for _ in range(6)]
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 2 and "status" not in seen:
+            seen["status"] = plugin.api_status()
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=3)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    data = seen["status"]["data"]
+    assert data["running"] is True
+    assert data["draws"] == 2 and data["cost"] == 4000
+    assert data["balance"] > 0 and data["elapsed"]
+
+
+def test_status_card_does_not_show_all_zeros_while_warming_up(plugin, monkeypatch):
+    """起跑的头一两秒还没回站点读余额，摆一排 0 出来会让人以为是坏了。"""
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1")]
+    server, host = start_site(site)
+    seen = {}
+
+    real_snapshot = HH.LotteryRunner.snapshot
+
+    def slow_snapshot(self):
+        if "page" not in seen:
+            seen["page"] = str(plugin.get_page())   # 此刻 balance 还是 0
+        return real_snapshot(self)
+
+    monkeypatch.setattr(HH.LotteryRunner, "snapshot", slow_snapshot)
+    monkeypatch.setattr(HH.LotteryRunner, "sleep",
+                        lambda self, ms: self.stop_event.is_set())
+    try:
+        _configure(plugin, host, draws=1)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert "正在启动" in seen["page"]
+    assert "余额 0 憨豆" not in seen["page"]
+    assert "已抽 0 次" not in seen["page"]
