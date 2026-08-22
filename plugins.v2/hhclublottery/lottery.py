@@ -7,6 +7,7 @@
 统计结构和油猴版 / 青龙版的 v4 备份完全一致，所以 MP 这边导出来的 JSON
 能被 hhanclub.net/lucky.php 面板上的「📥 导入备份」直接吃下去。
 """
+import copy
 import json
 import math
 import random
@@ -768,6 +769,10 @@ class LotteryRunner:
         # report() 收下的提示，最后拼进通知正文 —— 挂机的人不看日志，通知是唯一出口
         self.messages: List[str] = []
 
+        # 统计随时可能被数据页读走（点刷新的那一下），而这边正一抽一抽地改它。
+        # 不上锁的话读到一半正好撞上写入，deepcopy 会炸 dictionary changed size
+        self._stats_lock = threading.RLock()
+
         self.error_streak = 0
         self.rate_limit_streak = 0
         self.network_error_streak = 0
@@ -928,8 +933,25 @@ class LotteryRunner:
         return f"站点返回了认不出的内容（HTTP {status}）"
 
     def record(self, prize_text: str, prize: Dict):
-        for stats in (self.current, self.total, self.interval_stats):
-            apply_prize(stats, prize_text, self.cost, prize)
+        with self._stats_lock:
+            for stats in (self.current, self.total, self.interval_stats):
+                apply_prize(stats, prize_text, self.cost, prize)
+
+    def stats_snapshot(self) -> Dict:
+        """给数据页用的一致快照：本轮、累计、余额是同一时刻的。
+
+        逐个字段去读的话，读到一半正好被下一抽改掉，页面上就会出现
+        「抽了 37 次、消耗 74,000」这种对不上的组合。"""
+        with self._stats_lock:
+            return {
+                "current": copy.deepcopy(self.current),
+                "total": copy.deepcopy(self.total),
+                "balance": self.balance,
+                "cost": self.cost,
+                "draws_target": self.options.draws,
+                "started_at": self.started_at,
+                "mail_cleaned": self.mail_cleaned,
+            }
 
     # ---------------- VIP 折算 ----------------
 
@@ -1007,8 +1029,9 @@ class LotteryRunner:
 
         # 金额一律按站点公布的来。drift 里混着做种收益、赠送，当金额用会记出
         # 「1,000,060 憨豆」这种奖池里根本没有的档位。
-        for stats in (self.current, self.total, self.interval_stats):
-            mark_vip_swapped(stats, prize, beans)
+        with self._stats_lock:
+            for stats in (self.current, self.total, self.interval_stats):
+                mark_vip_swapped(stats, prize, beans)
         self.last_vip_swapped_beans = beans
 
         self.report(f"👑 你已经是 VIP，站点改发了 {fmt(beans)} 憨豆 · 仍计为一次 VIP 中奖")

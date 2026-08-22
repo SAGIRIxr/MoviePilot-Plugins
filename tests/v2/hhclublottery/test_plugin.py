@@ -813,7 +813,7 @@ def test_status_card_while_running(plugin, monkeypatch):
     finally:
         stop_site(server)
 
-    assert "正在抽 · 本轮已抽 2 次" in str(seen["page"])
+    assert "正在抽 · 第 2 / 3 抽" in str(seen["page"])
     # 跑着的时候只能停，不能再开一轮
     assert _buttons(seen["page"]) == {"开始抽奖": True, "停止": False, "刷新": False, "导出备份": None}
     assert "空闲中" in str(plugin.get_page()), "跑完要回到空闲"
@@ -1632,3 +1632,101 @@ def test_status_card_does_not_show_all_zeros_while_warming_up(plugin, monkeypatc
     assert "正在启动" in seen["page"]
     assert "余额 0 憨豆" not in seen["page"]
     assert "已抽 0 次" not in seen["page"]
+
+
+# ============================================================
+# 跑着的时候页面上有什么
+# ============================================================
+
+def _page_while_running(plugin, monkeypatch, at_draw=3, **opts):
+    site = FakeSite()
+    site.balance = 1000000
+    site.draw_queue = ([win("憨豆 5000", credit=5000), win("补签卡 1"),
+                        win("憨豆 1000", credit=1000), win("彩虹ID 7 Day(s)")]
+                       + [win("憨豆 100", credit=100) for _ in range(20)])
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == at_draw and "page" not in seen:
+            seen["page"] = str(plugin.get_page())
+        time.sleep(0.01)          # 让「已跑」有个非零的秒数
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, **opts)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+    return seen["page"]
+
+
+def test_running_card_shows_progress(plugin, monkeypatch):
+    text = _page_while_running(plugin, monkeypatch, at_draw=3, draws=10)
+    assert "正在抽 · 第 3 / 10 抽" in text
+    assert "VProgressLinear" in text and "model-value': 30.0" in text
+
+
+def test_running_card_shows_profit(plugin, monkeypatch):
+    text = _page_while_running(plugin, monkeypatch, at_draw=3, draws=10)
+    # 3 抽：5,000 + 补签卡 + 1,000 = 获得 6,000，消耗 6,000，盈亏 0
+    assert "消耗 6,000 · 获得 6,000" in text
+    assert "盈亏 +0（+0.0%）" in text
+    assert "余额" in text
+
+
+def test_running_card_shows_timing(plugin, monkeypatch):
+    text = _page_while_running(plugin, monkeypatch, at_draw=3, draws=10)
+    assert "已跑" in text
+    assert "预计还要" in text, "有分母才估得出剩余"
+
+
+def test_running_card_shows_prize_brief(plugin, monkeypatch):
+    text = _page_while_running(plugin, monkeypatch, at_draw=4, draws=10)
+    assert "本轮奖品：" in text
+    assert "💰 憨豆 ×2" in text
+    assert "🎫 补签卡 ×1" in text
+    assert "🌈 彩虹ID ×1" in text
+
+
+def test_draw_to_bottom_has_no_progress_bar(plugin, monkeypatch):
+    """一抽到底没有终点，画个进度条就是撒谎。"""
+    text = _page_while_running(plugin, monkeypatch, at_draw=3, draws=0, reserve=980000)
+    assert "一抽到底" in text
+    assert "VProgressLinear" not in text
+    assert "预计还要" not in text
+    assert "平均每抽" in text, "估不出剩余，至少给个速度"
+
+
+def test_whole_page_follows_the_running_round(plugin, monkeypatch):
+    """total 只在一轮跑完时才写库。挂机中途点刷新，历史总计不能停在开跑前 ——
+    不然只有顶上的状态卡在动，下面几张卡纹丝不动，看着像没在记。"""
+    _seed_total(plugin, draws=1000, beans=500000, origin="mpline")
+    text = _page_while_running(plugin, monkeypatch, at_draw=3, draws=10)
+
+    assert "1,003 抽" in text, "历史总计要含上跑到一半的这三抽"
+    assert "1,000 抽" not in text, "不该还停在开跑前"
+    # 落盘的那份这会儿确实还没动
+    assert plugin.get_data("total")["draws"] in (1000, 1010)
+
+
+def test_live_stats_failure_falls_back(plugin, monkeypatch):
+    """抽奖不能被数据页拖累：快照读不到就退回落盘那份，页面照样出得来。"""
+    _seed_total(plugin, draws=777)
+
+    class Boom:
+        current = {"draws": 0}
+        balance = 0
+
+        def stats_snapshot(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    plugin._running = True
+    plugin._runner = Boom()
+    try:
+        text = str(plugin.get_page())
+    finally:
+        plugin._running = False
+        plugin._runner = None
+    assert "777 抽" in text

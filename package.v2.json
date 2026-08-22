@@ -49,7 +49,7 @@
     "labels": "签到"
   },
   "HHClubLottery": {
-    "version": "1.8.0",
+    "version": "1.9.0",
     "level": 2,
     "name": "HHCLUB幸运大转盘",
     "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png",
@@ -58,6 +58,7 @@
     "authorUrl": "https://github.com/SAGIRIxr",
     "system_version": ">=2.12.0",
     "history": {
+      "v1.9.0": "抽奖时状态栏新增进度条、本轮盈亏、已跑时长与预计剩余、奖品小结；点刷新时整页统计一起更新。",
       "v1.8.0": "数据页新增「刷新」按钮；修复刚开始抽奖时状态栏显示为 0 的问题。",
       "v1.7.2": "完善油猴版备份中大奖名册的导入。",
       "v1.7.1": "修复同时触发可能重复抽奖的问题。",

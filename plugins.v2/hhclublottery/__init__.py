@@ -119,7 +119,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.8.0"
+    plugin_version = "1.9.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1069,43 +1069,120 @@ class HHClubLottery(_PluginBase):
             "text": text,
         }
 
-    def __status_card(self) -> dict:
-        """在不在跑 + 开始 / 停止两个按钮。
+    def __live_stats(self) -> Optional[dict]:
+        """跑着的时候，页面该看运行中那份统计，而不是上一轮落盘的那份。
+
+        `total` 只在一轮跑完时才写库 —— 挂机抽五千次的中途点刷新，历史总计
+        会一直停在开跑前的数字，看着像没在记。runner 手里那份是一抽一抽实时
+        更新的，直接拿它。"""
+        runner = self._runner
+        if not (self._running and runner is not None):
+            return None
+        try:
+            return runner.stats_snapshot()
+        except Exception as err:      # 抽奖不能被数据页拖累，读不到就退回落盘那份
+            logger.debug(f"读运行中统计失败，改用落盘的那份：{err}")
+            return None
+
+    @staticmethod
+    def __prize_brief(prizes: dict, limit: int = 6) -> str:
+        parts = []
+        for prize_type, bucket in sorted(prizes.items(),
+                                         key=lambda item: _num(item[1].get("count")),
+                                         reverse=True)[:limit]:
+            count = _num(bucket.get("count"))
+            if not count:
+                continue
+            meta = PRIZE_META.get(prize_type, PRIZE_META["unknown"])
+            parts.append(f"{meta['icon']} {meta['name']} ×{fmt(count)}")
+        return " · ".join(parts)
+
+    def __running_lines(self, live: dict) -> List[dict]:
+        """跑着的时候摆什么：进度、盈亏、时间、奖品小结。"""
+        current = live["current"]
+        draws = _num(current["draws"])
+        target = _num(live["draws_target"])
+        cost = _num(current["cost"])
+        beans = _num(current["gains"]["beans"])
+        profit, rate = profit_of(current)
+        elapsed = time.time() - live["started_at"]
+
+        head = f"正在抽 · 第 {fmt(draws)}"
+        head += f" / {fmt(target)} 抽" if target else " 抽（一抽到底）"
+
+        lines = [{"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                  "text": head}]
+
+        # 进度条只在有分母时才有意义；一抽到底没有终点，画个条反而是撒谎
+        if target:
+            lines.append({"component": "VProgressLinear", "props": {
+                "model-value": min(100, draws / target * 100), "height": 8,
+                "rounded": True, "color": "success", "class": "my-2"}})
+
+        profit_text = f"{'+' if profit >= 0 else ''}{fmt(profit)}（{'+' if rate >= 0 else ''}{rate:.1f}%）"
+        lines.append({"component": "div", "props": {"class": "text-body-2 mt-1"},
+                      "text": (f"消耗 {fmt(cost)} · 获得 {fmt(beans)} · "
+                               f"盈亏 {profit_text} · 余额 {fmt(live['balance'])} 憨豆")})
+
+        timing = f"已跑 {format_duration(elapsed * 1000)}"
+        if target and draws:
+            # 按已经抽出来的速度估，比拿配置里的间隔算准 —— 限流、退避都算在里面了
+            remaining = max(0, target - draws) * (elapsed / draws)
+            timing += f" · 预计还要 {format_duration(remaining * 1000)}"
+        elif draws:
+            timing += f" · 平均每抽 {round(elapsed / draws, 1)} 秒"
+        if live.get("mail_cleaned"):
+            timing += f" · 已清站内信 {fmt(live['mail_cleaned'])} 封"
+        lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+                      "text": timing})
+
+        brief = self.__prize_brief(current["prizes"])
+        if brief:
+            lines.append({"component": "div", "props": {"class": "text-body-2 mt-2"},
+                          "text": f"本轮奖品：{brief}"})
+
+        lines.append({"component": "div", "props": {"class": "text-caption text-disabled mt-1"},
+                      "text": "页面不会自己刷新，点「刷新」看最新进度；点「停止」当场收工，成绩照常落盘"})
+        return lines
+
+    def __status_card(self, live: Optional[dict] = None) -> dict:
+        """在不在跑 + 开始 / 停止 / 刷新。
 
         抽奖花的是真憨豆，定时不该是唯一入口 —— 抽奖周期留空就纯靠这里手动开。"""
         runner = self._runner
         running = self._running and runner is not None
-        # 起跑的头一两秒还没回站点读余额，这时候摆一排 0 出来会让人以为是坏了
-        warming_up = running and runner.balance <= 0 and not runner.current["draws"]
+        # 起跑的头一两秒还没回站点读余额，摆一排 0 出来会让人以为是坏了
+        warming_up = bool(live) and _num(live["balance"]) <= 0 and not _num(live["current"]["draws"])
 
-        if warming_up:
+        if running and live and not warming_up:
             color = "success"
-            text = "正在启动 · 读取余额与单抽消耗…"
-            hint = "点「刷新」看进度"
+            body = self.__running_lines(live)
         elif running:
             color = "success"
-            text = (f"正在抽 · 本轮已抽 {fmt(runner.current['draws'])} 次"
-                    f" · 消耗 {fmt(runner.current['cost'])}"
-                    f" · 余额 {fmt(runner.balance)} 憨豆")
-            hint = "页面不会自己刷新，点「刷新」看最新进度；点「停止」当场收工，成绩照常落盘"
-        elif not self._enabled:
-            color = "warning"
-            text = "插件未启用"
-            hint = "先到配置页勾上「启用插件」并保存"
+            body = [
+                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                 "text": "正在启动 · 读取余额与单抽消耗…"},
+                {"component": "div", "props": {"class": "text-caption"}, "text": "点「刷新」看进度"},
+            ]
         else:
-            color = "secondary"
-            text = "空闲中"
-            hint = (f"按抽奖周期 {self._cron} 自动触发；也可以直接点「开始抽奖」"
-                    if self._cron else "没设抽奖周期 —— 只在点「开始抽奖」时跑")
+            if not self._enabled:
+                color, text = "warning", "插件未启用"
+                hint = "先到配置页勾上「启用插件」并保存"
+            else:
+                color, text = "secondary", "空闲中"
+                hint = (f"按抽奖周期 {self._cron} 自动触发；也可以直接点「开始抽奖」"
+                        if self._cron else "没设抽奖周期 —— 只在点「开始抽奖」时跑")
+            body = [
+                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                 "text": text},
+                {"component": "div", "props": {"class": "text-caption"}, "text": hint},
+            ]
 
         return {
             "component": "VCard",
             "props": {"variant": "tonal", "color": color, "class": "mb-4"},
-            "content": [{"component": "VCardText", "content": [
-                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
-                 "text": text},
-                {"component": "div", "props": {"class": "text-caption mb-3"}, "text": hint},
-                {"component": "div", "props": {"class": "d-flex flex-wrap"}, "content": [
+            "content": [{"component": "VCardText", "content": body + [
+                {"component": "div", "props": {"class": "d-flex flex-wrap mt-3"}, "content": [
                     self.__action_button("run", "开始抽奖", "mdi-play", "primary",
                                          disabled=running or not self._enabled),
                     self.__action_button("stop", "停止", "mdi-stop", "error",
@@ -1466,13 +1543,16 @@ class HHClubLottery(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        total = normalize_stats(self.get_data("total"))
+        # 跑着的时候整页都看运行中那份 —— 历史总计、奖项明细、名册跟着一起动，
+        # 不然点了刷新只有顶上的状态卡在变，下面几张卡还停在开跑前
+        live = self.__live_stats()
+        total = normalize_stats(live["total"] if live else self.get_data("total"))
         history = self.get_data("history") or []
         if not isinstance(history, list):
             history = [history]
 
         if not total["draws"] and not history:
-            return [self.__status_card(), {
+            return [self.__status_card(live), {
                 "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
                 "content": [{"component": "VCardItem", "props": {"class": "pa-6"}, "content": [
                     {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
@@ -1486,7 +1566,7 @@ class HHClubLottery(_PluginBase):
 
         history = sorted(history, key=lambda item: item.get("date") or "", reverse=True)
         cards = [
-            self.__status_card(),
+            self.__status_card(live),
             self.__overview_card(total, history[0] if history else {}),
             self.__gain_card(total),
             self.__prize_card(total),
