@@ -26,6 +26,8 @@ class FakeSite:
         self.cost = 2000
         self.draw_queue = []
         self.cookie_valid = True
+        # 只让抽奖接口回登录页：站点掉登录时是拿 HTTP 200 回一张 HTML
+        self.draw_returns_login = False
         self.mail_pages = []          # [[{id, subject}, ...], ...]
         self.deleted = []
         self.user_class = "VIP"       # {Class}_Name
@@ -108,6 +110,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(LOGIN_HTML)
 
         if path.path == "/plugin/lucky-draw":
+            if site.draw_returns_login:
+                return self._send(LOGIN_HTML)
             result = site.next_draw()
             if result.get("ret") == 0:
                 with site.lock:

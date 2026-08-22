@@ -492,3 +492,54 @@ def test_saved_stats_have_no_float_tails(plugin, instant):
 
     payload = plugin.api_export()
     assert floats(payload["total"], "export.total") == []
+
+
+def test_stop_on_big_prize_end_to_end(plugin, instant):
+    site = FakeSite()
+    site.balance = 1000000
+    site.draw_queue = [win("补签卡 1"), win("憨豆 780000", credit=780000),
+                       win("补签卡 1"), win("补签卡 1")]
+    server, host = start_site(site)
+    try:
+        _configure(plugin, host, draws=10, stop_on_780k=True)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    record = plugin.get_data("history")[0]
+    assert record["draws"] == 2
+    assert "命中停止条件（780,000 憨豆）" in record["status"]
+    assert site.draw_calls == 2, "停了就别再发请求"
+
+
+def test_stop_switches_default_off(plugin):
+    _, defaults = plugin.get_form()
+    assert defaults["stop_on_vip"] is False
+    assert defaults["stop_on_780k"] is False
+
+
+def test_export_origin_id_is_stable(plugin):
+    """记录线编号头一次导出时生成，之后每次导出都得是同一个 ——
+    油猴版靠它认出这些文件同出一源。"""
+    first = plugin.api_export()
+    second = plugin.api_export()
+
+    assert first["originId"], "一轮没跑过也要带上记录线编号"
+    assert second["originId"] == first["originId"]
+    assert second["exportId"] != first["exportId"], "每个文件一个 exportId"
+    assert plugin.get_data("total")["originId"] == first["originId"], "编号要存回去"
+
+
+def test_run_stamps_origin_id(plugin, instant):
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1")]
+    server, host = start_site(site)
+    try:
+        _configure(plugin, host, draws=1)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    origin = plugin.get_data("total")["originId"]
+    assert origin, "跑完落盘时就该盖上编号"
+    assert plugin.api_export()["originId"] == origin, "导出沿用已有编号，不另起一条"

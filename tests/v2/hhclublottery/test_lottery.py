@@ -476,3 +476,181 @@ def test_network_retry():
     check_true("连不上 日志提示重试", any("网络不通" in line for line in logs))
     check("连不上 重试满 3 次", sum(1 for line in logs if "网络不通" in line), 3)
     check("连不上 没抽", runner.current["draws"], 0)
+
+
+# ============================================================
+# 中大奖就停（上游 2b454b4 / 60bfba9 / d1011a0）
+# ============================================================
+
+def _run_with_stop(queue, **opts):
+    site = FakeSite()
+    site.balance = 1000000
+    site.draw_queue = queue
+    server, host = start_site(site)
+    try:
+        runner, logs, notices = make_runner(host, draws=10, **opts)
+        runner.run()
+    finally:
+        stop_site(server)
+    return site, runner, logs, notices
+
+
+def test_stop_on_780k():
+    site, runner, _, _ = _run_with_stop(
+        [win("补签卡 1"), win("憨豆 780000", credit=780000), win("补签卡 1")],
+        stop_on_780k=True)
+    check("中 780k 就停 抽数", runner.current["draws"], 2)
+    check("中 780k 就停 不再发请求", site.draw_calls, 2)
+    check_true("中 780k 停止原因", "命中停止条件（780,000 憨豆）" in runner.stop_reason)
+
+
+def test_stop_on_780k_is_exact_tier():
+    """只认 780,000 这一个档位 —— 别的大额憨豆不停。"""
+    site, runner, _, _ = _run_with_stop(
+        [win("憨豆 1000000", credit=1000000), win("憨豆 779999", credit=779999),
+         win("补签卡 1")],
+        stop_on_780k=True)
+    check("1,000,000 不触发", runner.current["draws"], 3)
+    check("779,999 不触发", runner.stop_reason, "已达到设定抽奖次数（10 抽）"
+          if runner.current["draws"] >= 10 else runner.stop_reason)
+    check_true("跑完整个队列", site.draw_calls >= 3)
+
+
+def test_stop_on_vip_covers_swapped():
+    """VIP 折算成憨豆的那一注，type 仍是 vip，照样按 VIP 停。"""
+    site, runner, _, notices = _run_with_stop(
+        [win("VIP 7 Day(s)", credit=1000000), win("补签卡 1")],
+        stop_on_vip=True)
+    check("中 VIP 就停 抽数", runner.current["draws"], 1)
+    check("折算记上了", runner.current["prizes"]["vip"].get("swappedBeans"), 1000000)
+    check_true("停止原因写明含折算", "VIP（含折算）" in runner.stop_reason)
+    check_true("大奖通知末行改口", notices and "已按设置停止本轮抽奖" in notices[0][1])
+
+
+def test_no_stop_when_switches_off():
+    site, runner, _, notices = _run_with_stop(
+        [win("憨豆 780000", credit=780000), win("VIP 7 Day(s)", credit=0),
+         win("补签卡 1")])
+    check("开关都关 不停", runner.current["draws"], 3)
+    check_true("通知末行还是挂机中",
+               notices and all("后台持续挂机抽奖中" in body for _, body in notices))
+
+
+def test_stop_calibrates_balance():
+    """停在中奖那一刻要对账，不能摆本地估算。"""
+    site, runner, logs, _ = _run_with_stop(
+        # 站点实际入账比奖品档位多 137（做种收益），本地估算算不出来
+        [win("憨豆 780000", credit=780137)],
+        stop_on_780k=True)
+    check("停机前回服务端校准", runner.balance, 1000000 - 2000 + 780137)
+    check("多读了一次 lucky.php", site.lucky_calls, 2)
+
+
+def test_stop_on_vip_skips_double_calibration():
+    """VIP 那一注折算核对时已经校准过，停机前不用再要一遍。"""
+    site, runner, _, _ = _run_with_stop(
+        [win("VIP 7 Day(s)", credit=1000000)], stop_on_vip=True)
+    # 开跑一次 + 折算核对一次 = 2；再多就是白要了
+    check("不重复校准", site.lucky_calls, 2)
+
+
+def test_notify_threshold_and_stop_are_independent():
+    """通知门槛和停机条件是两回事：门槛调到只推 VIP，780k 照样能停。"""
+    site, runner, _, notices = _run_with_stop(
+        [win("憨豆 780000", credit=780000)],
+        stop_on_780k=True, big_prize_min_beans=0, notify_big_prize=True)
+    check("停了", runner.current["draws"], 1)
+    check("没推大奖通知", notices, [])
+
+
+# ============================================================
+# 请求失败要说清是怎么失败的（上游 57fb242）
+# ============================================================
+
+def test_describe_draw_failure():
+    d = L.LotteryRunner.describe_draw_failure
+    check("网络层错误", d({"error": "Connection reset"}), "请求失败：Connection reset")
+    check("401", d({"status": 401, "ok": False}), "请求被拒（登录多半已经失效）")
+    check("403", d({"status": 403, "ok": False}), "请求被拒（登录多半已经失效）")
+    check("502", d({"status": 502, "ok": False}), "请求失败：HTTP 502")
+    # 站点掉登录时拿 200 回一张登录页 —— 以前只报一句「请求失败：200」
+    check_true("200 登录页", "登录已失效" in d(
+        {"status": 200, "ok": True, "raw": "<html><form action='takelogin.php'>"}))
+    check("200 其他 HTML", d({"status": 200, "ok": True, "raw": "<html>维护中</html>"}),
+          "站点没返回 JSON（维护页或人机验证？）")
+    check("200 非 HTML", d({"status": 200, "ok": True, "raw": "???"}),
+          "站点返回了认不出的内容（HTTP 200）")
+
+
+def test_login_page_failure_shows_up_in_log():
+    """整条链路走一遍：抽奖接口回登录页时，日志得说人话。
+
+    页面还能读、只有接口掉登录，所以走的是「请求失败」那条线而不是
+    CookieInvalid —— 以前这里只会记一句「请求失败（HTTP 200）」。"""
+    site = FakeSite()
+    site.draw_returns_login = True
+    server, host = start_site(site)
+
+    class StopAfterOneFailure(FastRunner):
+        def sleep(self, ms):
+            self.stop_event.set()   # 记一条就够，不用真的一直重试下去
+            return True
+
+    try:
+        options = L.LotteryOptions(host=host, draws=5, follow_duration=True)
+        logs = []
+        runner = StopAfterOneFailure(options, "ck", log=logs.append)
+        runner.run()
+    finally:
+        stop_site(server)
+
+    check("一抽没记上", runner.current["draws"], 0)
+    check_true("日志指向重新登录", any("登录已失效" in line for line in logs))
+    check_true("不再是干巴巴的 HTTP 200",
+               not any("请求失败（HTTP 200）" in line for line in logs))
+
+
+# ============================================================
+# 备份编号与外来字段（上游 a2a0f2d / d1011a0）
+# ============================================================
+
+def test_backup_carries_origin_and_export_id():
+    total = L.empty_stats()
+    first = L.backup_payload(L.empty_stats(), total)
+    second = L.backup_payload(L.empty_stats(), total)
+
+    check_true("有 originId", first["originId"])
+    check_true("有 exportId", first["exportId"])
+    check("originId 认记录线，导多少次都一样", second["originId"], first["originId"])
+    check_true("exportId 认这一个文件，每次都换", second["exportId"] != first["exportId"])
+    check("originId 也进 total", first["total"]["originId"], first["originId"])
+    check("编号长度和油猴版一致", len(first["originId"]), 12)
+
+
+def test_stamp_origin_is_idempotent():
+    total = L.normalize_stats({"originId": "keepthisid00"})
+    L.stamp_origin(total)
+    check("已有编号不覆盖", total["originId"], "keepthisid00")
+
+
+def test_foreign_fields_survive():
+    """油猴版的大奖名册和导入台账原样带过去 —— 别把人家攒了几个月的记录抹了。"""
+    incoming = {
+        "draws": 5, "cost": 10000, "originId": "browserline",
+        "gains": {"beans": 100},
+        "jackpots": [{"label": "VIP 7 天", "at": 1755000000000}],
+        "imports": [{"exportId": "abc", "originId": "xyz", "draws": 3, "at": 1}],
+    }
+    stats = L.normalize_stats(incoming)
+    check("名册保住了", stats["jackpots"], incoming["jackpots"])
+    check("台账保住了", stats["imports"], incoming["imports"])
+    check("记录线保住了", stats["originId"], "browserline")
+
+    # 再导出去时也得原样带着
+    payload = L.backup_payload(L.empty_stats(), stats)
+    check("导出仍带名册", payload["total"]["jackpots"], incoming["jackpots"])
+    check("导出沿用原记录线", payload["originId"], "browserline")
+
+    # 没有这两个字段的普通统计不该凭空长出来
+    plain = L.normalize_stats({"draws": 1})
+    check_true("普通统计不长名册", "jackpots" not in plain and "imports" not in plain)

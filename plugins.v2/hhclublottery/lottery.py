@@ -9,6 +9,7 @@
 """
 import json
 import math
+import random
 import re
 import threading
 import time
@@ -292,6 +293,9 @@ def empty_stats() -> Dict:
         "gains": {key: 0 for key in _GAIN_KEYS},
         "prizes": {},
         "raw": {},
+        # 记录线编号。这份统计本身就是油猴版能直接导入的备份，带上它，
+        # 油猴版才认得出「同一份文件导了两遍」。
+        "originId": None,
         "firstAt": None,
         "lastAt": None,
     }
@@ -341,6 +345,16 @@ def normalize_stats(data) -> Dict:
             merged["tiers"][label] = _num(merged["tiers"].get(label)) + _num(count)
 
     stats["raw"] = dict(data.get("raw") or {})
+    stats["originId"] = data["originId"] if isinstance(data.get("originId"), str) else None
+
+    # 大奖名册和导入台账是油猴版那边的东西，这边既不产生也不读 —— 但这份统计
+    # 是双向的：真有人会把油猴版的备份导进 MP 让它接着记。原样带过去，
+    # 别下次覆写就把人家攒了几个月的名册抹了。
+    if isinstance(data.get("jackpots"), list):
+        stats["jackpots"] = data["jackpots"]
+    if isinstance(data.get("imports"), list):
+        stats["imports"] = data["imports"]
+
     return stats
 
 
@@ -400,13 +414,45 @@ def tidy_stats(stats: Dict) -> Dict:
     return _tidy(stats) if isinstance(stats, float) else stats
 
 
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _base36(number: int) -> str:
+    text = ""
+    while number:
+        number, rest = divmod(number, 36)
+        text = _BASE36[rest] + text
+    return text or "0"
+
+
+def random_id() -> str:
+    """和油猴版同款：8 位随机 + 4 位时间尾巴，都是 base36。"""
+    return ("".join(random.choice(_BASE36) for _ in range(8))
+            + _base36(int(time.time() * 1000))[-4:])
+
+
+def stamp_origin(total: Dict) -> Dict:
+    """头一次就把记录线编号定下来，之后每次导出都沿用同一个。
+    一抽没抽过就导出时也得补上，不然这份备份带不走记录线。"""
+    if not total.get("originId"):
+        total["originId"] = random_id()
+    return total
+
+
 def backup_payload(current: Dict, total: Dict) -> Dict:
-    """油猴版「📥 导入备份」认的格式。"""
+    """油猴版「📥 导入备份」认的格式。
+
+    两个编号是给那边的「重复导入」把关用的：originId 认记录线（同一台 MP
+    导出多少次都是同一个），exportId 认这一个文件（每导一次换一个）。
+    老备份没有也照样能导，只是认不出重复。"""
+    total = stamp_origin(total)
     return {
         "kind": "hhclub-lottery-backup",
         "version": STATS_VERSION,
         "exportedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         "source": "moviepilot",
+        "originId": total["originId"],
+        "exportId": random_id(),
         "current": tidy_stats(current),
         "total": tidy_stats(total),
     }
@@ -487,6 +533,10 @@ class LotteryOptions:
         self.clean_mail: bool = bool(kwargs.get("clean_mail"))
         self.notify_big_prize: bool = bool(kwargs.get("notify_big_prize", True))
         self.big_prize_min_beans: float = float(kwargs.get("big_prize_min_beans") or 0)
+        # 两个停止条件独立开关，都默认关。和上面的通知门槛互不影响 ——
+        # 通知想宽松点、停机想严格点，本来就是两回事。
+        self.stop_on_vip: bool = bool(kwargs.get("stop_on_vip"))
+        self.stop_on_780k: bool = bool(kwargs.get("stop_on_780k"))
         self.notify_periodic: bool = bool(kwargs.get("notify_periodic"))
         self.periodic_minutes: float = float(kwargs.get("periodic_minutes") or 0)
         self.proxies: Optional[dict] = kwargs.get("proxies")
@@ -538,6 +588,9 @@ class LotteryRunner:
         self.vip_or_above: Optional[bool] = None
         self.vip_class_checked = False
         self.last_vip_swapped_beans = 0
+        # 这一抽有没有回服务端校准过余额。中大奖停机前要补一次，
+        # VIP 折算核对时已经校准过的就别再要一遍
+        self.calibrated_this_draw = False
 
         self.mail_cleaned = 0
         self.started_at = time.time()
@@ -676,7 +729,34 @@ class LotteryRunner:
         try:
             return {"ok": response.ok, "status": response.status_code, "data": json.loads(text)}
         except (ValueError, TypeError):
-            return {"ok": False, "status": response.status_code, "data": None, "raw": text}
+            # ok 报的是 HTTP 层的真实结果，别因为 JSON 没解出来就写成 False ——
+            # 站点掉登录时正是拿 200 回一张登录页，describe_draw_failure 要靠
+            # 「HTTP 通了但不是 JSON」这个组合才认得出来
+            return {"ok": response.ok, "status": response.status_code,
+                    "data": None, "raw": text}
+
+    @staticmethod
+    def describe_draw_failure(result: Dict) -> str:
+        """这一枪到底是怎么失败的。
+
+        以前一律报 status，站点掉登录时拿 HTTP 200 回一张登录页，日志上就只有
+        一句「请求失败（HTTP 200）」。既然现在不因失败次数收摊、会一直重试下去，
+        人回来满屏都是这个，根本不知道该去重新登录。"""
+        if result.get("error"):
+            return f"请求失败：{result['error']}"
+        status = result.get("status")
+        if status in (401, 403):
+            return "请求被拒（登录多半已经失效）"
+        if not result.get("ok"):
+            return f"请求失败：HTTP {status}"
+
+        # HTTP 200 但不是 JSON —— 登录页、维护页、人机验证都长这样
+        body = str(result.get("raw") or "")
+        if re.search(r"<html", body, re.I):
+            if re.search(r"takelogin|login\.php|请登录|登录后", body, re.I):
+                return "站点回的是登录页 —— 登录已失效，去页面上重新登一下再抽"
+            return "站点没返回 JSON（维护页或人机验证？）"
+        return f"站点返回了认不出的内容（HTTP {status}）"
 
     def record(self, prize_text: str, prize: Dict):
         for stats in (self.current, self.total, self.interval_stats):
@@ -732,6 +812,7 @@ class LotteryRunner:
 
         drift = actual - estimated
         self.balance = actual
+        self.calibrated_this_draw = True
 
         beans = self.read_vip_swap_beans()
         eligible = self.check_vip_or_above()
@@ -769,17 +850,24 @@ class LotteryRunner:
 
     # ---------------- 通知 ----------------
 
-    def push_big_prize(self, prize: Dict, prize_text: str):
-        """挂机跑一晚上，中了大奖当场推一条。口径和油猴版的全屏庆祝一致：
-        VIP，或单笔憨豆到门槛。"""
-        if not self.options.notify_big_prize:
-            return
-        big = prize["type"] == "vip" or (
+    def is_big_prize(self, prize: Dict) -> bool:
+        """够不够格推一条大奖通知。门槛可配，和「中奖就停」那两个开关互不影响。"""
+        return prize["type"] == "vip" or (
             self.options.big_prize_min_beans > 0
             and prize["type"] == "beans"
             and prize["value"] >= self.options.big_prize_min_beans
         )
-        if not big:
+
+    def should_stop_for_prize(self, prize: Dict) -> bool:
+        """中了就收工。VIP 已折算成憨豆的那一注 type 仍是 vip，照样按 VIP 判；
+        780,000 只认普通憨豆的精确档位，不含 1,000,000 等其他档。"""
+        return ((self.options.stop_on_vip and prize["type"] == "vip")
+                or (self.options.stop_on_780k
+                    and prize["type"] == "beans" and prize["value"] == 780000))
+
+    def push_big_prize(self, prize: Dict, prize_text: str, will_stop: bool = False):
+        """挂机跑一晚上，中了大奖当场推一条 —— 不然要等跑完才知道。"""
+        if not self.options.notify_big_prize or not self.is_big_prize(prize):
             return
 
         # label 只是档位（VIP 那档就是「7 天」），单独拿出来看不出中的是什么奖，
@@ -808,7 +896,7 @@ class LotteryRunner:
             f"  🚀 净盈亏：{_signed(profit)}（{'+' if rate >= 0 else ''}{rate:.1f}%）",
             f"  💰 当前余额：{fmt(self.balance)} 憨豆",
             "━━━━━━━━━━━━━━━━━━━",
-            "🌟 后台持续挂机抽奖中",
+            "🛑 已按设置停止本轮抽奖" if will_stop else "🌟 后台持续挂机抽奖中",
         ])
         self.notify("🎉 HHCLUB 幸运大转盘｜命中大奖", body)
 
@@ -893,6 +981,20 @@ class LotteryRunner:
             return False
         return True
 
+    def stop_for_prize(self, prize: Dict, prize_text: str):
+        """按设置停在中奖那一刻。收工前拿一次权威余额 —— 开这个功能本来就是
+        为了停在中奖那一刻对账，记录里摆个本地估算说不过去。
+        VIP 那一注刚才折算核对时已经校准过，这里就跳过了。"""
+        if not self.calibrated_this_draw:
+            try:
+                self.balance = self.snapshot()["balance"]
+            except Exception as err:
+                self.log(f"⚠️ 停机前校准余额失败（{err}），余额按本地估算记")
+
+        stop_prize = "VIP（含折算）" if prize["type"] == "vip" else "780,000 憨豆"
+        self.stop_reason = f"命中停止条件（{stop_prize}），按设置停止"
+        self.report(f"🏆 命中 {str(prize_text).strip()}（停止项：{stop_prize}） · 按设置停止本轮")
+
     def note_stuck(self, streak: int, what: str, wait_ms: float):
         """一直卡着不动时隔一阵子推一条，让人知道它还在转、卡在哪 —— 但不收摊，
         无人值守的时候停了就再也起不来了。"""
@@ -943,7 +1045,7 @@ class LotteryRunner:
             if not result.get("data"):
                 self.error_streak += 1
                 self.quick_retry_ms = step_backoff_ms(self.error_streak, RUNTIME["error_retry_ms"])
-                self.log(f"❌ 请求失败（HTTP {result.get('status')}）· "
+                self.log(f"❌ {self.describe_draw_failure(result)} · "
                          f"{interval_text(self.quick_retry_ms / 1000)} 秒后再试")
                 self.note_stuck(self.error_streak, "请求失败", self.quick_retry_ms)
                 continue
@@ -976,9 +1078,18 @@ class LotteryRunner:
                 self.log(f"🎲 第 {fmt(self.current['draws'])} 抽：{str(prize_text).strip()}"
                          f" · 余额 {fmt(self.balance)}")
 
+                self.calibrated_this_draw = False
                 if prize["type"] == "vip":
                     self.reconcile_vip(prize)
-                self.push_big_prize(prize, prize_text)
+
+                will_stop = self.should_stop_for_prize(prize)
+                self.push_big_prize(prize, prize_text, will_stop)
+
+                # 中了大奖就收工。放在 VIP 折算和通知之后 —— 那两件事得先办完，
+                # 不然这一注的账记不齐、通知也发不出去。
+                if will_stop:
+                    self.stop_for_prize(prize, prize_text)
+                    break
 
                 if (self.options.notify_periodic and self.options.periodic_minutes > 0
                         and time.time() - self.last_periodic_report_at

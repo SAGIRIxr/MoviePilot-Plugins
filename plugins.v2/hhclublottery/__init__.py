@@ -26,6 +26,7 @@ from .lottery import (
     format_duration,
     normalize_stats,
     profit_of,
+    stamp_origin,
     swapped_beans_total,
     tidy_stats,
 )
@@ -88,7 +89,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -119,6 +120,9 @@ class HHClubLottery(_PluginBase):
     _duration_buffer = 0
     _max_minutes = 60
     _clean_mail = False
+    # 中大奖就收工，两个条件独立开关，都默认关
+    _stop_on_vip = False
+    _stop_on_780k = False
 
     # 通知
     _notify_big_prize = True
@@ -159,6 +163,8 @@ class HHClubLottery(_PluginBase):
             self._duration_buffer = int(config.get("duration_buffer") or 0)
             self._max_minutes = float(config.get("max_minutes") or 60)
             self._clean_mail = config.get("clean_mail") or False
+            self._stop_on_vip = config.get("stop_on_vip") or False
+            self._stop_on_780k = config.get("stop_on_780k") or False
 
             self._notify_big_prize = (config.get("notify_big_prize")
                                       if config.get("notify_big_prize") is not None else True)
@@ -201,6 +207,8 @@ class HHClubLottery(_PluginBase):
             "duration_buffer": self._duration_buffer,
             "max_minutes": self._max_minutes,
             "clean_mail": self._clean_mail,
+            "stop_on_vip": self._stop_on_vip,
+            "stop_on_780k": self._stop_on_780k,
             "notify_big_prize": self._notify_big_prize,
             "big_prize_min_beans": self._big_prize_min_beans,
             "notify_periodic": self._notify_periodic,
@@ -327,6 +335,8 @@ class HHClubLottery(_PluginBase):
                 duration_buffer_ms=self._duration_buffer,
                 max_minutes=self._max_minutes,
                 clean_mail=self._clean_mail,
+                stop_on_vip=self._stop_on_vip,
+                stop_on_780k=self._stop_on_780k,
                 notify_big_prize=self._notify_big_prize and self._notify,
                 big_prize_min_beans=self._big_prize_min_beans,
                 notify_periodic=self._notify_periodic and self._notify,
@@ -363,7 +373,7 @@ class HHClubLottery(_PluginBase):
                 logger.error(f"抽奖过程出错：{err}", exc_info=True)
 
             # 先落盘再清信 —— 清信可能上百个请求，卡在那儿被打断的话成绩不能跟着丢
-            self.save_data("total", tidy_stats(runner.total))
+            self.save_data("total", tidy_stats(stamp_origin(runner.total)))
             self.__save_history(runner, status_text)
 
             if self._clean_mail and not self._stop_event.is_set():
@@ -459,7 +469,11 @@ class HHClubLottery(_PluginBase):
     def api_export(self) -> dict:
         """油猴版「📥 导入备份」认这个格式，选「合并」就能把 MP 上的战绩带回浏览器。"""
         total = normalize_stats(self.get_data("total"))
-        return backup_payload(empty_stats(), total)
+        payload = backup_payload(empty_stats(), total)
+        # 记录线编号可能是这次现生成的（一轮没跑过就先导出）。存回去，
+        # 之后每次导出都沿用同一个，油猴版才认得出这些文件同出一源。
+        self.save_data("total", tidy_stats(total))
+        return payload
 
     def api_run(self) -> dict:
         if self._running:
@@ -572,6 +586,15 @@ class HHClubLottery(_PluginBase):
                                 "model": "interval", "label": "固定间隔(秒)", "type": "number",
                                 "hint": "仅在关闭自适应时生效，最小 3 秒", "persistent-hint": True}}),
                         ]},
+                        {"component": "VRow", "content": [
+                            col(6, {"component": "VSwitch", "props": {
+                                "model": "stop_on_vip", "label": "中 VIP 就收工", "color": "error",
+                                "hint": "已折算成憨豆的那一注也算", "persistent-hint": True}}),
+                            col(6, {"component": "VSwitch", "props": {
+                                "model": "stop_on_780k", "label": "中 780,000 憨豆就收工", "color": "error",
+                                "hint": "只认这一个精确档位，不含 1,000,000 等其他档",
+                                "persistent-hint": True}}),
+                        ]},
                     ]),
 
                     card("mdi-bell-ring", "success", "通知设置", [
@@ -642,6 +665,8 @@ class HHClubLottery(_PluginBase):
             "duration_buffer": 0,
             "max_minutes": 60,
             "clean_mail": False,
+            "stop_on_vip": False,
+            "stop_on_780k": False,
             "notify_big_prize": True,
             "big_prize_min_beans": 780000,
             "notify_periodic": False,
