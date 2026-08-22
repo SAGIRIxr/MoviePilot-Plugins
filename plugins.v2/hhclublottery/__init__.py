@@ -119,7 +119,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.7.0"
+    plugin_version = "1.7.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -180,6 +180,10 @@ class HHClubLottery(_PluginBase):
     _do_restore = False
 
     # 运行时
+    # 「在不在跑」的检查和置位必须是原子的：定时任务、/run 接口、立即运行一次
+    # 是三个不同的线程，光靠 if self._running 挡不住同时进来 —— 漏过去就是
+    # 两轮一起抽，花的是真憨豆
+    _run_lock = threading.Lock()
     _scheduler: Optional[BackgroundScheduler] = None
     # 全程只有这一个 Event，绝不在 init_plugin 里换新的 —— 换了的话，
     # 正在跑的那一轮还攥着旧的，之后谁也叫不停它
@@ -238,7 +242,8 @@ class HHClubLottery(_PluginBase):
 
             self._use_proxy = config.get("use_proxy") or False
             self._user_agent = (config.get("user_agent") or "").strip()
-            self._history_days = _number(config.get("history_days"), 90, int)
+            # 至少留 1 天。填 0 的话 `x or 90` 会把它悄悄变成 90，说不清楚
+            self._history_days = max(1, _number(config.get("history_days"), 90, int))
 
         # 一次性动作：导入 / 清空 / 撤销。一次保存只做一件，同时勾多个只能是
         # 勾错了 —— 与其猜哪个优先，不如全都不做、把话说清楚
@@ -495,7 +500,9 @@ class HHClubLottery(_PluginBase):
         existing = normalize_stats(self.get_data("total"))
         overlap = detect_overlap(existing, parsed, export_id)
 
-        if overlap and overlap["sure"] and self._import_mode == "merge":
+        # 白名单而不是 == "merge"：配置里万一是个认不出的值，也得按最保守的
+        # 来 —— 拦下来，而不是绕过查重闷头合并
+        if overlap and overlap["sure"] and self._import_mode not in ("force", "replace"):
             return False, (f"{overlap['title']} —— {overlap['detail']}"
                            "确认要合就把「导入方式」改成「强制合并」再存一次；"
                            "想让这份备份取代当前历史就选「覆盖」。")
@@ -528,14 +535,15 @@ class HHClubLottery(_PluginBase):
 
     def run_lottery(self):
         """跑一轮抽奖。定时服务、立即运行、远程命令和插件 API 都走这里。"""
-        if self._running:
-            logger.warning("上一轮抽奖还在跑，本次跳过")
-            return
-        if self._stop_event is None:
-            self._stop_event = threading.Event()
-        self._stop_event.clear()
-        self._stop_source = None
-        self._running = True
+        with self._run_lock:
+            if self._running:
+                logger.warning("上一轮抽奖还在跑，本次跳过")
+                return
+            if self._stop_event is None:
+                self._stop_event = threading.Event()
+            self._stop_event.clear()
+            self._stop_source = None
+            self._running = True
 
         try:
             cookie, note = self.__resolve_cookie()
@@ -577,6 +585,15 @@ class HHClubLottery(_PluginBase):
                 stop_event=self._stop_event,
             )
             self._runner = runner
+
+            # 数值被收敛时说一声。实机上有人把「单次运行上限」填成了 600000 分钟，
+            # 静悄悄按 1440 跑了，配置页上还显示 600000 —— 那就等于没人知道
+            for name, filled, used in (("单次运行上限(分钟)", self._max_minutes, options.max_minutes),
+                                       ("固定间隔(秒)", self._interval, options.interval),
+                                       ("自适应缓冲(ms)", self._duration_buffer, options.duration_buffer_ms)):
+                if filled != used:
+                    logger.warning(f"「{name}」填的是 {fmt(filled)}，超出允许范围，"
+                                   f"本轮按 {fmt(used)} 跑")
 
             if options.draws == 0:
                 mode = f"一抽到底（保留 {fmt(options.reserve)} 憨豆）"
@@ -643,7 +660,7 @@ class HHClubLottery(_PluginBase):
             "status": status_text,
         }))
 
-        expired = time.time() - int(self._history_days or 90) * 86400
+        expired = time.time() - self._history_days * 86400
         cleaned = []
         for record in history:
             try:

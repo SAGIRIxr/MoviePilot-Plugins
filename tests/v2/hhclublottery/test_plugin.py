@@ -6,6 +6,7 @@
 以及「插件 + 假站点」的整条链路都真跑一遍。
 """
 import json
+import time
 import types
 
 import pytest
@@ -1353,3 +1354,102 @@ def test_clearing_only_history_still_blocks_reimport(plugin):
     plugin.init_plugin(_import_config(backup))
     assert plugin.get_data("total")["draws"] == 500, "统计还在，不该重复合并"
     assert any("同源" in (m.get("text") or "") for m in plugin.messages)
+
+
+# ============================================================
+# review 带出来的几处
+# ============================================================
+
+def test_update_config_covers_every_form_field(plugin):
+    """配置页控件、默认值、写回配置三张单子必须一致。
+
+    少一项就是：界面上改了、保存后又被写回旧值，或者复位 onlyonce 时把某项
+    抹掉。前两张有 test_form_models_match_defaults 盯着，这条盯第三张。"""
+    _, defaults = plugin.get_form()
+    plugin._config.clear()
+    plugin._HHClubLottery__update_config()
+    assert set(plugin._config) == set(defaults), (
+        f"只在写回里有：{set(plugin._config) - set(defaults)}；"
+        f"只在默认值里有：{set(defaults) - set(plugin._config)}")
+
+
+def test_concurrent_starts_only_run_once(plugin, monkeypatch):
+    """定时任务、/run 接口、立即运行一次是三个不同的线程。
+
+    要命的窗口在「检查 self._running」和「置位 self._running」之间：光靠
+    if 挡不住同时进来，漏过去就是两轮一起抽，花的是真憨豆。这里往那个窗口
+    里塞一个会拖时间的 Event.clear()，把窗口撑到肉眼可见，再放六个线程进去。
+    """
+    import threading
+
+    class SlowEvent(threading.Event):
+        def clear(self):
+            time.sleep(0.2)      # 检查过了、还没置位 —— 别的线程正好撞进来
+            return super().clear()
+
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(60)]
+    server, host = start_site(site)
+    started = []
+
+    real_run = HH.LotteryRunner.run
+
+    def counting_run(self):
+        started.append(1)
+        return real_run(self)
+
+    monkeypatch.setattr(HH.LotteryRunner, "run", counting_run)
+    monkeypatch.setattr(HH.LotteryRunner, "sleep",
+                        lambda self, ms: self.stop_event.is_set())
+    try:
+        _configure(plugin, host, draws=5)
+        plugin._stop_event = SlowEvent()
+        threads = [threading.Thread(target=plugin.run_lottery) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+    finally:
+        stop_site(server)
+
+    assert len(started) == 1, f"只该跑一轮，实际起了 {len(started)} 轮"
+    assert len(plugin.get_data("history")) == 1
+    assert site.draw_calls == 5, "抽的次数就是设定的那些，不能翻倍"
+
+
+def test_unknown_import_mode_is_treated_as_the_safest(plugin):
+    """配置里万一是个认不出的导入方式，也得按最保守的来 —— 拦，而不是
+    绕过查重闷头合并。"""
+    _seed_total(plugin, draws=500, origin="mpline")
+    backup = plugin.build_backup()
+    plugin.init_plugin(_import_config(backup, mode="乱填的"))
+    assert plugin.get_data("total")["draws"] == 500, "认不出的方式不该绕过查重"
+    assert any("同源" in (m.get("text") or "") for m in plugin.messages)
+
+
+def test_history_days_is_at_least_one(plugin):
+    """填 0 的话 `x or 90` 会把它悄悄变成 90，说不清楚；直接收敛到 1 天。"""
+    plugin.init_plugin(_config_for("hhanclub.net", history_days=0))
+    assert plugin._history_days == 1
+    plugin.init_plugin(_config_for("hhanclub.net", history_days=-5))
+    assert plugin._history_days == 1
+    plugin.init_plugin(_config_for("hhanclub.net", history_days=30))
+    assert plugin._history_days == 30
+
+
+def test_out_of_range_values_are_announced(plugin, instant, monkeypatch):
+    """实机上有人把「单次运行上限」填成了 600000 分钟，静悄悄按 1440 跑了，
+    配置页上还显示 600000 —— 那就等于没人知道。"""
+    warnings = []
+    monkeypatch.setattr(HH.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
+
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1")]
+    server, host = start_site(site)
+    try:
+        _configure(plugin, host, draws=1, max_minutes=600000)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert any("单次运行上限(分钟)" in w and "600,000" in w and "1,440" in w for w in warnings)
