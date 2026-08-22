@@ -369,22 +369,58 @@ def test_page_jackpot_roster(plugin):
     """导进来的大奖名册要显示出来 —— 之前保留了却不展示，等于白留。"""
     plugin.save_data("total", {
         "draws": 10, "cost": 20000, "gains": {"beans": 5000},
-        "prizes": {"beans": {"count": 10, "value": 5000, "tiers": {"500 憨豆": 10}}},
+        "prizes": {"beans": {"count": 10, "value": 5000, "tiers": {"500 憨豆": 10}},
+                   "vip": {"count": 2, "value": 0, "swappedBeans": 2000000,
+                           "tiers": {"已转换为憨豆 1,000,000": 2}}},
         "jackpots": [{"at": 1787370861410, "text": "VIP 7 Day(s)"},
                      {"at": 1787300000000, "text": "憨豆 780000"}],
     })
     text = str(plugin.get_page())
-    assert "大奖名册（2 条）" in text
+    assert "大奖名册（中过 2 次，2 条有时间记录）" in text
     assert "VIP 7 Day(s)" in text and "憨豆 780000" in text
     assert "2026-" in text, "时刻要渲染成人看得懂的时间"
+    assert "没有时间记录" not in text, "名册齐了就别提这一句"
+
+
+def test_page_jackpot_counts_without_roster(plugin):
+    """名册只在油猴版面板上产生。MP 这边中过的那些没有时刻，
+    但「中过几次」是准的 —— 只摆名册的话，中过 31 次却显示 1 条，看着像丢了数据。"""
+    plugin.save_data("total", {
+        "draws": 34228, "cost": 68456000, "gains": {"beans": 72451900},
+        "prizes": {
+            "beans": {"count": 28997, "value": 63451900,
+                      "tiers": {"100 憨豆": 28975, "780,000 憨豆": 22}},
+            "vip": {"count": 9, "value": 0, "swappedBeans": 9000000,
+                    "tiers": {"已转换为憨豆 1,000,000": 9}},
+        },
+        "jackpots": [{"at": 1787370861410, "text": "VIP 7 Day(s)"}],
+    })
+    text = str(plugin.get_page())
+    assert "大奖名册（中过 31 次，1 条有时间记录）" in text
+    assert "⭐ VIP 9 次" in text
+    assert "780,000 以上憨豆 22 次" in text
+    assert "其中 30 次没有时间记录" in text
+
+
+def test_page_jackpot_card_without_any_roster(plugin):
+    """一条名册都没有、但统计里中过 —— 还是要把次数摆出来。"""
+    plugin.save_data("total", {
+        "draws": 5000, "cost": 10000000, "gains": {"beans": 5000000},
+        "prizes": {"beans": {"count": 4999, "value": 5000000,
+                             "tiers": {"780,000 憨豆": 3, "100 憨豆": 4996}}},
+    })
+    text = str(plugin.get_page())
+    assert "大奖名册（中过 3 次）" in text
+    assert "其中 3 次没有时间记录" in text
 
 
 def test_page_without_jackpots_hides_the_card(plugin):
+    """名册空、统计里也一次没中过 —— 这才该整卡不显示。"""
     plugin.save_data("total", {
         "draws": 10, "cost": 20000, "gains": {"beans": 5000},
         "prizes": {"beans": {"count": 10, "value": 5000, "tiers": {"500 憨豆": 10}}},
     })
-    assert "大奖名册" not in str(plugin.get_page()), "没有名册就别摆个空卡"
+    assert "大奖名册" not in str(plugin.get_page()), "一次没中过就别摆个空卡"
 
 
 def test_page_survives_legacy_magic_split(plugin):
@@ -1132,3 +1168,54 @@ def test_stop_reason_names_who_stopped(plugin, monkeypatch):
     record = plugin.get_data("history")[0]
     assert record["draws"] == 2
     assert record["status"] == "手动停止（数据页按钮）"
+
+
+def test_page_gain_card(plugin):
+    """憨豆之外的东西：彩虹ID、补签卡、上传量这些换算不成憨豆，
+    但它们才是抽奖真正想要的。没中过也要摆出来 —— 「邀请 0」本身就是信息。"""
+    plugin.save_data("total", {
+        "draws": 34228, "cost": 68456000,
+        "gains": {"beans": 72451900, "rainbow": 6251, "makeup": 1959,
+                  "upload": 5950, "invite": 58, "vip": 0, "rename": 0},
+        "prizes": {
+            "beans": {"count": 28997, "value": 63451900, "tiers": {"100 憨豆": 28997}},
+            "rainbow": {"count": 893, "value": 6251, "tiers": {"7 天": 893}},
+            "makeup": {"count": 1959, "value": 1959, "tiers": {"1 个": 1959}},
+            "upload": {"count": 2312, "value": 5950, "tiers": {"2 GB": 2312}},
+            "invite": {"count": 58, "value": 58, "tiers": {"1 邀请": 58}},
+            "vip": {"count": 9, "value": 0, "swappedBeans": 9000000,
+                    "tiers": {"已转换为憨豆 1,000,000": 9}},
+        },
+    })
+    text = str(plugin.get_page())
+
+    assert "奖品累计（憨豆以外）" in text
+    assert "6,251 天" in text and "893 次" in text          # 彩虹ID
+    assert "1,959 个" in text                                # 补签卡
+    assert "5,950 GB" in text and "2,312 次" in text        # 上传量
+    assert "📧 邀请" in text and "58" in text
+    # VIP 折算之后天数被扣回 0，主值得是次数，否则看着像一次没中过
+    assert "9 次" in text and "折算 9,000,000 憨豆" in text
+    # 一次没中过的类别照样占位
+    assert "📛 改名卡" in text and "没中过" in text
+
+
+def test_gain_card_shows_vip_days_when_not_swapped(plugin):
+    """没被折算时，VIP 的天数要照实显示。"""
+    plugin.save_data("total", {
+        "draws": 100, "cost": 200000, "gains": {"beans": 0, "vip": 14},
+        "prizes": {"vip": {"count": 2, "value": 14, "tiers": {"7 天": 2}}},
+    })
+    text = str(plugin.get_page())
+    assert "2 次" in text and "14 天" in text
+    assert "折算" not in text.split("奖品累计")[1].split("奖项明细")[0]
+
+
+def test_gain_card_keeps_unknown_prizes(plugin):
+    """站点哪天加了认不出的新奖品，别让它凭空消失。"""
+    plugin.save_data("total", {
+        "draws": 10, "cost": 20000, "gains": {"beans": 0},
+        "prizes": {"unknown": {"count": 3, "value": 0, "tiers": {"神秘礼包": 3}}},
+    })
+    text = str(plugin.get_page())
+    assert "其他奖品" in text and "站点新加的奖品？" in text

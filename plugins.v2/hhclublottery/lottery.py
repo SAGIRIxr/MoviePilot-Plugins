@@ -442,6 +442,24 @@ def stamp_origin(total: Dict) -> Dict:
     return total
 
 
+# 名册收的就是这两档：VIP，和这个数以上的憨豆。几千抽才碰一次。
+JACKPOT_BEANS = 780000
+
+
+def jackpot_counts(stats: Dict) -> Tuple[int, int, int]:
+    """统计里一共中过多少次大奖，返回 (合计, VIP 次数, 大额憨豆次数)。
+
+    名册只有从油猴版备份合并进来的那部分带时刻，但「中过几次」在 prizes 里
+    一直是准的 —— 两个数摆在一起，才看得出名册缺了多少条。"""
+    prizes = stats.get("prizes") or {}
+    vip = int(_num((prizes.get("vip") or {}).get("count")))
+    big_beans = int(sum(
+        _num(count) for label, count in ((prizes.get("beans") or {}).get("tiers") or {}).items()
+        if (first_number(label) or 0) >= JACKPOT_BEANS
+    ))
+    return vip + big_beans, vip, big_beans
+
+
 def lineage_of(stats: Dict) -> set:
     """这份统计里含有哪些记录线：自己的，加上历次并进来的。
     两份统计的记录线一旦有交集，就说明它们共享过历史。"""

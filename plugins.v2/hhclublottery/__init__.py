@@ -21,6 +21,8 @@ from .lottery import (
     CookieInvalid,
     _num,
     first_number,
+    JACKPOT_BEANS,
+    jackpot_counts,
     detect_overlap,
     merge_stats,
     parse_backup,
@@ -117,7 +119,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1031,6 +1033,57 @@ class HHClubLottery(_PluginBase):
             ],
         }
 
+    def __gain_card(self, total: dict) -> dict:
+        """憨豆之外的东西。这些换算不成憨豆，但彩虹ID、补签卡、上传量本来就是
+        抽奖真正想要的东西 —— 没中过也要摆出来，「邀请 0」本身就是信息。"""
+        tiles = []
+        for key in ("invite", "rainbow", "vip", "makeup", "upload", "rename"):
+            meta = PRIZE_META[key]
+            bucket = total["prizes"].get(key) or {}
+            count = _num(bucket.get("count"))
+
+            if key == "vip":
+                # 折算之后天数被扣回 0，拿次数当主值才看得出到底中过几次
+                value = f"{fmt(count)} 次"
+                parts = []
+                days = _num(total["gains"].get("vip"))
+                swapped = _num(bucket.get("swappedBeans"))
+                if days:
+                    parts.append(f"{fmt(days)} 天")
+                if swapped:
+                    parts.append(f"折算 {fmt(swapped)} 憨豆")
+                hint = " · ".join(parts) or ("没中过" if not count else "—")
+            else:
+                amount = _num(total["gains"].get(key))
+                value = f"{fmt(amount)}{' ' + meta['unit'] if meta['unit'] else ''}"
+                hint = f"{fmt(count)} 次" if count else "没中过"
+
+            tiles.append(self.__stat(f"{meta['icon']} {meta['name']}", value,
+                                     hint=hint, cols=6, md=2))
+
+        # 站点哪天加了新奖品，认不出来的会落在这一类，别让它凭空消失
+        other = total["prizes"].get("unknown") or {}
+        if _num(other.get("count")):
+            tiles.append(self.__stat(f"{PRIZE_META['unknown']['icon']} 其他奖品",
+                                     f"{fmt(other['count'])} 次",
+                                     hint="站点新加的奖品？", cols=6, md=2))
+
+        return {
+            "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
+            "content": [
+                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "teal", "class": "mr-3"},
+                          "text": "mdi-package-variant-closed"},
+                         {"component": "span", "text": "奖品累计（憨豆以外）"},
+                     ]},
+                ]},
+                {"component": "VCardText", "content": [
+                    {"component": "VRow", "content": tiles}]},
+            ],
+        }
+
     def __prize_card(self, total: dict) -> dict:
         """奖项明细。档位从「挤在一个格子里用顿号拼」改成每档一行，
         并给每一行算出它到底折合多少憨豆 —— 之前那一列混着天 / 个 / GB，
@@ -1124,10 +1177,26 @@ class HHClubLottery(_PluginBase):
 
     def __jackpot_card(self, total: dict) -> Optional[dict]:
         """大奖名册。780,000 憨豆和 VIP 这两档几千抽才碰一次，日志滚掉就再也
-        找不回来了。名册是从油猴版备份合并进来的，这边不产生 —— 有才显示。"""
+        找不回来了。
+
+        名册里带时刻的那些是从油猴版备份合并进来的，MP 这边不产生；但「一共
+        中过几次」在 prizes 里一直是准的。两个数摆在一起，才看得出名册缺了
+        多少条 —— 只摆名册的话，中过 31 次却只显示 1 条，看着像丢了数据。"""
         jackpots = [item for item in (total.get("jackpots") or []) if isinstance(item, dict)]
-        if not jackpots:
+        total_hits, vip_hits, bean_hits = jackpot_counts(total)
+        if not jackpots and not total_hits:
             return None
+
+        missing = max(0, total_hits - len(jackpots))
+        title = f"大奖名册（中过 {fmt(total_hits)} 次"
+        title += f"，{fmt(len(jackpots))} 条有时间记录）" if jackpots else "）"
+
+        breakdown = (f"⭐ VIP {fmt(vip_hits)} 次 · "
+                     f"💰 {fmt(JACKPOT_BEANS)} 以上憨豆 {fmt(bean_hits)} 次")
+        if missing:
+            breakdown += (f" —— 其中 {fmt(missing)} 次没有时间记录："
+                          "名册只在油猴版面板上产生，MP 这边只能靠导入备份带过来，"
+                          "在此之前中的那些只剩次数。")
 
         rows = []
         for item in jackpots[:100]:
@@ -1150,10 +1219,13 @@ class HHClubLottery(_PluginBase):
                      "content": [
                          {"component": "VIcon", "props": {"color": "amber", "class": "mr-3"},
                           "text": "mdi-trophy"},
-                         {"component": "span", "text": f"大奖名册（{fmt(len(jackpots))} 条）"},
+                         {"component": "span", "text": title},
                      ]},
                 ]},
                 {"component": "VCardText", "content": [
+                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-3"},
+                     "text": breakdown},
+                ] + ([
                     {"component": "VTable", "props": {"hover": True, "density": "compact"},
                      "content": [
                          {"component": "thead", "content": [{"component": "tr", "content": [
@@ -1162,7 +1234,7 @@ class HHClubLottery(_PluginBase):
                          ]}]},
                          {"component": "tbody", "content": rows},
                      ]},
-                ]},
+                ] if rows else [])},
             ],
         }
 
@@ -1244,6 +1316,7 @@ class HHClubLottery(_PluginBase):
         cards = [
             self.__status_card(),
             self.__overview_card(total, history[0] if history else {}),
+            self.__gain_card(total),
             self.__prize_card(total),
         ]
         jackpot = self.__jackpot_card(total)
