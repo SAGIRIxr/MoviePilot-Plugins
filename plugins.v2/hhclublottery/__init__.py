@@ -89,7 +89,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -135,19 +135,32 @@ class HHClubLottery(_PluginBase):
     _user_agent = ""
     _history_days = 90
 
+    # 「停止当前抽奖」：一次性开关，保存后立刻复位（和 onlyonce 一个路子）
+    _stop_current = False
+
     # 运行时
     _scheduler: Optional[BackgroundScheduler] = None
+    # 全程只有这一个 Event，绝不在 init_plugin 里换新的 —— 换了的话，
+    # 正在跑的那一轮还攥着旧的，之后谁也叫不停它
     _stop_event: Optional[threading.Event] = None
     _running = False
+    # 正在跑的那一轮，数据页拿它显示实时进度
+    _runner: Optional[LotteryRunner] = None
 
     def init_plugin(self, config: dict = None):
-        # 停止现有任务
-        self.stop_service()
-        self._stop_event = threading.Event()
+        """MoviePilot 保存插件配置走的就是这里（同一个实例，不经过 stop_service）。
+
+        所以这里**不能**顺手把正在跑的那一轮打断 —— 改个 cron、调个通知开关
+        都会把挂了一半的抽奖腰斩，还看不出是谁干的。要停就走「停止当前抽奖」
+        那个开关，明明白白地停。"""
+        self.__shutdown_scheduler()
+        if self._stop_event is None:
+            self._stop_event = threading.Event()
 
         if config:
             self._enabled = config.get("enabled") or False
             self._onlyonce = config.get("onlyonce") or False
+            self._stop_current = config.get("stop_current") or False
             self._notify = config.get("notify") if config.get("notify") is not None else True
             self._cron = config.get("cron") or "5 9 * * *"
 
@@ -176,6 +189,21 @@ class HHClubLottery(_PluginBase):
             self._user_agent = (config.get("user_agent") or "").strip()
             self._history_days = int(config.get("history_days") or 90)
 
+        # 停止当前抽奖：只停不启。和「立即运行一次」同时勾上时，停优先 ——
+        # 一次保存里既要停又要开，只能是勾错了，宁可什么都不启
+        if self._stop_current:
+            self._stop_current = False
+            if self._running:
+                logger.info("收到「停止当前抽奖」，本轮收工 —— 已抽的成绩会照常落盘")
+                self._stop_event.set()
+            else:
+                logger.info("「停止当前抽奖」已复位 —— 当前没有正在跑的抽奖")
+            if self._onlyonce:
+                logger.warning("「停止当前抽奖」和「立即运行一次」同时勾上了，本次只停不启")
+                self._onlyonce = False
+            self.__update_config()
+            return
+
         # 立即运行一次
         if self._onlyonce:
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
@@ -195,6 +223,7 @@ class HHClubLottery(_PluginBase):
         self.update_config({
             "enabled": self._enabled,
             "onlyonce": self._onlyonce,
+            "stop_current": self._stop_current,
             "notify": self._notify,
             "cron": self._cron,
             "cookie_source": self._cookie_source,
@@ -353,6 +382,7 @@ class HHClubLottery(_PluginBase):
                 notify=self.__push,
                 stop_event=self._stop_event,
             )
+            self._runner = runner
 
             mode = ("一抽到底" if options.draws == 0
                     else f"抽 {fmt(options.draws)} 次")
@@ -385,6 +415,7 @@ class HHClubLottery(_PluginBase):
                                   title="🎡 HHCLUB 幸运大转盘｜任务结算",
                                   text=runner.summary_notice(status_text))
         finally:
+            self._runner = None
             self._running = False
 
     def __push(self, title: str, text: str):
@@ -525,6 +556,12 @@ class HHClubLottery(_PluginBase):
                                 "model": "notify", "label": "开启通知", "color": "info"}}),
                             col(3, {"component": "VSwitch", "props": {
                                 "model": "onlyonce", "label": "立即运行一次", "color": "success"}}),
+                            col(3, {"component": "VSwitch", "props": {
+                                "model": "stop_current", "label": "停止当前抽奖", "color": "error",
+                                "hint": "保存后立刻收工，已抽的成绩照常落盘",
+                                "persistent-hint": True}}),
+                        ]},
+                        {"component": "VRow", "content": [
                             col(3, {"component": cron_field, "props": {
                                 "model": "cron", "label": "抽奖周期", "placeholder": "5 9 * * *",
                                 "prepend-inner-icon": "mdi-clock-outline"}}),
@@ -653,6 +690,7 @@ class HHClubLottery(_PluginBase):
         ], {
             "enabled": False,
             "onlyonce": False,
+            "stop_current": False,
             "notify": True,
             "cron": "5 9 * * *",
             "cookie_source": "manual",
@@ -678,6 +716,31 @@ class HHClubLottery(_PluginBase):
 
     # ---------------- 数据页 ----------------
 
+    def __status_card(self) -> dict:
+        """当前在不在跑。「停止当前抽奖」得有个东西给它照着，
+        不然点下去也不知道停没停、原本有没有在跑。"""
+        runner = self._runner
+        if self._running and runner is not None:
+            icon, color = "mdi-play-circle", "success"
+            text = (f"正在抽 · 本轮已抽 {fmt(runner.current['draws'])} 次"
+                    f" · 消耗 {fmt(runner.current['cost'])}"
+                    f" · 余额 {fmt(runner.balance)} 憨豆")
+            hint = "要收手就在配置页勾「停止当前抽奖」并保存，已抽的成绩会照常落盘"
+        else:
+            icon, color = "mdi-pause-circle-outline", "secondary"
+            text = "空闲中"
+            hint = f"下次按抽奖周期 {self._cron} 触发" if self._enabled and self._cron                 else "插件未启用或未设置抽奖周期"
+        return {
+            "component": "VAlert",
+            "props": {"type": "info", "variant": "tonal", "color": color,
+                      "icon": icon, "class": "mb-4"},
+            "content": [
+                {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"},
+                 "text": text},
+                {"component": "div", "props": {"class": "text-caption"}, "text": hint},
+            ],
+        }
+
     def get_page(self) -> List[dict]:
         total = normalize_stats(self.get_data("total"))
         history = self.get_data("history") or []
@@ -685,7 +748,7 @@ class HHClubLottery(_PluginBase):
             history = [history]
 
         if not total["draws"] and not history:
-            return [{
+            return [self.__status_card(), {
                 "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
                 "content": [{"component": "VCardItem", "props": {"class": "pa-6"}, "content": [
                     {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
@@ -841,17 +904,23 @@ class HHClubLottery(_PluginBase):
             ],
         }
 
-        return [overview, prize_card, run_card]
+        return [self.__status_card(), overview, prize_card, run_card]
 
-    def stop_service(self):
-        """停用插件：先让抽奖循环自己收工（成绩已在每轮结束时落盘），再收掉调度器。"""
+    def __shutdown_scheduler(self):
+        """收掉「立即运行一次」那个一次性调度器。不碰抽奖循环。"""
         try:
-            if self._stop_event:
-                self._stop_event.set()
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
                     self._scheduler.shutdown()
                 self._scheduler = None
         except Exception as err:
-            logger.error(f"退出插件失败：{err}")
+            logger.error(f"关闭调度器失败：{err}")
+
+    def stop_service(self):
+        """停用 / 重载插件：让抽奖循环自己收工（成绩已在每轮结束时落盘），再收调度器。
+
+        MoviePilot 只在禁用插件、重载插件、退出时走这里；保存配置不走。"""
+        if self._stop_event:
+            self._stop_event.set()
+        self.__shutdown_scheduler()

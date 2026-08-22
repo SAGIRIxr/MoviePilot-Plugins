@@ -543,3 +543,130 @@ def test_run_stamps_origin_id(plugin, instant):
     origin = plugin.get_data("total")["originId"]
     assert origin, "跑完落盘时就该盖上编号"
     assert plugin.api_export()["originId"] == origin, "导出沿用已有编号，不另起一条"
+
+
+# ============================================================
+# 停止当前抽奖 / 保存配置不打断
+# ============================================================
+
+def _config_for(host, **overrides):
+    """一份完整的配置字典，模拟界面上按「保存」提交的内容。"""
+    config = {
+        "enabled": True, "notify": False, "onlyonce": False, "stop_current": False,
+        "cron": "5 9 * * *", "cookie_source": "manual",
+        "cookie": "c_secure_uid=1; c_secure_pass=2", "host": host,
+        "draws": 10, "reserve": 0, "interval": 6.8, "follow_duration": True,
+        "duration_buffer": 0, "max_minutes": 60, "clean_mail": False,
+        "stop_on_vip": False, "stop_on_780k": False,
+        "notify_big_prize": True, "big_prize_min_beans": 780000,
+        "notify_periodic": False, "periodic_minutes": 30,
+        "use_proxy": False, "user_agent": "", "history_days": 90,
+    }
+    config.update(overrides)
+    return config
+
+
+def test_plain_config_save_does_not_interrupt(plugin, monkeypatch):
+    """改个 cron、调个通知开关，不该把挂了一半的抽奖腰斩。
+
+    MoviePilot 保存配置走的是同一个实例的 init_plugin，不经过 stop_service ——
+    以前 init_plugin 第一行就调 stop_service，等于每次保存都腰斩一次。"""
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(6)]
+    server, host = start_site(site)
+    saved = {"n": 0}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 2 and not saved["n"]:
+            saved["n"] += 1
+            # 用户在界面上改了抽奖周期就按了保存
+            plugin.init_plugin(_config_for(host, cron="0 3 * * *"))
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        plugin.init_plugin(_config_for(host, draws=5))
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert saved["n"] == 1, "保存钩子没被触发，这个用例就没测到东西"
+    assert plugin.get_data("history")[0]["draws"] == 5, "保存配置不该打断这一轮"
+    assert plugin._cron == "0 3 * * *", "新配置照样生效"
+
+
+def test_stop_current_interrupts_running_round(plugin, monkeypatch):
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(10)]
+    server, host = start_site(site)
+    saved = {"n": 0}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 2 and not saved["n"]:
+            saved["n"] += 1
+            plugin.init_plugin(_config_for(host, stop_current=True))
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        plugin.init_plugin(_config_for(host, draws=10))
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    record = plugin.get_data("history")[0]
+    assert record["draws"] == 2, "勾了就该当场收工"
+    assert site.draw_calls == 2
+    assert plugin.get_data("total")["draws"] == 2, "已抽的成绩照常落盘"
+
+
+def test_stop_current_resets_itself(plugin):
+    plugin.init_plugin(_config_for("hhanclub.net", stop_current=True))
+    assert plugin._stop_current is False, "一次性开关，保存后立刻复位"
+    assert plugin._config["stop_current"] is False, "复位要写回配置，不然下次保存又停一遍"
+
+
+def test_stop_current_beats_onlyonce(plugin, monkeypatch):
+    started = []
+    monkeypatch.setattr(plugin, "run_lottery", lambda: started.append(1))
+    plugin.init_plugin(_config_for("hhanclub.net", stop_current=True, onlyonce=True))
+    assert started == [], "既要停又要开只能是勾错了，宁可什么都不启"
+    assert plugin._onlyonce is False
+    assert plugin._stop_current is False
+
+
+def test_stop_event_is_never_swapped(plugin):
+    """init_plugin 里换个新 Event 的话，正在跑的那一轮还攥着旧的，谁也叫不停它。"""
+    before = plugin._stop_event
+    plugin.init_plugin(_config_for("hhanclub.net"))
+    assert plugin._stop_event is before, "同一个实例上 Event 不能换"
+
+    plugin.stop_service()
+    assert before.is_set(), "禁用插件仍然要能叫停"
+
+
+def test_status_card(plugin, monkeypatch):
+    """「停止当前抽奖」得有个东西给它照着 —— 数据页要看得出在不在跑。"""
+    idle = str(plugin.get_page())
+    assert "空闲中" in idle
+
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(6)]
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 2 and "page" not in seen:
+            seen["page"] = str(plugin.get_page())
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=3)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert "正在抽 · 本轮已抽 2 次" in seen["page"]
+    assert "停止当前抽奖" in seen["page"], "顺带告诉人怎么停"
+    assert "空闲中" in str(plugin.get_page()), "跑完要回到空闲"
