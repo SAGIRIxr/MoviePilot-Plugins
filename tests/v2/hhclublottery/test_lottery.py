@@ -704,3 +704,63 @@ def test_push_jackpot():
         L.push_jackpot(stats, f"憨豆 780000 #{i}", at=1700000000001 + i)
     check("封顶 100 条", len(stats["jackpots"]), 100)
     check("留最新的", stats["jackpots"][0]["text"], "憨豆 780000 #149")
+
+
+# ============================================================
+# 剩余时间（定时结束开着时才有）
+# ============================================================
+
+def _periodic_runner(**opts):
+    runner, _, notices = make_runner("127.0.0.1:1", draws=0,
+                                     notify_periodic=True, **opts)
+    runner.interval_stats["draws"] = 5
+    runner.interval_stats["cost"] = 10000
+    return runner, notices
+
+
+def test_remaining_is_none_without_a_deadline():
+    runner, _, _ = make_runner("127.0.0.1:1", draws=1)
+    check("不限时 没有剩余", runner.remaining_seconds(), None)
+    check("不限时 没有文案", runner.remaining_text(), None)
+
+
+def test_remaining_never_goes_negative():
+    """到点之后页面还可能刷一次，摆个负数出来不像话。"""
+    runner, _, _ = make_runner("127.0.0.1:1", draws=1, max_minutes=10)
+    runner.deadline = L.time.time() - 120
+    check("过点了收敛到 0", runner.remaining_seconds(), 0.0)
+    check("文案也是 0", runner.remaining_text(), "0秒")
+
+
+def test_periodic_report_shows_remaining():
+    runner, notices = _periodic_runner(max_minutes=30, periodic_minutes=10)
+    runner.push_periodic_report()
+    body = notices[0][1]
+    check_true("战报带剩余时间", "│ 定时结束：还有 " in body)
+    check_true("下次播报照旧", "下次播报约 10 分钟后" in body)
+
+
+def test_periodic_report_says_when_it_is_the_last_one():
+    """下一次播报落在定时结束之后 —— 那一条永远不会来，别许这个愿。"""
+    runner, notices = _periodic_runner(max_minutes=10, periodic_minutes=60)
+    runner.push_periodic_report()
+    body = notices[0][1]
+    check_true("说明这是最后一次", "这是最后一次播报" in body)
+    check_true("不再许下次播报的愿", "下次播报约" not in body)
+
+
+def test_periodic_report_without_deadline():
+    runner, notices = _periodic_runner(periodic_minutes=10)
+    runner.push_periodic_report()
+    body = notices[0][1]
+    check_true("不限时 不摆这一栏", "定时结束" not in body)
+    check_true("下次播报照旧", "下次播报约 10 分钟后" in body)
+
+
+def test_big_prize_notice_tail():
+    r, _, _ = make_runner("127.0.0.1:1", draws=1, max_minutes=30)
+    check_true("挂机中带剩余", "距定时结束还有 " in r.running_tail())
+    check("停了就不提剩余", r.running_tail(will_stop=True), "🛑 已按设置停止本轮抽奖")
+
+    plain, _, _ = make_runner("127.0.0.1:1", draws=1)
+    check("不限时 只说挂机中", plain.running_tail(), "🌟 后台持续挂机抽奖中")

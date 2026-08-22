@@ -122,7 +122,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.12.0"
+    plugin_version = "1.13.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -813,6 +813,8 @@ class HHClubLottery(_PluginBase):
                 "beans": runner.current["gains"]["beans"],
                 "balance": runner.balance,
                 "elapsed": format_duration((time.time() - runner.started_at) * 1000),
+                # 没设定时结束就是 null，外部轮询时好判断
+                "remaining": runner.remaining_text(),
             })
         return {"code": 0, "message": "ok", "data": status}
 
@@ -911,16 +913,26 @@ class HHClubLottery(_PluginBase):
                                f"盈亏 {profit_text} · 余额 {fmt(live['balance'])} 憨豆")})
 
         timing = f"已跑 {format_duration(elapsed * 1000)}"
+        eta = None
         if target and draws:
             # 按已经抽出来的速度估，比拿配置里的间隔算准 —— 限流、退避都算在里面了
-            remaining = max(0, target - draws) * (elapsed / draws)
-            timing += f" · 预计还要 {format_duration(remaining * 1000)}"
+            eta = max(0, target - draws) * (elapsed / draws)
+            timing += f" · 预计还要 {format_duration(eta * 1000)}"
         elif draws:
             timing += f" · 平均每抽 {round(elapsed / draws, 1)} 秒"
+        # 定时结束留空时是 None —— 不限时就不摆这一栏，摆个「还有 0」更让人犯嘀咕
+        left = live.get("remaining")
+        if left is not None:
+            timing += f" · 距定时结束还有 {format_duration(left * 1000)}"
         if live.get("mail_cleaned"):
             timing += f" · 已清站内信 {fmt(live['mail_cleaned'])} 封"
         lines.append({"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
                       "text": timing})
+
+        # 两个数都在上面摆着，但得有人把话挑明：这一轮抽不完
+        if left is not None and eta is not None and eta > left:
+            lines.append({"component": "div", "props": {"class": "text-caption text-warning"},
+                          "text": "⏰ 按这个速度抽不完，会先到定时结束的点收工"})
 
         # 大奖单拎一行摆最前面。混在类别汇总里根本看不出来 —— 中了 780,000
         # 只不过让「💰 憨豆 ×10」变成「×11」，而那一注顶得上三百多抽的消耗

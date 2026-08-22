@@ -2250,3 +2250,81 @@ def test_legacy_notify_config_is_translated(plugin, legacy, expected):
     config.update(legacy)
     plugin.init_plugin(config)
     assert plugin._big_prize_kinds == expected
+
+
+# ============================================================
+# 状态卡上的剩余时间
+# ============================================================
+
+def _page_mid_run(plugin, monkeypatch, at_draw=3, **opts):
+    """跑到第 at_draw 抽时截一张状态卡。每次等待推进 60 秒，好让时间算得准。"""
+    site = FakeSite()
+    site.balance = 5000000
+    site.draw_queue = [win("补签卡 1") for _ in range(30)]
+    server, host = start_site(site)
+    seen = {}
+    clock = {"t": time.time()}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == at_draw and "page" not in seen:
+            seen["page"] = str(plugin.get_page()[0])
+        clock["t"] += 60
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    monkeypatch.setattr(time, "time", lambda: clock["t"])
+    try:
+        _configure(plugin, host, **opts)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+    return seen["page"]
+
+
+def test_status_card_shows_remaining(plugin, monkeypatch):
+    """开着定时结束就摆一栏「还有多久」—— 挂机时想知道的就是这个。"""
+    page = _page_mid_run(plugin, monkeypatch, draws=5, max_minutes=10)
+    assert "已跑 2分 0秒" in page
+    assert "距定时结束还有 8分 0秒" in page
+    assert "抽不完" not in page, "还剩 8 分钟、只差 2 抽，抽得完"
+
+
+def test_status_card_without_deadline(plugin, monkeypatch):
+    """留空 = 不限时，那就别摆这一栏 —— 摆个「还有 0」更让人犯嘀咕。"""
+    page = _page_mid_run(plugin, monkeypatch, draws=5)
+    assert "已跑 2分 0秒" in page
+    assert "定时结束" not in page
+
+
+def test_status_card_warns_when_it_cannot_finish(plugin, monkeypatch):
+    """两个数都摆着，但得有人把话挑明：按这个速度抽不完。"""
+    page = _page_mid_run(plugin, monkeypatch, draws=100, max_minutes=10)
+    assert "距定时结束还有 8分 0秒" in page
+    assert "预计还要 1小时 4分" in page, "97 抽 × 每抽 40 秒"
+    assert "按这个速度抽不完，会先到定时结束的点收工" in page
+
+
+def test_status_api_reports_remaining(plugin, monkeypatch):
+    """外部轮询也拿得到；不限时是 null，好判断。"""
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(20)]
+    server, host = start_site(site)
+    seen, key = {}, ["timed"]
+
+    def sleep_hook(self, ms):
+        seen.setdefault(key[0], plugin.api_status()["data"])
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=2, max_minutes=30)
+        plugin.run_lottery()
+        key[0] = "open"
+        _configure(plugin, host, draws=2, max_minutes=0)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert "分" in seen["timed"]["remaining"], f"设了 30 分钟：{seen['timed']['remaining']!r}"
+    assert seen["open"]["remaining"] is None, "不限时给 null，别拿 0 顶替"
+    assert "remaining" not in plugin.api_status()["data"], "空闲时整块运行数据都不摆"

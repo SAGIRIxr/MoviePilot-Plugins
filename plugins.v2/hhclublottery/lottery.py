@@ -1025,6 +1025,7 @@ class LotteryRunner:
                 "cost": self.cost,
                 "draws_target": self.options.draws,
                 "started_at": self.started_at,
+                "remaining": self.remaining_seconds(),
                 "mail_cleaned": self.mail_cleaned,
             }
 
@@ -1163,9 +1164,16 @@ class LotteryRunner:
             f"  🚀 净盈亏：{_signed(profit)}（{'+' if rate >= 0 else ''}{rate:.1f}%）",
             f"  💰 当前余额：{fmt(self.balance)} 憨豆",
             "━━━━━━━━━━━━━━━━━━━",
-            "🛑 已按设置停止本轮抽奖" if will_stop else "🌟 后台持续挂机抽奖中",
+            self.running_tail(will_stop),
         ])
         self.notify("🎉 HHCLUB 幸运大转盘｜命中大奖", body)
+
+    def running_tail(self, will_stop: bool = False) -> str:
+        """通知末行：还在跑的话，顺带说一句还能跑多久。"""
+        if will_stop:
+            return "🛑 已按设置停止本轮抽奖"
+        left = self.remaining_text()
+        return "🌟 后台持续挂机抽奖中" + (f" · 距定时结束还有 {left}" if left else "")
 
     def push_periodic_report(self):
         """定时战报：挂机长跑时按设定周期推送此次增量与累计总览。"""
@@ -1179,10 +1187,18 @@ class LotteryRunner:
         elapsed_minutes = max(1, round((time.time() - self.last_periodic_report_at) / 60))
         next_minutes = max(1, round(self.options.periodic_minutes))
 
+        # 下一次播报落在定时结束之后的话就别许这个愿了 —— 到点收工，那一条永远不会来
+        left = self.remaining_seconds()
+        tail = f"🌟 后台持续监控与抽奖中 · 下次播报约 {next_minutes} 分钟后"
+        if left is not None and left / 60 < next_minutes:
+            tail = (f"🌟 后台持续监控与抽奖中 · 还有 {format_duration(left * 1000)} "
+                    "到点收工，这是最后一次播报")
+
         body = "\n".join([
             "╭─ ⏰ 播报概览",
             f"│ 统计区间：近 {elapsed_minutes} 分钟",
             f"│ 持续运行：{format_duration((time.time() - self.started_at) * 1000)}",
+            *([f"│ 定时结束：还有 {self.remaining_text()}"] if self.deadline else []),
             f"╰─ 播报时间：{self.now_text()}",
             "━━━━━━━━━━━━━━━━━━━",
             "⚡ 此次播报增量",
@@ -1201,7 +1217,7 @@ class LotteryRunner:
             gain_line(self.total),
             f"  ✨ 净盈亏：{_signed(total_profit)}（{'+' if total_rate >= 0 else ''}{total_rate:.1f}%）",
             "━━━━━━━━━━━━━━━━━━━",
-            f"🌟 后台持续监控与抽奖中 · 下次播报约 {next_minutes} 分钟后",
+            tail,
         ])
         self.notify("📊 HHCLUB 幸运大转盘｜定时战报", body)
 
@@ -1225,6 +1241,17 @@ class LotteryRunner:
             # 响应传输、记账和通知耗掉的时间也算在冷却里
             return max(250, gap - (time.time() - self.last_draw_sent_at) * 1000)
         return gap
+
+    def remaining_seconds(self) -> Optional[float]:
+        """离定时结束还有多久。没设就是 None —— 不能拿 0 顶替，
+        「还有 0 秒」和「不限时」在页面上是两码事。"""
+        if not self.deadline:
+            return None
+        return max(0.0, self.deadline - time.time())
+
+    def remaining_text(self) -> Optional[str]:
+        left = self.remaining_seconds()
+        return None if left is None else format_duration(left * 1000)
 
     def should_continue(self) -> bool:
         if self.stopping():
