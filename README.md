@@ -10,6 +10,7 @@ SAGIRIxr 的 [MoviePilot](https://github.com/jxxghp/MoviePilot) 第三方插件�
 |------|------|------|
 | NodeSeek签到 | [`plugins.v2/nodeseeksignin`](plugins.v2/nodeseeksignin) | NodeSeek 论坛自动签到：多账号 Cookie / 账密登录、随机签到、收益统计、通知。详见插件目录内 README。 |
 | Discord消息转发 | [`plugins.v2/discordmsgforward`](plugins.v2/discordmsgforward) | 将 Discord 频道新消息按规则转发到指定通知渠道：Vue 卡片式规则管理，每条规则独立配置频道、渠道、过滤、模板与免打扰时段。详见插件目录内 README。 |
+| HHCLUB幸运大转盘 | [`plugins.v2/hhclublottery`](plugins.v2/hhclublottery) | hhanclub 幸运大转盘自动抽奖：Cookie 支持手填 / CookieCloud / 站点管理三种来源，自适应延迟、VIP 折算、站内信清理与战绩统计。详见插件目录内 README。 |
 
 ## 安装
 
@@ -28,7 +29,9 @@ MoviePilot-Plugins/
 ├── plugins/                # V1 插件目录（暂空）
 ├── plugins.v2/             # V2 插件目录
 │   ├── nodeseeksignin/     # NodeSeek 签到
-│   └── discordmsgforward/  # Discord 消息转发
+│   ├── discordmsgforward/  # Discord 消息转发
+│   └── hhclublottery/      # HHCLUB 幸运大转盘
+├── tests/                  # 插件单测（tests/v2/<插件ID>/，pytest -m v2）
 ├── icons/                  # 插件图标资源（沿用官方，可复用）
 ├── docs/                   # 官方插件开发文档（保留供参考）
 ├── package.json            # V1 插件索引（暂空）

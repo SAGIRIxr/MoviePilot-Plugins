@@ -1,0 +1,832 @@
+# -*- coding: utf-8 -*-
+import threading
+import time
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app.core.config import settings
+from app.core.event import eventmanager, Event
+from app.log import logger
+from app.plugins import _PluginBase
+from app.schemas import NotificationType
+from app.schemas.types import EventType
+
+from .lottery import (
+    CookieInvalid,
+    LotteryOptions,
+    LotteryRunner,
+    PRIZE_META,
+    backup_payload,
+    empty_stats,
+    fmt,
+    format_duration,
+    normalize_stats,
+    profit_of,
+    swapped_beans_total,
+    tidy_stats,
+)
+
+# HH 登录态的关键 Cookie，少了就是没登录
+REQUIRED_COOKIE_KEYS = ("c_secure_uid", "c_secure_pass")
+
+
+def _load_cookiecloud_helper():
+    """CookieCloud 的模块路径在 MoviePilot 各版本间搬过家，挨个试。
+
+    v2 在 app.helper.cookiecloud，更早在 app.modules.cookiecloud.cookiecloud，
+    新版重构后到了 app.adapters.external.cookiecloud。取不到就返回 None，
+    由调用方给出「当前版本没有 CookieCloud」的明确提示，而不是抛一个 ImportError。
+    """
+    for module_path in ("app.helper.cookiecloud",
+                        "app.modules.cookiecloud.cookiecloud",
+                        "app.adapters.external.cookiecloud"):
+        try:
+            module = __import__(module_path, fromlist=["CookieCloudHelper"])
+            helper = getattr(module, "CookieCloudHelper", None)
+            if helper:
+                return helper
+        except Exception:
+            continue
+    return None
+
+
+def _load_site_oper():
+    """MoviePilot 站点管理里的 Cookie（它自己也会定时用 CookieCloud 刷新）。"""
+    for module_path in ("app.db.site_oper", "app.db.siteoper"):
+        try:
+            module = __import__(module_path, fromlist=["SiteOper"])
+            oper = getattr(module, "SiteOper", None)
+            if oper:
+                return oper
+        except Exception:
+            continue
+    return None
+
+
+def _short_domain(host: str) -> str:
+    """把用户填的 host 收成 CookieCloud / 站点库里用的域名 key（末两级）。"""
+    text = (host or "").strip().lower()
+    text = text.split("://")[-1].split("/")[0].split("?")[0].split("@")[-1].split(":")[0]
+    parts = [p for p in text.split(".") if p]
+    if len(parts) <= 2:
+        return ".".join(parts)
+    # 二级后缀（com.cn / co.uk 之类）要多留一级
+    if parts[-2] in ("com", "net", "org", "gov", "edu", "co") and len(parts[-1]) == 2:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+class HHClubLottery(_PluginBase):
+    # 插件名称
+    plugin_name = "HHCLUB幸运大转盘"
+    # 插件描述
+    plugin_desc = "hhanclub 幸运大转盘自动抽奖：Cookie 可手填或从 CookieCloud / 站点管理取，自适应延迟、VIP 折算、站内信清理与战绩统计。"
+    # 插件图标
+    plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
+    # 插件版本
+    plugin_version = "1.0.0"
+    # 插件作者
+    plugin_author = "SAGIRIxr"
+    # 作者主页
+    author_url = "https://github.com/SAGIRIxr"
+    # 插件配置项ID前缀
+    plugin_config_prefix = "hhclublottery_"
+    # 加载顺序
+    plugin_order = 25
+    # 可使用的用户级别
+    auth_level = 2
+
+    # ---------------- 私有属性 ----------------
+    _enabled = False
+    _onlyonce = False
+    _notify = True
+    _cron = "5 9 * * *"
+
+    # Cookie 来源：manual / cookiecloud / site
+    _cookie_source = "manual"
+    _cookie = ""
+    _host = "hhanclub.net"
+
+    # 抽奖参数
+    _draws = 10
+    _reserve = 0
+    _interval = 6.8
+    _follow_duration = True
+    _duration_buffer = 0
+    _max_minutes = 60
+    _clean_mail = False
+
+    # 通知
+    _notify_big_prize = True
+    _big_prize_min_beans = 780000
+    _notify_periodic = False
+    _periodic_minutes = 30
+
+    # 其他
+    _use_proxy = False
+    _user_agent = ""
+    _history_days = 90
+
+    # 运行时
+    _scheduler: Optional[BackgroundScheduler] = None
+    _stop_event: Optional[threading.Event] = None
+    _running = False
+
+    def init_plugin(self, config: dict = None):
+        # 停止现有任务
+        self.stop_service()
+        self._stop_event = threading.Event()
+
+        if config:
+            self._enabled = config.get("enabled") or False
+            self._onlyonce = config.get("onlyonce") or False
+            self._notify = config.get("notify") if config.get("notify") is not None else True
+            self._cron = config.get("cron") or "5 9 * * *"
+
+            self._cookie_source = (config.get("cookie_source") or "manual").strip()
+            self._cookie = (config.get("cookie") or "").strip()
+            self._host = (config.get("host") or "hhanclub.net").strip()
+
+            self._draws = int(config.get("draws") or 0)
+            self._reserve = float(config.get("reserve") or 0)
+            self._interval = float(config.get("interval") or 6.8)
+            self._follow_duration = (config.get("follow_duration")
+                                     if config.get("follow_duration") is not None else True)
+            self._duration_buffer = int(config.get("duration_buffer") or 0)
+            self._max_minutes = float(config.get("max_minutes") or 60)
+            self._clean_mail = config.get("clean_mail") or False
+
+            self._notify_big_prize = (config.get("notify_big_prize")
+                                      if config.get("notify_big_prize") is not None else True)
+            self._big_prize_min_beans = float(config.get("big_prize_min_beans") or 0)
+            self._notify_periodic = config.get("notify_periodic") or False
+            self._periodic_minutes = float(config.get("periodic_minutes") or 0)
+
+            self._use_proxy = config.get("use_proxy") or False
+            self._user_agent = (config.get("user_agent") or "").strip()
+            self._history_days = int(config.get("history_days") or 90)
+
+        # 立即运行一次
+        if self._onlyonce:
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+            logger.info("HHCLUB幸运大转盘：立即运行一次")
+            self._scheduler.add_job(func=self.run_lottery, trigger="date",
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ))
+                                    + timedelta(seconds=3),
+                                    name="HHCLUB幸运大转盘")
+            self._onlyonce = False
+            self.__update_config()
+            if self._scheduler.get_jobs():
+                self._scheduler.print_jobs()
+                self._scheduler.start()
+
+    def __update_config(self):
+        """把当前配置写回（主要用于复位 onlyonce）。"""
+        self.update_config({
+            "enabled": self._enabled,
+            "onlyonce": self._onlyonce,
+            "notify": self._notify,
+            "cron": self._cron,
+            "cookie_source": self._cookie_source,
+            "cookie": self._cookie,
+            "host": self._host,
+            "draws": self._draws,
+            "reserve": self._reserve,
+            "interval": self._interval,
+            "follow_duration": self._follow_duration,
+            "duration_buffer": self._duration_buffer,
+            "max_minutes": self._max_minutes,
+            "clean_mail": self._clean_mail,
+            "notify_big_prize": self._notify_big_prize,
+            "big_prize_min_beans": self._big_prize_min_beans,
+            "notify_periodic": self._notify_periodic,
+            "periodic_minutes": self._periodic_minutes,
+            "use_proxy": self._use_proxy,
+            "user_agent": self._user_agent,
+            "history_days": self._history_days,
+        })
+
+    # ---------------- Cookie 来源 ----------------
+
+    def __get_proxies(self) -> Optional[dict]:
+        if not self._use_proxy:
+            return None
+        try:
+            if getattr(settings, "PROXY", None):
+                return settings.PROXY
+        except Exception as err:
+            logger.error(f"获取代理设置出错：{err}")
+        return None
+
+    @staticmethod
+    def __pick_domain_cookie(contents: dict, domain: str) -> Tuple[str, str]:
+        """在 {域名: cookie} 里找我们要的那个站。返回 (cookie, 命中的 key)。
+
+        CookieCloud 那边用域名末两级做分组 key，正常就是 hhanclub.net；
+        万一用户填的是完整 URL 或带子域名，再做一轮宽松匹配。"""
+        if not contents:
+            return "", ""
+        if domain in contents:
+            return contents[domain], domain
+        for key, value in contents.items():
+            key_lower = str(key).lower().lstrip(".")
+            if key_lower == domain or key_lower.endswith("." + domain) or domain.endswith("." + key_lower):
+                return value, key
+        return "", ""
+
+    def __cookie_from_cookiecloud(self, domain: str) -> Tuple[str, str]:
+        helper_cls = _load_cookiecloud_helper()
+        if not helper_cls:
+            return "", "当前 MoviePilot 版本里没找到 CookieCloud 模块，请改用手动填写"
+        try:
+            contents, msg = helper_cls().download()
+        except Exception as err:
+            return "", f"CookieCloud 同步出错：{err}"
+        if not contents:
+            return "", f"CookieCloud 没返回数据：{msg or '请检查 MoviePilot 设定里的 CookieCloud 配置'}"
+
+        cookie, hit = self.__pick_domain_cookie(contents, domain)
+        if not cookie:
+            # 把拿到的域名列一部分出来，用户一眼就能看出是不是同步了别的域名
+            sample = "、".join(list(contents.keys())[:12])
+            return "", (f"CookieCloud 里没有 {domain} 的 Cookie（共 {len(contents)} 个站点："
+                        f"{sample}{'…' if len(contents) > 12 else ''}）。"
+                        "请确认浏览器插件同步范围包含该站，且最近登录过")
+        return cookie, f"CookieCloud（{hit}）"
+
+    def __cookie_from_site(self, domain: str) -> Tuple[str, str]:
+        oper_cls = _load_site_oper()
+        if not oper_cls:
+            return "", "当前 MoviePilot 版本里没找到站点管理模块，请改用手动填写"
+        try:
+            site = oper_cls().get_by_domain(domain)
+        except Exception as err:
+            return "", f"读取站点 Cookie 出错：{err}"
+        if not site or not getattr(site, "cookie", None):
+            return "", f"MoviePilot 站点管理里没有 {domain}，或该站点没有 Cookie"
+        return site.cookie, f"MoviePilot 站点（{getattr(site, 'name', domain)}）"
+
+    def __resolve_cookie(self) -> Tuple[str, str]:
+        """返回 (cookie, 来源说明或失败原因)。cookie 为空时第二项就是错误信息。"""
+        domain = _short_domain(self._host)
+
+        if self._cookie_source == "cookiecloud":
+            cookie, note = self.__cookie_from_cookiecloud(domain)
+        elif self._cookie_source == "site":
+            cookie, note = self.__cookie_from_site(domain)
+        else:
+            cookie, note = self._cookie, "手动填写"
+            if not cookie:
+                note = "没有填写 Cookie"
+
+        cookie = (cookie or "").strip()
+        if not cookie:
+            return "", note
+
+        # 少了这两个就是没登录态，早点说清楚比跑到一半被踢回登录页强
+        missing = [key for key in REQUIRED_COOKIE_KEYS if key not in cookie]
+        if missing:
+            logger.warning(f"取到的 Cookie 里缺少 {'、'.join(missing)}，"
+                           "多半不是已登录状态，抽奖大概率会失败")
+        return cookie, note
+
+    # ---------------- 主流程 ----------------
+
+    def run_lottery(self):
+        """跑一轮抽奖。定时服务、立即运行、远程命令和插件 API 都走这里。"""
+        if self._running:
+            logger.warning("上一轮抽奖还在跑，本次跳过")
+            return
+        if self._stop_event is None:
+            self._stop_event = threading.Event()
+        self._stop_event.clear()
+        self._running = True
+
+        try:
+            cookie, note = self.__resolve_cookie()
+            if not cookie:
+                logger.error(f"取不到 Cookie：{note}")
+                if self._notify:
+                    self.post_message(mtype=NotificationType.SiteMessage,
+                                      title="【HHCLUB 幸运大转盘】",
+                                      text=f"❌ 取不到 Cookie，本次未执行\n{note}")
+                return
+            logger.info(f"Cookie 来源：{note}")
+
+            options = LotteryOptions(
+                host=self._host,
+                user_agent=self._user_agent or None,
+                draws=self._draws,
+                reserve=self._reserve,
+                interval=self._interval,
+                follow_duration=self._follow_duration,
+                duration_buffer_ms=self._duration_buffer,
+                max_minutes=self._max_minutes,
+                clean_mail=self._clean_mail,
+                notify_big_prize=self._notify_big_prize and self._notify,
+                big_prize_min_beans=self._big_prize_min_beans,
+                notify_periodic=self._notify_periodic and self._notify,
+                periodic_minutes=self._periodic_minutes,
+                proxies=self.__get_proxies(),
+                tz=pytz.timezone(settings.TZ),
+            )
+
+            runner = LotteryRunner(
+                options=options,
+                cookie=cookie,
+                total=self.get_data("total"),
+                log=logger.info,
+                notify=self.__push,
+                stop_event=self._stop_event,
+            )
+
+            mode = ("一抽到底" if options.draws == 0
+                    else f"抽 {fmt(options.draws)} 次")
+            pace = ("自适应延迟 · 缓冲 %dms" % options.duration_buffer_ms
+                    if options.follow_duration else f"固定间隔 {options.interval} 秒")
+            logger.info(f"🎡 HHCLUB 幸运大转盘 · {mode} · {pace}")
+
+            status_text = "正常结束"
+            try:
+                runner.run()
+                if runner.stop_reason:
+                    status_text = runner.stop_reason
+            except CookieInvalid as err:
+                status_text = f"Cookie 失效（{err}）"
+                logger.error(status_text)
+            except Exception as err:
+                status_text = f"运行异常（{err}）"
+                logger.error(f"抽奖过程出错：{err}", exc_info=True)
+
+            # 先落盘再清信 —— 清信可能上百个请求，卡在那儿被打断的话成绩不能跟着丢
+            self.save_data("total", tidy_stats(runner.total))
+            self.__save_history(runner, status_text)
+
+            if self._clean_mail and not self._stop_event.is_set():
+                runner.clean_mailbox()
+
+            logger.info("\n" + runner.summary_notice(status_text))
+            if self._notify:
+                self.post_message(mtype=NotificationType.SiteMessage,
+                                  title="🎡 HHCLUB 幸运大转盘｜任务结算",
+                                  text=runner.summary_notice(status_text))
+        finally:
+            self._running = False
+
+    def __push(self, title: str, text: str):
+        self.post_message(mtype=NotificationType.SiteMessage, title=title, text=text)
+
+    def __save_history(self, runner: LotteryRunner, status_text: str):
+        """一次运行记一条。抽了 0 次也记 —— Cookie 失效这种情况正需要在页面上看见。"""
+        profit, rate = profit_of(runner.current)
+        history = self.get_data("history") or []
+        if not isinstance(history, list):
+            history = [history]
+
+        history.append(tidy_stats({
+            "date": datetime.now(pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S"),
+            "draws": runner.current["draws"],
+            "cost": runner.current["cost"],
+            "beans": runner.current["gains"]["beans"],
+            "swapped": swapped_beans_total(runner.current),
+            "profit": profit,
+            "rate": round(rate, 1),
+            "balance": runner.balance,
+            "mail_cleaned": runner.mail_cleaned,
+            "duration": format_duration((time.time() - runner.started_at) * 1000),
+            "status": status_text,
+        }))
+
+        expired = time.time() - int(self._history_days or 90) * 86400
+        cleaned = []
+        for record in history:
+            try:
+                if datetime.strptime(record["date"], "%Y-%m-%d %H:%M:%S").timestamp() >= expired:
+                    cleaned.append(record)
+            except Exception:
+                logger.debug(f"忽略格式异常的运行记录：{record}")
+        self.save_data("history", cleaned)
+
+    # ---------------- MoviePilot 接口 ----------------
+
+    def get_state(self) -> bool:
+        return self._enabled
+
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
+        return [{
+            "cmd": "/hh_lottery",
+            "event": EventType.PluginAction,
+            "desc": "HHCLUB 幸运大转盘抽奖",
+            "category": "站点",
+            "data": {"action": "hh_lottery"},
+        }]
+
+    @eventmanager.register(EventType.PluginAction)
+    def remote_run(self, event: Event):
+        if not event:
+            return
+        event_data = event.event_data or {}
+        if event_data.get("action") != "hh_lottery":
+            return
+        logger.info("收到远程命令，开始抽奖")
+        self.run_lottery()
+
+    def get_api(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "path": "/export",
+                "endpoint": self.api_export,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "导出统计备份",
+                "description": "导出油猴版面板可直接导入的 v4 备份 JSON",
+            },
+            {
+                "path": "/run",
+                "endpoint": self.api_run,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "立即抽一轮",
+                "description": "后台触发一轮抽奖，立即返回",
+            },
+        ]
+
+    def api_export(self) -> dict:
+        """油猴版「📥 导入备份」认这个格式，选「合并」就能把 MP 上的战绩带回浏览器。"""
+        total = normalize_stats(self.get_data("total"))
+        return backup_payload(empty_stats(), total)
+
+    def api_run(self) -> dict:
+        if self._running:
+            return {"code": 1, "message": "上一轮还在跑"}
+        threading.Thread(target=self.run_lottery, daemon=True).start()
+        return {"code": 0, "message": "已在后台开始抽奖"}
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        if self._enabled and self._cron:
+            return [{
+                "id": "HHClubLottery",
+                "name": "HHCLUB幸运大转盘",
+                "trigger": CronTrigger.from_crontab(self._cron),
+                "func": self.run_lottery,
+                "kwargs": {},
+            }]
+        return []
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        version = getattr(settings, "VERSION_FLAG", "v1")
+        cron_field = "VCronField" if version == "v2" else "VTextField"
+
+        def card(icon: str, color: str, title: str, rows: List[dict]) -> dict:
+            return {
+                "component": "VCard",
+                "props": {"class": "mt-3"},
+                "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center"}, "content": [
+                        {"component": "VIcon", "props": {"color": color, "class": "mr-2"}, "text": icon},
+                        {"component": "span", "text": title},
+                    ]},
+                    {"component": "VDivider"},
+                    {"component": "VCardText", "content": rows},
+                ],
+            }
+
+        def col(md: int, component: dict) -> dict:
+            return {"component": "VCol", "props": {"cols": 12, "md": md}, "content": [component]}
+
+        return [
+            {
+                "component": "VForm",
+                "content": [
+                    card("mdi-cog", "info", "基础设置", [
+                        {"component": "VRow", "content": [
+                            col(3, {"component": "VSwitch", "props": {
+                                "model": "enabled", "label": "启用插件", "color": "primary"}}),
+                            col(3, {"component": "VSwitch", "props": {
+                                "model": "notify", "label": "开启通知", "color": "info"}}),
+                            col(3, {"component": "VSwitch", "props": {
+                                "model": "onlyonce", "label": "立即运行一次", "color": "success"}}),
+                            col(3, {"component": cron_field, "props": {
+                                "model": "cron", "label": "抽奖周期", "placeholder": "5 9 * * *",
+                                "prepend-inner-icon": "mdi-clock-outline"}}),
+                        ]},
+                    ]),
+
+                    card("mdi-cookie", "warning", "Cookie 来源", [
+                        {"component": "VRow", "content": [
+                            col(4, {"component": "VSelect", "props": {
+                                "model": "cookie_source", "label": "Cookie 来源",
+                                "items": [
+                                    {"title": "手动填写", "value": "manual"},
+                                    {"title": "CookieCloud（用 MoviePilot 设定里的配置）", "value": "cookiecloud"},
+                                    {"title": "MoviePilot 站点管理", "value": "site"},
+                                ]}}),
+                            col(4, {"component": "VTextField", "props": {
+                                "model": "host", "label": "站点域名", "placeholder": "hhanclub.net",
+                                "hint": "同时作为 CookieCloud / 站点管理里的匹配域名",
+                                "persistent-hint": True}}),
+                        ]},
+                        {"component": "VRow", "content": [
+                            {"component": "VCol", "props": {"cols": 12}, "content": [
+                                {"component": "VTextarea", "props": {
+                                    "model": "cookie", "label": "Cookie（来源选「手动填写」时必填）",
+                                    "rows": 3, "auto-grow": True,
+                                    "placeholder": "c_secure_uid=...; c_secure_pass=...; c_secure_ssl=...; "
+                                                   "c_secure_tracker_ssl=...; c_secure_login=...",
+                                    "hint": "浏览器登录站点 → F12 → Network → 任一请求的请求头里 Cookie 整行复制",
+                                    "persistent-hint": True}},
+                            ]},
+                        ]},
+                    ]),
+
+                    card("mdi-slot-machine", "primary", "抽奖设置", [
+                        {"component": "VRow", "content": [
+                            col(3, {"component": "VTextField", "props": {
+                                "model": "draws", "label": "每次抽多少次", "type": "number",
+                                "placeholder": "10",
+                                "hint": "填 0 = 一抽到底", "persistent-hint": True}}),
+                            col(3, {"component": "VTextField", "props": {
+                                "model": "reserve", "label": "保留憨豆", "type": "number",
+                                "hint": "一抽到底时留多少不动", "persistent-hint": True}}),
+                            col(3, {"component": "VTextField", "props": {
+                                "model": "max_minutes", "label": "单次运行上限(分钟)", "type": "number",
+                                "hint": "防止一抽到底把任务挂死", "persistent-hint": True}}),
+                            col(3, {"component": "VSwitch", "props": {
+                                "model": "clean_mail", "label": "清理抽奖站内信", "color": "warning",
+                                "hint": "只删主题带「幸运大转盘」的", "persistent-hint": True}}),
+                        ]},
+                        {"component": "VRow", "content": [
+                            col(4, {"component": "VSwitch", "props": {
+                                "model": "follow_duration", "label": "自适应延迟（推荐）", "color": "success",
+                                "hint": "按上一抽返回的转盘时长排队，开启后固定间隔不参与",
+                                "persistent-hint": True}}),
+                            col(4, {"component": "VTextField", "props": {
+                                "model": "duration_buffer", "label": "自适应缓冲(ms)", "type": "number",
+                                "hint": "-500 ~ 5000，负值更贴边", "persistent-hint": True}}),
+                            col(4, {"component": "VTextField", "props": {
+                                "model": "interval", "label": "固定间隔(秒)", "type": "number",
+                                "hint": "仅在关闭自适应时生效，最小 3 秒", "persistent-hint": True}}),
+                        ]},
+                    ]),
+
+                    card("mdi-bell-ring", "success", "通知设置", [
+                        {"component": "VRow", "content": [
+                            col(3, {"component": "VSwitch", "props": {
+                                "model": "notify_big_prize", "label": "中大奖即时推送", "color": "success"}}),
+                            col(3, {"component": "VTextField", "props": {
+                                "model": "big_prize_min_beans", "label": "大奖门槛(憨豆)", "type": "number",
+                                "hint": "填 0 则只有 VIP 才推", "persistent-hint": True}}),
+                            col(3, {"component": "VSwitch", "props": {
+                                "model": "notify_periodic", "label": "定时战报", "color": "info",
+                                "hint": "长跑时中途也播报一次", "persistent-hint": True}}),
+                            col(3, {"component": "VTextField", "props": {
+                                "model": "periodic_minutes", "label": "战报间隔(分钟)", "type": "number",
+                                "hint": "别填得比运行上限还大", "persistent-hint": True}}),
+                        ]},
+                    ]),
+
+                    card("mdi-tune", "grey", "其他", [
+                        {"component": "VRow", "content": [
+                            col(3, {"component": "VSwitch", "props": {
+                                "model": "use_proxy", "label": "使用系统代理", "color": "warning"}}),
+                            col(3, {"component": "VTextField", "props": {
+                                "model": "history_days", "label": "运行记录保留(天)", "type": "number"}}),
+                            col(6, {"component": "VTextField", "props": {
+                                "model": "user_agent", "label": "User-Agent（留空用默认 Chrome）"}}),
+                        ]},
+                    ]),
+
+                    card("mdi-information", "info", "说明", [
+                        {"component": "VAlert", "props": {
+                            "type": "warning", "variant": "tonal", "class": "mb-2",
+                            "text": "【CookieCloud】选它就用 MoviePilot「设定 → 站点 → CookieCloud」里已配好的服务器/KEY/密码，"
+                                    "插件不再单独填一遍。前提是浏览器端的 CookieCloud 插件同步范围包含本站，"
+                                    "且最近在浏览器里登录过 —— 站点 Cookie 缺 c_secure_uid / c_secure_pass 就是没登录态。"}},
+                        {"component": "VAlert", "props": {
+                            "type": "info", "variant": "tonal", "class": "mb-2",
+                            "text": "【自适应延迟】站点的冷却窗口就等于上一抽返回的转盘时长（实测 3976~7666ms 随机），"
+                                    "任何固定间隔都躲不掉「不要重复点击」。开着自适应时手填的固定间隔完全不参与；"
+                                    "被挡回不扣憨豆，脚本会在 300ms 后补一枪。"}},
+                        {"component": "VAlert", "props": {
+                            "type": "success", "variant": "tonal", "class": "mb-2",
+                            "text": "【VIP 折算】站点写明「已是 VIP 或以上等级时中 VIP 改发憨豆」。中到 VIP 会回服务端核余额 + 查等级，"
+                                    "确认折算后这一注仍计为一次 VIP 中奖，只把收益记成憨豆，爆率统计和盈亏两头都不错。"}},
+                        {"component": "VAlert", "props": {
+                            "type": "info", "variant": "tonal", "class": "mb-2",
+                            "text": "【统计互通】数据页的战绩可通过插件 API /api/v1/plugin/HHClubLottery/export?apikey=xxx 导出，"
+                                    "格式与油猴版备份一致，在 lucky.php 面板上点「📥 导入备份」选「合并」即可带回浏览器。"}},
+                        {"component": "VAlert", "props": {
+                            "type": "error", "variant": "tonal",
+                            "text": "抽奖花的是真憨豆。插件只调用站点自身接口、不做任何数据篡改，"
+                                    "请自行控制抽奖频率，后果自负。"}},
+                    ]),
+                ],
+            }
+        ], {
+            "enabled": False,
+            "onlyonce": False,
+            "notify": True,
+            "cron": "5 9 * * *",
+            "cookie_source": "manual",
+            "cookie": "",
+            "host": "hhanclub.net",
+            "draws": 10,
+            "reserve": 0,
+            "interval": 6.8,
+            "follow_duration": True,
+            "duration_buffer": 0,
+            "max_minutes": 60,
+            "clean_mail": False,
+            "notify_big_prize": True,
+            "big_prize_min_beans": 780000,
+            "notify_periodic": False,
+            "periodic_minutes": 30,
+            "use_proxy": False,
+            "user_agent": "",
+            "history_days": 90,
+        }
+
+    # ---------------- 数据页 ----------------
+
+    def get_page(self) -> List[dict]:
+        total = normalize_stats(self.get_data("total"))
+        history = self.get_data("history") or []
+        if not isinstance(history, list):
+            history = [history]
+
+        if not total["draws"] and not history:
+            return [{
+                "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
+                "content": [{"component": "VCardItem", "props": {"class": "pa-6"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "primary", "class": "mr-3"},
+                          "text": "mdi-database-remove"},
+                         {"component": "span", "text": "暂无抽奖记录"},
+                     ]},
+                ]}],
+            }]
+
+        history = sorted(history, key=lambda item: item.get("date") or "", reverse=True)
+        profit, rate = profit_of(total)
+        swapped = swapped_beans_total(total)
+        latest = history[0] if history else {}
+
+        def stat(label: str, value: str, color: str = "") -> dict:
+            return {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
+                {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+                 "text": label},
+                {"component": "div",
+                 "props": {"class": f"text-h6 {color}".strip()}, "text": value},
+            ]}
+
+        overview = {
+            "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
+            "content": [
+                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "primary", "class": "mr-3"},
+                          "text": "mdi-chart-box"},
+                         {"component": "span", "text": "历史总计"},
+                     ]},
+                ]},
+                {"component": "VCardText", "content": [
+                    {"component": "VRow", "content": [
+                        stat("累计抽奖", f"{fmt(total['draws'])} 抽"),
+                        stat("累计消耗", f"{fmt(total['cost'])} 憨豆"),
+                        stat("累计获得",
+                             f"{fmt(total['gains']['beans'])} 憨豆"
+                             + (f"（含折算 {fmt(swapped)}）" if swapped else "")),
+                        stat("净盈亏",
+                             f"{'+' if profit >= 0 else ''}{fmt(profit)}"
+                             f"（{'+' if rate >= 0 else ''}{rate:.1f}%）",
+                             "text-success" if profit >= 0 else "text-error"),
+                    ]},
+                    {"component": "VRow", "content": [
+                        stat("最近运行", str(latest.get("date") or "—")),
+                        stat("最近抽数", f"{fmt(latest.get('draws') or 0)} 抽"),
+                        stat("最近余额", f"{fmt(latest.get('balance') or 0)} 憨豆"),
+                        stat("最近状态", str(latest.get("status") or "—")),
+                    ]},
+                ]},
+            ],
+        }
+
+        prize_rows = []
+        for prize_type, bucket in sorted(total["prizes"].items(),
+                                         key=lambda item: item[1].get("count") or 0, reverse=True):
+            if not bucket.get("count"):
+                continue
+            meta = PRIZE_META.get(prize_type, PRIZE_META["unknown"])
+            unit = meta["unit"] or ("憨豆" if prize_type in ("beans", "magic") else "")
+            tiers = "、".join(
+                f"{label} × {fmt(count)}"
+                for label, count in sorted((bucket.get("tiers") or {}).items(),
+                                           key=lambda item: item[1], reverse=True))
+            amount = f"{fmt(bucket.get('value'))} {unit}".strip()
+            if bucket.get("swappedBeans"):
+                amount += f"（另折算 {fmt(bucket['swappedBeans'])} 憨豆）"
+            share = (bucket["count"] / total["draws"] * 100) if total["draws"] else 0
+            prize_rows.append({"component": "tr", "content": [
+                {"component": "td", "text": f"{meta['icon']} {meta['name']}"},
+                {"component": "td", "text": f"{fmt(bucket['count'])} 次"},
+                {"component": "td", "text": f"{share:.2f}%"},
+                {"component": "td", "text": amount},
+                {"component": "td", "text": tiers},
+            ]})
+
+        prize_card = {
+            "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
+            "content": [
+                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "warning", "class": "mr-3"},
+                          "text": "mdi-gift"},
+                         {"component": "span", "text": "奖项明细（历史总计）"},
+                     ]},
+                ]},
+                {"component": "VCardText", "content": [
+                    {"component": "VTable", "props": {"hover": True}, "content": [
+                        {"component": "thead", "content": [{"component": "tr", "content": [
+                            {"component": "th", "props": {"class": "text-start"}, "text": "奖项"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "次数"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "实测占比"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "累计"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "档位"},
+                        ]}]},
+                        {"component": "tbody", "content": prize_rows or [
+                            {"component": "tr", "content": [
+                                {"component": "td", "props": {"colspan": 5}, "text": "暂无奖品记录"}]}]},
+                    ]},
+                ]},
+            ],
+        }
+
+        run_rows = []
+        for record in history:
+            record_profit = record.get("profit") or 0
+            run_rows.append({"component": "tr", "content": [
+                {"component": "td", "text": str(record.get("date") or "")},
+                {"component": "td", "text": f"{fmt(record.get('draws') or 0)}"},
+                {"component": "td", "text": fmt(record.get("cost") or 0)},
+                {"component": "td", "text": fmt(record.get("beans") or 0)},
+                {"component": "td", "content": [{"component": "VChip", "props": {
+                    "color": "success" if record_profit >= 0 else "error",
+                    "size": "small", "variant": "tonal"},
+                    "text": f"{'+' if record_profit >= 0 else ''}{fmt(record_profit)}"
+                            f"（{record.get('rate', 0)}%）"}]},
+                {"component": "td", "text": fmt(record.get("balance") or 0)},
+                {"component": "td", "text": str(record.get("duration") or "")},
+                {"component": "td", "text": str(record.get("status") or "")},
+            ]})
+
+        run_card = {
+            "component": "VCard", "props": {"variant": "flat"},
+            "content": [
+                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "primary", "class": "mr-3"},
+                          "text": "mdi-history"},
+                         {"component": "span", "text": "运行记录"},
+                     ]},
+                ]},
+                {"component": "VCardText", "content": [
+                    {"component": "VTable", "props": {"hover": True}, "content": [
+                        {"component": "thead", "content": [{"component": "tr", "content": [
+                            {"component": "th", "props": {"class": "text-start"}, "text": "时间"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "抽数"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "消耗"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "获得憨豆"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "盈亏"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "结束余额"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "时长"},
+                            {"component": "th", "props": {"class": "text-start"}, "text": "状态"},
+                        ]}]},
+                        {"component": "tbody", "content": run_rows},
+                    ]},
+                ]},
+            ],
+        }
+
+        return [overview, prize_card, run_card]
+
+    def stop_service(self):
+        """停用插件：先让抽奖循环自己收工（成绩已在每轮结束时落盘），再收掉调度器。"""
+        try:
+            if self._stop_event:
+                self._stop_event.set()
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
+        except Exception as err:
+            logger.error(f"退出插件失败：{err}")

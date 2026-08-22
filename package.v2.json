@@ -47,5 +47,19 @@
       "v1.0.0": "首个版本：由 NodeSeek-Signin 脚本移植为 MoviePilot 插件。"
     },
     "labels": "签到"
+  },
+  "HHClubLottery": {
+    "version": "1.0.0",
+    "level": 2,
+    "name": "HHCLUB幸运大转盘",
+    "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png",
+    "description": "hhanclub 幸运大转盘自动抽奖：Cookie 可手填或从 CookieCloud / 站点管理取，自适应延迟、VIP 折算、站内信清理与战绩统计。",
+    "author": "SAGIRIxr",
+    "authorUrl": "https://github.com/SAGIRIxr",
+    "system_version": ">=2.12.0",
+    "history": {
+      "v1.0.0": "首个版本：由 HH-Automatic-lottery 命令行版移植为 MoviePilot 插件。Cookie 支持手动填写 / CookieCloud / 站点管理三种来源；按次数抽或一抽到底、按转盘时长自适应延迟、限流补枪与阶梯退避、VIP 折算按等级判定、抽奖站内信清理；战绩累计入数据页，并可通过插件 API 导出为油猴版可导入的备份。"
+    },
+    "labels": "站点"
   }
 }
