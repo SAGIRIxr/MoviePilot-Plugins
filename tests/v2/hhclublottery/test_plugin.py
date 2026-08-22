@@ -2016,3 +2016,79 @@ def test_current_balance_says_when_it_was_read(plugin):
     assert "💰 当前余额" in text and "5,530,655" in text
     assert "截至 2026-08-22 17:46:55" in text
     assert "最近余额" not in text
+
+
+# ============================================================
+# MP 这边自己记大奖名册
+# ============================================================
+
+def _run_and_get_roster(plugin, queue, **opts):
+    site = FakeSite()
+    site.balance = 5000000
+    site.user_class = "VIP"
+    site.draw_queue = queue
+    server, host = start_site(site)
+    try:
+        _configure(plugin, host, **opts)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+    return (plugin.get_data("total") or {}).get("jackpots") or []
+
+
+def test_big_beans_are_recorded(plugin, instant):
+    """在 MP 里中了 780,000，名册就该有 —— 之前只有油猴版会记，
+    在 MP 上中的大奖日志滚掉就再也找不回来了。"""
+    roster = _run_and_get_roster(plugin, [
+        win("憨豆 100", credit=100),
+        win("憨豆 780000", credit=780000),
+        win("补签卡 1"),
+    ], draws=3)
+
+    assert len(roster) == 1
+    assert roster[0]["text"] == "憨豆 780000"
+    assert roster[0]["at"] > 1700000000000, "时刻是毫秒"
+    assert set(roster[0]) == {"at", "text"}, "形状要和油猴版一致"
+
+
+def test_vip_is_recorded(plugin, instant):
+    roster = _run_and_get_roster(plugin, [win("VIP 7 Day(s)", credit=1000000)], draws=1)
+    assert len(roster) == 1
+    assert roster[0]["text"] == "VIP 7 Day(s)", "记的是原始文案，折算前"
+
+
+def test_small_prizes_are_not_recorded(plugin, instant):
+    """名册只收 VIP 和 780,000 以上的憨豆。"""
+    roster = _run_and_get_roster(plugin, [
+        win("憨豆 5000", credit=5000), win("憨豆 779999", credit=779999),
+        win("补签卡 1"), win("彩虹ID 7 Day(s)"),
+    ], draws=4)
+    assert roster == []
+
+
+def test_roster_口径_ignores_the_notification_threshold(plugin, instant):
+    """「大奖通知门槛」是可配的，有人调到 100 图个热闹。名册不能跟着走，
+    不然就成流水账了。"""
+    roster = _run_and_get_roster(plugin, [
+        win("憨豆 5000", credit=5000), win("憨豆 100", credit=100),
+    ], draws=2, big_prize_min_beans=100)
+    assert roster == [], "门槛调到 100 也不该往名册里塞"
+
+
+def test_roster_accumulates_across_rounds(plugin, instant):
+    """名册跟着 total 走，跨轮累积；新的在前。"""
+    _run_and_get_roster(plugin, [win("憨豆 780000", credit=780000)], draws=1)
+    roster = _run_and_get_roster(plugin, [win("VIP 7 Day(s)", credit=1000000)], draws=1)
+
+    assert len(roster) == 2
+    assert roster[0]["text"] == "VIP 7 Day(s)", "新的在前"
+    assert roster[1]["text"] == "憨豆 780000"
+    assert roster[0]["at"] >= roster[1]["at"]
+
+
+def test_roster_shows_up_on_the_page(plugin, instant):
+    _run_and_get_roster(plugin, [win("憨豆 780000", credit=780000)], draws=1)
+    text = str(plugin.get_page())
+    assert "大奖名册（中过 1 次，1 条有时间记录）" in text
+    assert "憨豆 780000" in text
+    assert "没有时间记录" not in text, "这条是 MP 自己记的，时刻齐全"

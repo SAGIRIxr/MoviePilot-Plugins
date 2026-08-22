@@ -680,3 +680,27 @@ def test_jackpot_roster_is_normalized():
     check("留的是最新的", over["jackpots"][0]["at"], 149)
 
     check_true("空名册不写进去", "jackpots" not in L.normalize_stats({"draws": 1, "jackpots": []}))
+
+
+def test_is_jackpot():
+    """名册的口径写死，不跟着可配的「大奖通知门槛」走。"""
+    check("VIP 算", L.is_jackpot({"type": "vip", "value": 7}), True)
+    check("780,000 算", L.is_jackpot({"type": "beans", "value": 780000}), True)
+    check("1,000,000 算", L.is_jackpot({"type": "beans", "value": 1000000}), True)
+    check("779,999 不算", L.is_jackpot({"type": "beans", "value": 779999}), False)
+    check("彩虹不算", L.is_jackpot({"type": "rainbow", "value": 7}), False)
+    check("补签卡不算", L.is_jackpot({"type": "makeup", "value": 1}), False)
+
+
+def test_push_jackpot():
+    stats = L.normalize_stats({"draws": 1})
+    check_true("空统计本来没有名册", "jackpots" not in stats)
+
+    L.push_jackpot(stats, "  憨豆 780000  ", at=1700000000000)
+    check("文案 trim 过", stats["jackpots"][0]["text"], "憨豆 780000")
+    check("形状和油猴版一致", set(stats["jackpots"][0]), {"at", "text"})
+
+    for i in range(150):
+        L.push_jackpot(stats, f"憨豆 780000 #{i}", at=1700000000001 + i)
+    check("封顶 100 条", len(stats["jackpots"]), 100)
+    check("留最新的", stats["jackpots"][0]["text"], "憨豆 780000 #149")

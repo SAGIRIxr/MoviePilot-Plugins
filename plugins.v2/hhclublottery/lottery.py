@@ -471,6 +471,27 @@ def jackpot_counts(stats: Dict) -> Tuple[int, int, int]:
     return vip + big_beans, vip, big_beans
 
 
+def is_jackpot(prize: Dict) -> bool:
+    """够不够格进大奖名册。
+
+    口径写死，不跟着「大奖通知门槛」走 —— 那个是可配的，有人调到 100
+    图个热闹，名册跟着走就成流水账了。名册和 jackpot_counts、停机开关
+    共用这一条：VIP，或 780,000 以上的憨豆。"""
+    return prize["type"] == "vip" or (prize["type"] == "beans"
+                                      and prize["value"] >= JACKPOT_BEANS)
+
+
+def push_jackpot(stats: Dict, prize_text: str, at: Optional[int] = None):
+    """记一条大奖。新的在前，封顶 jackpot_log_limit。
+
+    条目形状和油猴版一致（{at, text}，text 是原始中奖文案），两边的名册
+    合并时才对得上、去得了重。"""
+    roster = stats.setdefault("jackpots", [])
+    roster.insert(0, {"at": int(at if at is not None else time.time() * 1000),
+                      "text": str(prize_text).strip()})
+    del roster[RUNTIME["jackpot_log_limit"]:]
+
+
 def jackpot_parts(stats: Dict) -> List[str]:
     """本轮 / 历史里中过的大奖，逐档列出来。
 
@@ -957,9 +978,15 @@ class LotteryRunner:
         return f"站点返回了认不出的内容（HTTP {status}）"
 
     def record(self, prize_text: str, prize: Dict):
+        # 大奖顺手记进名册，和统计写在同一把锁里 —— 免得中间态里出现
+        # 「统计有、名册没有」
+        jackpot = is_jackpot(prize)
+        at = int(time.time() * 1000)
         with self._stats_lock:
             for stats in (self.current, self.total, self.interval_stats):
                 apply_prize(stats, prize_text, self.cost, prize)
+                if jackpot:
+                    push_jackpot(stats, prize_text, at)
 
     def set_origin_id(self, origin_id: str):
         """把记录线编号写进运行中那份统计。

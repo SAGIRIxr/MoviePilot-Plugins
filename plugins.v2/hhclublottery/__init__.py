@@ -121,7 +121,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.10.1"
+    plugin_version = "1.11.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1204,9 +1204,10 @@ class HHClubLottery(_PluginBase):
         """大奖名册。780,000 憨豆和 VIP 这两档几千抽才碰一次，日志滚掉就再也
         找不回来了。
 
-        名册里带时刻的那些是从油猴版备份合并进来的，MP 这边不产生；但「一共
-        中过几次」在 prizes 里一直是准的。两个数摆在一起，才看得出名册缺了
-        多少条 —— 只摆名册的话，中过 31 次却只显示 1 条，看着像丢了数据。"""
+        MP 这边中到大奖会当场记一条；油猴版备份里的名册合并进来时也带着时刻。
+        但「一共中过几次」在 prizes 里一直是准的，而名册是后来才有的功能 ——
+        两个数摆在一起，才看得出名册缺了多少条。只摆名册的话，中过 31 次却
+        只显示 1 条，看着像丢了数据。"""
         jackpots = [item for item in (total.get("jackpots") or []) if isinstance(item, dict)]
         total_hits, vip_hits, bean_hits = jackpot_counts(total)
         if not jackpots and not total_hits:
@@ -1222,9 +1223,9 @@ class HHClubLottery(_PluginBase):
         breakdown = (f"⭐ VIP {fmt(vip_hits)} 次 · "
                      f"💰 {fmt(JACKPOT_BEANS)} 以上憨豆 {fmt(bean_hits)} 次")
         if missing:
-            breakdown += (f" —— 其中 {fmt(missing)} 次没有时间记录："
-                          "名册只在油猴版面板上产生，MP 这边只能靠导入备份带过来，"
-                          "在此之前中的那些只剩次数。")
+            breakdown += (f" —— 其中 {fmt(missing)} 次没有时间记录：名册是后来才加的，"
+                          "在那之前中的只剩次数。之后 MP 这边中到会当场记一条，"
+                          "油猴版导入的备份也会带着时刻过来。")
 
         rows = []
         for item in jackpots[:100]:
