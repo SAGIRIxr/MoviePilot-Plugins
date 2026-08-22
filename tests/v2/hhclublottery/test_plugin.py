@@ -1034,3 +1034,26 @@ def test_round_trip(plugin):
     payload = plugin.build_backup()
     plugin.init_plugin(_import_config(payload))
     assert plugin.get_data("total")["draws"] == 100, "自己导出的自己导回来必须被拦"
+
+
+def test_stop_reason_names_who_stopped(plugin, monkeypatch):
+    """点按钮停和插件被停用都会 set 同一个 Event，运行记录上得分得开。"""
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(10)]
+    server, host = start_site(site)
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 2:
+            plugin.api_stop()
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=10)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    record = plugin.get_data("history")[0]
+    assert record["draws"] == 2
+    assert record["status"] == "手动停止（数据页按钮）"

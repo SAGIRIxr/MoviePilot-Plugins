@@ -115,7 +115,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -178,6 +178,9 @@ class HHClubLottery(_PluginBase):
     _running = False
     # 正在跑的那一轮，数据页拿它显示实时进度
     _runner: Optional[LotteryRunner] = None
+    # 是谁叫停的。「点了停止」和「插件被停用/重载」都会 set 同一个 Event，
+    # 但运行记录上写清楚是哪一种，回头看才有用
+    _stop_source: Optional[str] = None
 
     def init_plugin(self, config: dict = None):
         """MoviePilot 保存插件配置走的就是这里（同一个实例，不经过 stop_service）。
@@ -248,6 +251,7 @@ class HHClubLottery(_PluginBase):
             self._stop_current = False
             if self._running:
                 logger.info("收到「停止当前抽奖」，本轮收工 —— 已抽的成绩会照常落盘")
+                self._stop_source = "手动停止（配置页开关）"
                 self._stop_event.set()
             else:
                 logger.info("「停止当前抽奖」已复位 —— 当前没有正在跑的抽奖")
@@ -446,6 +450,7 @@ class HHClubLottery(_PluginBase):
         if self._stop_event is None:
             self._stop_event = threading.Event()
         self._stop_event.clear()
+        self._stop_source = None
         self._running = True
 
         try:
@@ -504,6 +509,9 @@ class HHClubLottery(_PluginBase):
                 runner.run()
                 if runner.stop_reason:
                     status_text = runner.stop_reason
+                # 被叫停的话，记清楚是谁叫的
+                if self._stop_event.is_set() and self._stop_source:
+                    status_text = self._stop_source
             except CookieInvalid as err:
                 status_text = f"Cookie 失效（{err}）"
                 logger.error(status_text)
@@ -634,6 +642,7 @@ class HHClubLottery(_PluginBase):
     def api_stop(self) -> dict:
         if not self._running:
             return {"code": 1, "message": "当前没有正在跑的抽奖"}
+        self._stop_source = "手动停止（数据页按钮）"
         if self._stop_event:
             self._stop_event.set()
         return {"code": 0, "message": "已通知收工，已抽的成绩会照常落盘"}
@@ -1123,6 +1132,7 @@ class HHClubLottery(_PluginBase):
         """停用 / 重载插件：让抽奖循环自己收工（成绩已在每轮结束时落盘），再收调度器。
 
         MoviePilot 只在禁用插件、重载插件、退出时走这里；保存配置不走。"""
+        self._stop_source = "插件停用 / 重载"
         if self._stop_event:
             self._stop_event.set()
         self.__shutdown_scheduler()
