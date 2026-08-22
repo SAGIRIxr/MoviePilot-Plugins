@@ -8,8 +8,9 @@
 
 ```
 hhclublottery/
-├── __init__.py    # 插件主体（HHClubLottery 类）：配置、调度、通知、数据页
-├── lottery.py     # 抽奖核心：站点交互 + 统计口径，不依赖 MoviePilot
+├── __init__.py       # 插件主体（HHClubLottery 类）：调度、Cookie、备份、数据页
+├── config_form.py    # 配置页的 Vuetify JSON（260 多行纯拼装，不碰 self）
+├── lottery.py        # 抽奖核心：站点交互 + 统计口径，不依赖 MoviePilot
 └── README.md
 ```
 
@@ -107,7 +108,7 @@ MoviePilot → 设定 → 插件 → 插件仓库，添加 `https://github.com/S
 | 接口 | 说明 |
 |------|------|
 | `GET /api/v1/plugin/HHClubLottery/export?apikey=xxx` | 导出统计备份，格式与油猴版一致 |
-| `GET /api/v1/plugin/HHClubLottery/run?apikey=xxx` | 后台触发一轮抽奖，立即返回（数据页的「开始抽奖」按钮走的就是它） |
+| `GET /api/v1/plugin/HHClubLottery/run?apikey=xxx` | 后台触发一轮抽奖，立即返回（数据页的「开始抽奖」按钮走的就是它）。插件未启用时拒绝 —— 「禁用」就该是「不会花憨豆」 |
 | `GET /api/v1/plugin/HHClubLottery/stop?apikey=xxx` | 让正在跑的那一轮收工，已抽的成绩照常落盘 |
 | `GET /api/v1/plugin/HHClubLottery/status?apikey=xxx` | 当前状态，无副作用（数据页「刷新」按钮点的就是它，也可供外部轮询） |
 

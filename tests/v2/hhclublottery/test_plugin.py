@@ -1821,3 +1821,65 @@ def test_one_round_writes_history_once(plugin, instant):
         stop_site(server)
     assert len(plugin.get_data("history")) == 1
     assert plugin.get_data("total")["draws"] == 3, "这一轮只该被计一次"
+
+
+# ============================================================
+# 本轮 review 带出来的
+# ============================================================
+
+def test_api_run_requires_enabled(plugin):
+    """「禁用」就该是「不会花憨豆」。定时服务本来就要 enabled 才注册，
+    数据页的开始按钮也按这个置灰 —— 接口再放行就前后不一致了。"""
+    plugin._enabled = False
+    result = plugin.api_run()
+    assert result["code"] == 1 and "未启用" in result["message"]
+    assert plugin._running is False
+
+    plugin._enabled = True
+    plugin._running = True          # 已经在跑，也该拦
+    assert plugin.api_run()["code"] == 1
+    plugin._running = False
+
+
+def test_status_card_is_honest_when_snapshot_fails(plugin):
+    """跑着但快照读不到时，别谎称「正在启动」—— 那会让人以为刚开始。"""
+    class Boom:
+        def stats_snapshot(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    _seed_total(plugin, draws=777)
+    plugin._running = True
+    plugin._runner = Boom()
+    try:
+        text = str(plugin.get_page())
+    finally:
+        plugin._running = False
+        plugin._runner = None
+
+    assert "这一下没读到进度" in text
+    assert "正在启动" not in text
+    assert "777 抽" in text, "读不到实时的就退回落盘那份，页面照样出得来"
+
+
+def test_action_notification_titles(plugin):
+    """通知标题原来是从「📥 备份导入」里按空格抠字，多一个空格就散架。"""
+    _seed_total(plugin, draws=100)
+    plugin.init_plugin(_config_for("hhanclub.net", notify=True, do_restore=True))
+    titles = [m.get("title") for m in plugin.messages]
+    assert "【HHCLUB 幸运大转盘】撤销上次清空" in titles
+
+    plugin.messages.clear()
+    plugin.init_plugin(_clear_config("all"))
+    assert "【HHCLUB 幸运大转盘】清空记录" in [m.get("title") for m in plugin.messages]
+
+
+def test_get_form_delegates_to_the_form_module(plugin, monkeypatch):
+    """配置页 260 多行纯 JSON 拼装、整个函数不碰 self，已经搬去 config_form.py。
+    get_form 只该是个转发 —— 别哪天又往里塞逻辑。
+
+    （不直接 import config_form 来比对：那样会拿 sys.modules 里当时的 settings
+    重新绑一遍，插件自己那份用的是加载时的桩，两边的 VERSION_FLAG 不一样。）
+    """
+    sentinel = ([{"component": "VForm", "content": []}], {"enabled": False})
+    monkeypatch.setattr(HH, "build_form", lambda: sentinel)
+    assert plugin.get_form() is sentinel
