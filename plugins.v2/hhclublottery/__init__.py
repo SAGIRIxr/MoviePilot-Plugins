@@ -19,6 +19,8 @@ from app.schemas.types import EventType
 
 from .lottery import (
     CookieInvalid,
+    _num,
+    first_number,
     detect_overlap,
     merge_stats,
     parse_backup,
@@ -115,7 +117,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -952,6 +954,273 @@ class HHClubLottery(_PluginBase):
             ]}],
         }
 
+    @staticmethod
+    def __bean_gain(prize_type: str, bucket: dict) -> float:
+        """这一类到底进账了多少憨豆。
+
+        只有憨豆类别本身的 value 是憨豆，别的类别单位是天 / 个 / GB，
+        换算不了也不该硬凑；唯一的例外是被折算成憨豆的那部分（目前只有 VIP）。
+        各类别的憨豆收益加起来必须等于 gains.beans。"""
+        value = _num(bucket.get("value")) if prize_type in ("beans", "magic") else 0
+        return value + _num(bucket.get("swappedBeans"))
+
+    @staticmethod
+    def __stat(label: str, value: str, color: str = "", hint: str = "",
+               cols: int = 6, md: int = 3) -> dict:
+        content = [
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
+             "text": label},
+            {"component": "div", "props": {"class": f"text-h6 {color}".strip()}, "text": value},
+        ]
+        if hint:
+            content.append({"component": "div",
+                            "props": {"class": "text-caption text-disabled"}, "text": hint})
+        return {"component": "VCol", "props": {"cols": cols, "md": md}, "content": content}
+
+    def __overview_card(self, total: dict, latest: dict) -> dict:
+        """憨豆盈亏摆在最显眼的地方 —— 抽奖说到底就是拿憨豆换憨豆，
+        「一共抽了多少次」远不如「平均每抽亏多少」有用。"""
+        draws = _num(total["draws"]) or 0
+        cost = _num(total["cost"])
+        beans = _num(total["gains"]["beans"])
+        swapped = swapped_beans_total(total)
+        profit, rate = profit_of(total)
+        per = (lambda value: fmt(round(value / draws, 1)) if draws else "—")
+
+        profit_color = "text-success" if profit >= 0 else "text-error"
+        # 回本率：每花 100 憨豆收回多少。和净盈亏率是同一件事的两种说法，
+        # 但「回本 105.8%」比「+5.8%」更直观
+        payback = f"{beans / cost * 100:.1f}%" if cost else "—"
+
+        rows = [
+            {"component": "VRow", "content": [
+                self.__stat("💸 累计消耗", f"{fmt(cost)}", "text-warning",
+                            f"每抽 {per(cost)}"),
+                self.__stat("🎁 累计获得", f"{fmt(beans)}", "text-info",
+                            (f"档位 {fmt(beans - swapped)} + 折算 {fmt(swapped)}"
+                             if swapped else f"每抽 {per(beans)}")),
+                self.__stat("🚀 净盈亏", f"{'+' if profit >= 0 else ''}{fmt(profit)}",
+                            profit_color,
+                            f"每抽 {'+' if profit >= 0 else ''}{per(profit)} 憨豆"),
+                self.__stat("📈 回本率", payback, profit_color,
+                            f"净盈亏率 {'+' if rate >= 0 else ''}{rate:.1f}%"),
+            ]},
+            {"component": "VDivider", "props": {"class": "my-3"}},
+            {"component": "VRow", "content": [
+                self.__stat("🎲 累计抽奖", f"{fmt(draws)} 抽"),
+                self.__stat("🕐 最近运行", str(latest.get("date") or "—"),
+                            hint=str(latest.get("status") or "")),
+                self.__stat("💰 最近余额", f"{fmt(latest.get('balance') or 0)}"),
+                self.__stat("⏱ 最近一轮", f"{fmt(latest.get('draws') or 0)} 抽",
+                            hint=str(latest.get("duration") or "")),
+            ]},
+        ]
+
+        return {
+            "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
+            "content": [
+                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "primary", "class": "mr-3"},
+                          "text": "mdi-chart-box"},
+                         {"component": "span", "text": "憨豆盈亏（历史总计）"},
+                     ]},
+                ]},
+                {"component": "VCardText", "content": rows},
+            ],
+        }
+
+    def __prize_card(self, total: dict) -> dict:
+        """奖项明细。档位从「挤在一个格子里用顿号拼」改成每档一行，
+        并给每一行算出它到底折合多少憨豆 —— 之前那一列混着天 / 个 / GB，
+        看不出哪一档才是真正在回血。"""
+        draws = _num(total["draws"]) or 0
+        rows = []
+
+        for prize_type, bucket in sorted(total["prizes"].items(),
+                                         key=lambda item: _num(item[1].get("count")),
+                                         reverse=True):
+            count = _num(bucket.get("count"))
+            if not count:
+                continue
+            meta = PRIZE_META.get(prize_type, PRIZE_META["unknown"])
+            unit = meta["unit"] or ("憨豆" if prize_type in ("beans", "magic") else "")
+            bean_gain = self.__bean_gain(prize_type, bucket)
+
+            amount = f"{fmt(bucket.get('value'))} {unit}".strip()
+            if _num(bucket.get("swappedBeans")):
+                amount = f"另折算 {fmt(bucket['swappedBeans'])} 憨豆" if not _num(
+                    bucket.get("value")) else f"{amount} + 折算 {fmt(bucket['swappedBeans'])}"
+
+            rows.append({"component": "tr", "props": {"class": "font-weight-medium"}, "content": [
+                {"component": "td", "text": f"{meta['icon']} {meta['name']}"},
+                {"component": "td", "text": f"{fmt(count)} 次"},
+                {"component": "td", "text": f"{count / draws * 100:.2f}%" if draws else "—"},
+                {"component": "td", "text": amount},
+                {"component": "td", "text": f"{fmt(bean_gain)}" if bean_gain else "—"},
+            ]})
+
+            # 档位子行。憨豆小计只对能折成憨豆的档位算 —— 档位标签本身就是
+            # 「金额 + 单位」，数字直接从里面取；天 / 个 / GB 这些留空不硬凑
+            for label, tier_count in sorted((bucket.get("tiers") or {}).items(),
+                                            key=lambda item: _num(item[1]), reverse=True):
+                tier_count = _num(tier_count)
+                tier_beans = ""
+                if bean_gain:
+                    each = first_number(label)
+                    if each is not None:
+                        tier_beans = fmt(each * tier_count)
+                rows.append({"component": "tr", "content": [
+                    {"component": "td", "props": {"class": "ps-8 text-medium-emphasis"},
+                     "text": f"└ {label}"},
+                    {"component": "td", "props": {"class": "text-medium-emphasis"},
+                     "text": f"{fmt(tier_count)} 次"},
+                    {"component": "td", "props": {"class": "text-medium-emphasis"},
+                     "text": f"{tier_count / draws * 100:.2f}%" if draws else "—"},
+                    {"component": "td", "text": ""},
+                    {"component": "td", "props": {"class": "text-medium-emphasis"},
+                     "text": tier_beans},
+                ]})
+
+        total_beans = sum(self.__bean_gain(t, b) for t, b in total["prizes"].items())
+        rows.append({"component": "tr", "props": {"class": "font-weight-bold"}, "content": [
+            {"component": "td", "text": "合计"},
+            {"component": "td", "text": f"{fmt(draws)} 抽"},
+            {"component": "td", "text": "100%"},
+            {"component": "td", "text": ""},
+            {"component": "td", "text": fmt(total_beans)},
+        ]})
+
+        return {
+            "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
+            "content": [
+                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "warning", "class": "mr-3"},
+                          "text": "mdi-gift"},
+                         {"component": "span", "text": "奖项明细"},
+                     ]},
+                ]},
+                {"component": "VCardText", "content": [
+                    {"component": "VTable", "props": {"hover": True, "density": "compact"},
+                     "content": [
+                         {"component": "thead", "content": [{"component": "tr", "content": [
+                             {"component": "th", "props": {"class": "text-start"}, "text": "奖项 / 档位"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "次数"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "实测占比"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "累计"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "折合憨豆"},
+                         ]}]},
+                         {"component": "tbody", "content": rows},
+                     ]},
+                    {"component": "div", "props": {"class": "text-caption text-disabled mt-2"},
+                     "text": "「折合憨豆」只算真进账的憨豆：彩虹ID / 补签卡 / 上传量的单位是天 / 个 / GB，"
+                             "换算不了也不硬凑；VIP 那一行是被站点折算成的憨豆。这一列合计等于「累计获得」。"},
+                ]},
+            ],
+        }
+
+    def __jackpot_card(self, total: dict) -> Optional[dict]:
+        """大奖名册。780,000 憨豆和 VIP 这两档几千抽才碰一次，日志滚掉就再也
+        找不回来了。名册是从油猴版备份合并进来的，这边不产生 —— 有才显示。"""
+        jackpots = [item for item in (total.get("jackpots") or []) if isinstance(item, dict)]
+        if not jackpots:
+            return None
+
+        rows = []
+        for item in jackpots[:100]:
+            at = item.get("at")
+            try:
+                when = datetime.fromtimestamp(at / 1000,
+                                              pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                when = "—"
+            rows.append({"component": "tr", "content": [
+                {"component": "td", "text": when},
+                {"component": "td", "text": str(item.get("text") or "")},
+            ]})
+
+        return {
+            "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
+            "content": [
+                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "amber", "class": "mr-3"},
+                          "text": "mdi-trophy"},
+                         {"component": "span", "text": f"大奖名册（{fmt(len(jackpots))} 条）"},
+                     ]},
+                ]},
+                {"component": "VCardText", "content": [
+                    {"component": "VTable", "props": {"hover": True, "density": "compact"},
+                     "content": [
+                         {"component": "thead", "content": [{"component": "tr", "content": [
+                             {"component": "th", "props": {"class": "text-start"}, "text": "时间"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "中的什么"},
+                         ]}]},
+                         {"component": "tbody", "content": rows},
+                     ]},
+                ]},
+            ],
+        }
+
+    def __run_card(self, history: List[dict]) -> dict:
+        rows = []
+        for record in history:
+            record_profit = _num(record.get("profit"))
+            record_draws = _num(record.get("draws"))
+            per = fmt(round(record_profit / record_draws, 1)) if record_draws else "—"
+            rows.append({"component": "tr", "content": [
+                {"component": "td", "text": str(record.get("date") or "")},
+                {"component": "td", "text": fmt(record_draws)},
+                {"component": "td", "text": fmt(record.get("cost") or 0)},
+                {"component": "td", "text": (
+                    f"{fmt(record.get('beans') or 0)}"
+                    + (f"（含折算 {fmt(record['swapped'])}）" if _num(record.get("swapped")) else ""))},
+                {"component": "td", "content": [{"component": "VChip", "props": {
+                    "color": "success" if record_profit >= 0 else "error",
+                    "size": "small", "variant": "tonal"},
+                    "text": f"{'+' if record_profit >= 0 else ''}{fmt(record_profit)}"
+                            f"（{record.get('rate', 0)}%）"}]},
+                {"component": "td", "text": f"{'+' if record_profit >= 0 else ''}{per}"},
+                {"component": "td", "text": fmt(record.get("balance") or 0)},
+                {"component": "td", "text": str(record.get("duration") or "")},
+                {"component": "td", "text": str(record.get("status") or "")},
+            ]})
+
+        return {
+            "component": "VCard", "props": {"variant": "flat"},
+            "content": [
+                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
+                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
+                     "content": [
+                         {"component": "VIcon", "props": {"color": "primary", "class": "mr-3"},
+                          "text": "mdi-history"},
+                         {"component": "span", "text": "运行记录"},
+                     ]},
+                ]},
+                {"component": "VCardText", "content": [
+                    {"component": "VTable", "props": {"hover": True, "density": "compact"},
+                     "content": [
+                         {"component": "thead", "content": [{"component": "tr", "content": [
+                             {"component": "th", "props": {"class": "text-start"}, "text": "时间"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "抽数"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "消耗"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "获得憨豆"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "盈亏"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "每抽盈亏"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "结束余额"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "时长"},
+                             {"component": "th", "props": {"class": "text-start"}, "text": "状态"},
+                         ]}]},
+                         {"component": "tbody", "content": rows},
+                     ]},
+                ]},
+            ],
+        }
+
     def get_page(self) -> List[dict]:
         total = normalize_stats(self.get_data("total"))
         history = self.get_data("history") or []
@@ -972,150 +1241,16 @@ class HHClubLottery(_PluginBase):
             }]
 
         history = sorted(history, key=lambda item: item.get("date") or "", reverse=True)
-        profit, rate = profit_of(total)
-        swapped = swapped_beans_total(total)
-        latest = history[0] if history else {}
-
-        def stat(label: str, value: str, color: str = "") -> dict:
-            return {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                {"component": "div", "props": {"class": "text-caption text-medium-emphasis"},
-                 "text": label},
-                {"component": "div",
-                 "props": {"class": f"text-h6 {color}".strip()}, "text": value},
-            ]}
-
-        overview = {
-            "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
-            "content": [
-                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
-                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
-                     "content": [
-                         {"component": "VIcon", "props": {"color": "primary", "class": "mr-3"},
-                          "text": "mdi-chart-box"},
-                         {"component": "span", "text": "历史总计"},
-                     ]},
-                ]},
-                {"component": "VCardText", "content": [
-                    {"component": "VRow", "content": [
-                        stat("累计抽奖", f"{fmt(total['draws'])} 抽"),
-                        stat("累计消耗", f"{fmt(total['cost'])} 憨豆"),
-                        stat("累计获得",
-                             f"{fmt(total['gains']['beans'])} 憨豆"
-                             + (f"（含折算 {fmt(swapped)}）" if swapped else "")),
-                        stat("净盈亏",
-                             f"{'+' if profit >= 0 else ''}{fmt(profit)}"
-                             f"（{'+' if rate >= 0 else ''}{rate:.1f}%）",
-                             "text-success" if profit >= 0 else "text-error"),
-                    ]},
-                    {"component": "VRow", "content": [
-                        stat("最近运行", str(latest.get("date") or "—")),
-                        stat("最近抽数", f"{fmt(latest.get('draws') or 0)} 抽"),
-                        stat("最近余额", f"{fmt(latest.get('balance') or 0)} 憨豆"),
-                        stat("最近状态", str(latest.get("status") or "—")),
-                    ]},
-                ]},
-            ],
-        }
-
-        prize_rows = []
-        for prize_type, bucket in sorted(total["prizes"].items(),
-                                         key=lambda item: item[1].get("count") or 0, reverse=True):
-            if not bucket.get("count"):
-                continue
-            meta = PRIZE_META.get(prize_type, PRIZE_META["unknown"])
-            unit = meta["unit"] or ("憨豆" if prize_type in ("beans", "magic") else "")
-            tiers = "、".join(
-                f"{label} × {fmt(count)}"
-                for label, count in sorted((bucket.get("tiers") or {}).items(),
-                                           key=lambda item: item[1], reverse=True))
-            amount = f"{fmt(bucket.get('value'))} {unit}".strip()
-            if bucket.get("swappedBeans"):
-                amount += f"（另折算 {fmt(bucket['swappedBeans'])} 憨豆）"
-            share = (bucket["count"] / total["draws"] * 100) if total["draws"] else 0
-            prize_rows.append({"component": "tr", "content": [
-                {"component": "td", "text": f"{meta['icon']} {meta['name']}"},
-                {"component": "td", "text": f"{fmt(bucket['count'])} 次"},
-                {"component": "td", "text": f"{share:.2f}%"},
-                {"component": "td", "text": amount},
-                {"component": "td", "text": tiers},
-            ]})
-
-        prize_card = {
-            "component": "VCard", "props": {"variant": "flat", "class": "mb-4"},
-            "content": [
-                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
-                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
-                     "content": [
-                         {"component": "VIcon", "props": {"color": "warning", "class": "mr-3"},
-                          "text": "mdi-gift"},
-                         {"component": "span", "text": "奖项明细（历史总计）"},
-                     ]},
-                ]},
-                {"component": "VCardText", "content": [
-                    {"component": "VTable", "props": {"hover": True}, "content": [
-                        {"component": "thead", "content": [{"component": "tr", "content": [
-                            {"component": "th", "props": {"class": "text-start"}, "text": "奖项"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "次数"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "实测占比"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "累计"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "档位"},
-                        ]}]},
-                        {"component": "tbody", "content": prize_rows or [
-                            {"component": "tr", "content": [
-                                {"component": "td", "props": {"colspan": 5}, "text": "暂无奖品记录"}]}]},
-                    ]},
-                ]},
-            ],
-        }
-
-        run_rows = []
-        for record in history:
-            record_profit = record.get("profit") or 0
-            run_rows.append({"component": "tr", "content": [
-                {"component": "td", "text": str(record.get("date") or "")},
-                {"component": "td", "text": f"{fmt(record.get('draws') or 0)}"},
-                {"component": "td", "text": fmt(record.get("cost") or 0)},
-                {"component": "td", "text": fmt(record.get("beans") or 0)},
-                {"component": "td", "content": [{"component": "VChip", "props": {
-                    "color": "success" if record_profit >= 0 else "error",
-                    "size": "small", "variant": "tonal"},
-                    "text": f"{'+' if record_profit >= 0 else ''}{fmt(record_profit)}"
-                            f"（{record.get('rate', 0)}%）"}]},
-                {"component": "td", "text": fmt(record.get("balance") or 0)},
-                {"component": "td", "text": str(record.get("duration") or "")},
-                {"component": "td", "text": str(record.get("status") or "")},
-            ]})
-
-        run_card = {
-            "component": "VCard", "props": {"variant": "flat"},
-            "content": [
-                {"component": "VCardItem", "props": {"class": "pa-4 pb-0"}, "content": [
-                    {"component": "VCardTitle", "props": {"class": "d-flex align-center text-h6"},
-                     "content": [
-                         {"component": "VIcon", "props": {"color": "primary", "class": "mr-3"},
-                          "text": "mdi-history"},
-                         {"component": "span", "text": "运行记录"},
-                     ]},
-                ]},
-                {"component": "VCardText", "content": [
-                    {"component": "VTable", "props": {"hover": True}, "content": [
-                        {"component": "thead", "content": [{"component": "tr", "content": [
-                            {"component": "th", "props": {"class": "text-start"}, "text": "时间"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "抽数"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "消耗"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "获得憨豆"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "盈亏"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "结束余额"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "时长"},
-                            {"component": "th", "props": {"class": "text-start"}, "text": "状态"},
-                        ]}]},
-                        {"component": "tbody", "content": run_rows},
-                    ]},
-                ]},
-            ],
-        }
-
-        return [self.__status_card(), overview, prize_card, run_card]
+        cards = [
+            self.__status_card(),
+            self.__overview_card(total, history[0] if history else {}),
+            self.__prize_card(total),
+        ]
+        jackpot = self.__jackpot_card(total)
+        if jackpot:
+            cards.append(jackpot)
+        cards.append(self.__run_card(history))
+        return cards
 
     def __shutdown_scheduler(self):
         """收掉「立即运行一次」那个一次性调度器。不碰抽奖循环。"""

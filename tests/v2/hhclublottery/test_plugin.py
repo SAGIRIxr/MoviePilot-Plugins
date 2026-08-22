@@ -283,9 +283,9 @@ def test_page_empty(plugin):
 
 def test_page_with_data(plugin):
     plugin.save_data("total", {
-        "draws": 100, "cost": 200000, "gains": {"beans": 150000, "rainbow": 14},
+        "draws": 100, "cost": 200000, "gains": {"beans": 1150000, "rainbow": 14},
         "prizes": {
-            "beans": {"count": 60, "value": 150000, "tiers": {"1,000 憨豆": 40, "5,000 憨豆": 20}},
+            "beans": {"count": 60, "value": 150000, "tiers": {"1,000 憨豆": 40, "5,000 憨豆": 22}},
             "vip": {"count": 1, "value": 0, "swappedBeans": 1000000,
                     "tiers": {"已转换为憨豆 1,000,000": 1}},
             "rainbow": {"count": 2, "value": 14, "tiers": {"7 天": 2}},
@@ -295,21 +295,96 @@ def test_page_with_data(plugin):
         {"date": "2026-08-20 09:05:00", "draws": 50, "cost": 100000, "beans": 70000,
          "profit": -30000, "rate": -30.0, "balance": 1200000, "duration": "6分 12秒",
          "status": "已达到设定抽奖次数（50 抽）"},
-        {"date": "2026-08-21 09:05:00", "draws": 50, "cost": 100000, "beans": 80000,
-         "profit": -20000, "rate": -20.0, "balance": 1100000, "duration": "6分 3秒",
-         "status": "正常结束"},
+        {"date": "2026-08-21 09:05:00", "draws": 50, "cost": 100000, "beans": 1080000,
+         "swapped": 1000000, "profit": 980000, "rate": 980.0, "balance": 2100000,
+         "duration": "6分 3秒", "status": "正常结束"},
     ])
     text = str(plugin.get_page())
 
-    assert "历史总计" in text and "奖项明细" in text and "运行记录" in text
-    assert "100 抽" in text
+    assert "憨豆盈亏（历史总计）" in text and "奖项明细" in text and "运行记录" in text
+
+    # 盈亏是这一页的主角
+    assert "+950,000" in text, "净盈亏 = 1,150,000 - 200,000"
+    assert "每抽 +9,500 憨豆" in text, "平均每抽赚多少才是真正有用的那个数"
+    assert "每抽 2,000" in text, "平均每抽消耗"
+    assert "575.0%" in text, "回本率 = 获得 / 消耗"
+
     # 折算来的憨豆要单独点出来，否则拿档位乘开对不上总数
-    assert "含折算 1,000,000" in text
-    assert "已转换为憨豆 1,000,000 × 1" in text
-    assert "60.00%" in text, "实测占比按 60/100 计"
-    # 最近一次应当是排序后的第一条
-    assert "2026-08-21 09:05:00" in text
-    assert text.index("2026-08-21") < text.index("2026-08-20")
+    assert "档位 150,000 + 折算 1,000,000" in text
+
+    # 档位是子行，不再是挤在一个格子里的顿号串
+    assert "└ 1,000 憨豆" in text and "└ 5,000 憨豆" in text and "└ 7 天" in text
+    assert "、" not in text, "档位不该再用顿号拼成一串"
+
+    # 实测占比：类别和档位都要有
+    assert "60.00%" in text and "40.00%" in text and "22.00%" in text
+
+    # 每抽盈亏也进运行记录
+    assert "+19,600" in text, "980,000 / 50"
+
+
+def test_page_bean_column_adds_up(plugin):
+    """「折合憨豆」这一列的合计必须等于累计获得 —— 对不上就说明哪一类算漏了。"""
+    plugin.save_data("total", {
+        "draws": 100, "cost": 200000, "gains": {"beans": 1150000, "rainbow": 14},
+        "prizes": {
+            "beans": {"count": 60, "value": 150000, "tiers": {"1,000 憨豆": 40, "5,000 憨豆": 22}},
+            "vip": {"count": 1, "value": 0, "swappedBeans": 1000000,
+                    "tiers": {"已转换为憨豆 1,000,000": 1}},
+            "rainbow": {"count": 2, "value": 14, "tiers": {"7 天": 2}},
+            "makeup": {"count": 37, "value": 37, "tiers": {"1 个": 37}},
+        },
+    })
+    gain = plugin._HHClubLottery__bean_gain
+    assert gain("beans", {"value": 150000}) == 150000
+    assert gain("vip", {"value": 0, "swappedBeans": 1000000}) == 1000000
+    # 天 / 个 / GB 换算不了，不硬凑
+    assert gain("rainbow", {"value": 14}) == 0
+    assert gain("makeup", {"value": 37}) == 0
+    assert gain("upload", {"value": 5950}) == 0
+
+    total = plugin.get_data("total")
+    assert sum(gain(t, b) for t, b in total["prizes"].items()) == total["gains"]["beans"]
+
+    text = str(plugin.get_page())
+    assert "1,150,000" in text, "表尾合计"
+    # 彩虹 / 补签卡那两行的折合憨豆是空的，不是 0 也不是瞎折算
+    assert "5,950" not in text
+
+
+def test_page_tier_bean_subtotal(plugin):
+    """档位的憨豆小计 = 档位金额 × 次数，加起来要等于这一类的 value。"""
+    plugin.save_data("total", {
+        "draws": 62, "cost": 124000, "gains": {"beans": 150000},
+        "prizes": {"beans": {"count": 62, "value": 150000,
+                             "tiers": {"1,000 憨豆": 40, "5,000 憨豆": 22}}},
+    })
+    text = str(plugin.get_page())
+    assert "40,000" in text, "1,000 × 40"
+    assert "110,000" in text, "5,000 × 22"
+    assert 40000 + 110000 == 150000
+
+
+def test_page_jackpot_roster(plugin):
+    """导进来的大奖名册要显示出来 —— 之前保留了却不展示，等于白留。"""
+    plugin.save_data("total", {
+        "draws": 10, "cost": 20000, "gains": {"beans": 5000},
+        "prizes": {"beans": {"count": 10, "value": 5000, "tiers": {"500 憨豆": 10}}},
+        "jackpots": [{"at": 1787370861410, "text": "VIP 7 Day(s)"},
+                     {"at": 1787300000000, "text": "憨豆 780000"}],
+    })
+    text = str(plugin.get_page())
+    assert "大奖名册（2 条）" in text
+    assert "VIP 7 Day(s)" in text and "憨豆 780000" in text
+    assert "2026-" in text, "时刻要渲染成人看得懂的时间"
+
+
+def test_page_without_jackpots_hides_the_card(plugin):
+    plugin.save_data("total", {
+        "draws": 10, "cost": 20000, "gains": {"beans": 5000},
+        "prizes": {"beans": {"count": 10, "value": 5000, "tiers": {"500 憨豆": 10}}},
+    })
+    assert "大奖名册" not in str(plugin.get_page()), "没有名册就别摆个空卡"
 
 
 def test_page_survives_legacy_magic_split(plugin):
