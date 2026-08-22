@@ -121,7 +121,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.10.0"
+    plugin_version = "1.10.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -999,7 +999,7 @@ class HHClubLottery(_PluginBase):
                             "props": {"class": "text-caption text-disabled"}, "text": hint})
         return {"component": "VCol", "props": {"cols": cols, "md": md}, "content": content}
 
-    def __overview_card(self, total: dict, latest: dict) -> dict:
+    def __overview_card(self, total: dict, latest: dict, live: Optional[dict] = None) -> dict:
         """憨豆盈亏摆在最显眼的地方 —— 抽奖说到底就是拿憨豆换憨豆，
         「一共抽了多少次」远不如「平均每抽亏多少」有用。"""
         draws = _num(total["draws"]) or 0
@@ -1032,7 +1032,12 @@ class HHClubLottery(_PluginBase):
                 self.__stat("🎲 累计抽奖", f"{fmt(draws)} 抽"),
                 self.__stat("🕐 最近运行", str(latest.get("date") or "—"),
                             hint=str(latest.get("status") or "")),
-                self.__stat("💰 最近余额", f"{fmt(latest.get('balance') or 0)}"),
+                # 跑着的时候拿运行中那份的实时余额；空闲时只能是上一轮收尾的读数，
+                # 所以副行注明截至什么时候 —— 做种收益一直在涨，不说清楚就是在骗人
+                self.__stat("💰 当前余额",
+                            fmt(live["balance"] if live else (latest.get("balance") or 0)),
+                            hint=("抽奖中 · 实时结算" if live
+                                  else (f"截至 {latest['date']}" if latest.get("date") else "还没跑过"))),
                 self.__stat("⏱ 最近一轮", f"{fmt(latest.get('draws') or 0)} 抽",
                             hint=str(latest.get("duration") or "")),
             ]},
@@ -1341,7 +1346,7 @@ class HHClubLottery(_PluginBase):
         history = sorted(history, key=lambda item: item.get("date") or "", reverse=True)
         cards = [
             self.__status_card(live),
-            self.__overview_card(total, history[0] if history else {}),
+            self.__overview_card(total, history[0] if history else {}, live),
             self.__gain_card(total),
             self.__prize_card(total),
         ]

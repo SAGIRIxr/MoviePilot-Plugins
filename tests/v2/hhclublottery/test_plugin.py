@@ -1970,3 +1970,49 @@ def test_jackpot_parts_without_swap():
     parts = HH.jackpot_parts(HH.normalize_stats({
         "draws": 10, "prizes": {"vip": {"count": 1, "value": 7, "tiers": {"7 天": 1}}}}))
     assert parts == ["⭐ VIP ×1"]
+
+
+def test_current_balance_is_live_while_running(plugin, monkeypatch):
+    """叫「当前余额」就得真是当前的。跑着的时候拿运行中那份的实时读数，
+    不能还摆着上一轮收尾时的数字。"""
+    plugin.save_data("history", [{"date": "2026-08-20 09:00:00", "draws": 10,
+                                  "cost": 20000, "beans": 0, "profit": -20000,
+                                  "balance": 111111, "duration": "1分", "status": "正常结束"}])
+    site = FakeSite()
+    site.balance = 999999
+    site.draw_queue = [win("补签卡 1") for _ in range(8)]
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        if self.current["draws"] == 2 and "page" not in seen:
+            # 只看概览卡 —— 运行记录那张表里本来就该有上一轮的结束余额
+            seen["page"] = str(plugin.get_page()[1])
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=4)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert "💰 当前余额" in seen["page"]
+    assert "995,999" in seen["page"], "999,999 - 2 抽 × 2,000"
+    assert "111,111" not in seen["page"], "不该还摆着上一轮的余额"
+    assert "抽奖中 · 实时结算" in seen["page"]
+
+
+def test_current_balance_says_when_it_was_read(plugin):
+    """空闲时只能是上一轮收尾的读数 —— 做种收益一直在涨，
+    不说清楚截至什么时候就是在骗人。"""
+    plugin.save_data("total", {"draws": 10, "cost": 20000, "gains": {"beans": 5000},
+                               "prizes": {"beans": {"count": 10, "value": 5000,
+                                                    "tiers": {"500 憨豆": 10}}}})
+    plugin.save_data("history", [{"date": "2026-08-22 17:46:55", "draws": 10,
+                                  "cost": 20000, "beans": 5000, "profit": -15000,
+                                  "balance": 5530655, "duration": "1分", "status": "正常结束"}])
+    text = str(plugin.get_page())
+    assert "💰 当前余额" in text and "5,530,655" in text
+    assert "截至 2026-08-22 17:46:55" in text
+    assert "最近余额" not in text
