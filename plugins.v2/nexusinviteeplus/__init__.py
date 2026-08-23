@@ -408,7 +408,7 @@ class NexusInviteePlus(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/NexusInviteePlus_A.png"
     # 插件版本
-    plugin_version = "2.3.0"
+    plugin_version = "2.4.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1384,23 +1384,31 @@ class NexusInviteePlus(_PluginBase):
     # 直接标红会让人白跑一趟去查一个其实没事的站点。
     _DEAD_STREAK = 3
 
-    def _site_id_map(self, cached_data: Dict[str, Any]) -> Dict[str, Any]:
-        """展示名 → 站点 id。重名站点在存数据时带了域名后缀，这里按同样规则还原。"""
-        indexers = []
+    def _all_site_configs(self) -> List[Dict[str, Any]]:
+        """
+        站点配置列表。
+
+        SitesHelper 依赖 MP 的认证态，取不到时退回直接读站点库——否则详情页
+        会因为拿不到站点信息而把所有站点卡片都吞掉，只剩一句「暂无数据」。
+        """
         try:
             indexers = self.sites.get_indexers() or []
+            if indexers:
+                return indexers
         except Exception as e:
             logger.debug(f"从 SitesHelper 取站点列表失败: {str(e)}")
+        try:
+            return [{"id": site.id, "name": site.name, "url": site.url}
+                    for site in (self.siteoper.list() or [])]
+        except Exception as e:
+            logger.debug(f"从 SiteOper 取站点列表失败: {str(e)}")
+            return []
 
+    def _site_id_map(self, cached_data: Dict[str, Any]) -> Dict[str, Any]:
+        """展示名 → 站点 id。重名站点在存数据时带了域名后缀，这里按同样规则还原。"""
+        indexers = self._all_site_configs()
         if not indexers:
-            # SitesHelper 依赖 MP 的认证态，取不到时退回直接读站点库
-            try:
-                indexers = [{"id": site.id, "name": site.name, "url": site.url}
-                            for site in (self.siteoper.list() or [])]
-            except Exception as e:
-                logger.debug(f"从 SiteOper 取站点列表失败: {str(e)}")
-                return {}
-
+            return {}
         names = self._resolve_display_names(indexers)
         return {display: sid for sid, display in names.items() if display in cached_data}
 
@@ -1551,15 +1559,141 @@ class NexusInviteePlus(_PluginBase):
             ]
         }
 
-    def _build_overview_tables(self, cached_data: Dict[str, Any]) -> List[dict]:
-        """
-        总览区：一张可排序的站点表 + 按状态分好的成员表。
+    # 统计磁贴的样式。VExpansionPanels 默认是竖着堆的，这里让它横排成一行磁贴，
+    # 展开的那块再撑满整行去放表格——这样「后宫总览」看着还是原来那排数字，
+    # 但每个数字都能点开看到对应的明细。
+    _STAT_CSS = """
+        .hh-stats .v-expansion-panels {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+        }
+        .hh-stats .v-expansion-panel {
+            flex: 1 1 140px;
+            border-radius: 8px !important;
+            overflow: hidden;
+        }
+        .hh-stats .v-expansion-panel--active {
+            flex-basis: 100%;
+        }
+        .hh-stats .v-expansion-panel-title {
+            padding: 0.75rem 1rem;
+            min-height: 0;
+        }
+        .hh-stat__title {
+            font-size: 0.8rem;
+            opacity: 0.7;
+        }
+        .hh-stat__value {
+            font-size: 1.5rem;
+            font-weight: bold;
+            line-height: 1.2;
+        }
+    """
 
-        原版只有一堆静态卡片，想知道「哪个站后宫最多」「哪些人被 ban 了」
-        只能一张张卡片翻。站点表点列头就能按后宫人数、邀请名额排序；
-        成员按「已禁用 / 分享率偏低 / 无数据」分成折叠面板，展开即是筛选结果。
+    def _stat_tile(self, title: str, value, color: str, body: List[dict]) -> dict:
+        """一块统计磁贴：标题 + 数字，点开是对应的明细表。"""
+        return {
+            "component": "VExpansionPanel",
+            "content": [
+                {
+                    "component": "VExpansionPanelTitle",
+                    "content": [{
+                        "component": "div",
+                        "content": [
+                            {"component": "div", "props": {"class": "hh-stat__title"}, "text": title},
+                            {"component": "div",
+                             "props": {"class": f"hh-stat__value{(' text-' + color) if color else ''}"},
+                             "text": str(value)},
+                        ]
+                    }]
+                },
+                {
+                    "component": "VExpansionPanelText",
+                    "content": body
+                }
+            ]
+        }
+
+    def _build_stat_filters(self, cached_data: Dict[str, Any]) -> List[dict]:
+        """
+        后宫总览：一排数字，每个都能点开看明细。
+
+        原来这里是一排纯展示的 div，看到「已禁用 12」也不知道是哪 12 个人，
+        只能一张张翻下面的站点卡片。现在每块磁贴点开就是筛好的表，
+        表头还能再点着排序。
         """
         site_rows, member_rows = self._collect_rows(cached_data)
+
+        member_headers = [
+            {"title": "站点", "key": "site", "sortable": True},
+            {"title": "用户名", "key": "username", "sortable": True},
+            {"title": "邮箱", "key": "email", "sortable": True},
+            {"title": "上传", "key": "uploaded", "sortable": True, "align": "end"},
+            {"title": "下载", "key": "downloaded", "sortable": True, "align": "end"},
+            {"title": "分享率", "key": "ratio", "sortable": True, "align": "end"},
+            {"title": "状态", "key": "status", "sortable": True, "align": "center"},
+        ]
+        site_headers = [
+            {"title": "站点", "key": "site", "sortable": True},
+            {"title": "可邀请", "key": "can_invite", "sortable": True, "align": "center"},
+            {"title": "永久", "key": "perm", "sortable": True, "align": "end"},
+            {"title": "临时", "key": "temp", "sortable": True, "align": "end"},
+            {"title": "后宫人数", "key": "members", "sortable": True, "align": "end"},
+            {"title": "低分享率", "key": "low_ratio", "sortable": True, "align": "end"},
+            {"title": "已禁用", "key": "banned", "sortable": True, "align": "end"},
+            {"title": "状态", "key": "reason", "sortable": False},
+        ]
+
+        def clean(rows):
+            return [{k: v for k, v in row.items() if not k.startswith("_")} for row in rows]
+
+        banned = [r for r in member_rows if r["_banned"]]
+        low = [r for r in member_rows if r["_health"] in ("warning", "danger")]
+        nodata = [r for r in member_rows if r["_health"] == "neutral"]
+        perm_sites = [r for r in site_rows if r["perm"] > 0]
+        temp_sites = [r for r in site_rows if r["temp"] > 0]
+
+        tiles = [
+            self._stat_tile("站点数量", len(site_rows), "",
+                            [self._data_table(site_headers, site_rows, per_page=50)]),
+            self._stat_tile("后宫成员", len(member_rows), "",
+                            [self._data_table(member_headers, clean(member_rows))]),
+            self._stat_tile("永久邀请", sum(r["perm"] for r in site_rows), "",
+                            [self._data_table(site_headers, perm_sites, per_page=50)]),
+            self._stat_tile("临时邀请", sum(r["temp"] for r in site_rows), "",
+                            [self._data_table(site_headers, temp_sites, per_page=50)]),
+            self._stat_tile("分享率低于1.0", len(low), "warning",
+                            [self._data_table(member_headers, clean(low))]),
+            self._stat_tile("已禁用用户", len(banned), "error",
+                            [self._data_table(member_headers, clean(banned))]),
+            self._stat_tile("无数据用户", len(nodata), "grey",
+                            [self._data_table(member_headers, clean(nodata))]),
+        ]
+
+        return [
+            {"type": "style", "content": self._STAT_CSS},
+            {
+                "component": "div",
+                "props": {"class": "hh-stats"},
+                "content": [{
+                    "component": "VExpansionPanels",
+                    "props": {"variant": "accordion"},
+                    "content": tiles
+                }]
+            },
+        ]
+
+    def _build_overview_tables(self, cached_data: Dict[str, Any]) -> List[dict]:
+        """
+        站点卡片上方的那一块：导出、失效站点、可排序的站点总览表、最近变化。
+
+        成员的分组筛选放在页首的「后宫总览」磁贴里了，这里不再重复一遍，
+        只留下和下方站点卡片直接相关的东西——尤其是那张站点表，
+        点一下列头就能按后宫人数或剩余名额排序，省得一张张卡片翻。
+        """
+        site_rows, _ = self._collect_rows(cached_data)
         if not site_rows:
             return []
 
@@ -1573,78 +1707,23 @@ class NexusInviteePlus(_PluginBase):
             {"title": "已禁用", "key": "banned", "sortable": True, "align": "end"},
             {"title": "状态", "key": "reason", "sortable": False},
         ]
-        member_headers = [
-            {"title": "站点", "key": "site", "sortable": True},
-            {"title": "用户名", "key": "username", "sortable": True},
-            {"title": "邮箱", "key": "email", "sortable": True},
-            {"title": "上传", "key": "uploaded", "sortable": True, "align": "end"},
-            {"title": "下载", "key": "downloaded", "sortable": True, "align": "end"},
-            {"title": "分享率", "key": "ratio", "sortable": True, "align": "end"},
-            {"title": "状态", "key": "status", "sortable": True, "align": "center"},
-        ]
-
-        def strip_private(rows):
-            return [{k: v for k, v in row.items() if not k.startswith("_")} for row in rows]
-
-        groups = (
-            ("已禁用", [r for r in member_rows if r["_banned"]], "error"),
-            ("分享率偏低", [r for r in member_rows if r["_health"] in ("warning", "danger")], "warning"),
-            ("无数据", [r for r in member_rows if r["_health"] == "neutral"], "grey"),
-            ("全部成员", member_rows, "primary"),
-        )
-
-        panels = []
-        for title, rows, color in groups:
-            clean = strip_private(rows)
-            panels.append({
-                "component": "VExpansionPanel",
-                "content": [
-                    {
-                        "component": "VExpansionPanelTitle",
-                        "content": [{
-                            "component": "span",
-                            "props": {"class": f"text-{color}"},
-                            "text": f"{title}（{len(clean)} 人）"
-                        }]
-                    },
-                    {
-                        "component": "VExpansionPanelText",
-                        "content": [self._data_table(member_headers, clean)]
-                    }
-                ]
-            })
 
         blocks = [self._build_toolbar()]
+
         dead_card = self._build_dead_sites_card(cached_data)
         if dead_card:
             blocks.append(dead_card)
 
-        blocks += [
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-4"},
-                "content": [
-                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                     "text": "站点总览（点击列头排序）"},
-                    {"component": "VCardText", "props": {"class": "pa-0"},
-                     "content": [self._data_table(site_headers, site_rows, per_page=50)]}
-                ]
-            },
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-4"},
-                "content": [
-                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
-                     "text": "后宫成员（展开即筛选，列头可排序）"},
-                    {"component": "VCardText", "props": {"class": "pa-0"},
-                     "content": [{
-                         "component": "VExpansionPanels",
-                         "props": {"variant": "accordion", "multiple": True},
-                         "content": panels
-                     }]}
-                ]
-            },
-        ]
+        blocks.append({
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                 "text": "站点总览（点击列头排序）"},
+                {"component": "VCardText", "props": {"class": "pa-0"},
+                 "content": [self._data_table(site_headers, site_rows, per_page=50)]}
+            ]
+        })
 
         changes_card = self._build_changes_card()
         if changes_card:
@@ -1722,171 +1801,9 @@ class NexusInviteePlus(_PluginBase):
                 total_perm_invites += invite_status.get("permanent_count", 0)
                 total_temp_invites += invite_status.get("temporary_count", 0)
 
-            # 添加统计卡片
-            page_content.extend([
-                {
-                    "type": "div",
-                    "class": "dashboard-stats",
-                    "content": [
-                        {
-                            "type": "div",
-                            "class": "dashboard-stats__item",
-                            "content": [
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__title",
-                                    "content": "站点数量"
-                                },
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__value",
-                                    "content": str(total_sites)
-                                }
-                            ]
-                        },
-                        {
-                            "type": "div",
-                            "class": "dashboard-stats__item",
-                            "content": [
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__title",
-                                    "content": "后宫成员"
-                                },
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__value",
-                                    "content": str(total_invitees)
-                                }
-                            ]
-                        },
-                        {
-                            "type": "div",
-                            "class": "dashboard-stats__item",
-                            "content": [
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__title",
-                                    "content": "永久邀请"
-                                },
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__value",
-                                    "content": str(total_perm_invites)
-                                }
-                            ]
-                        },
-                        {
-                            "type": "div",
-                            "class": "dashboard-stats__item",
-                            "content": [
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__title",
-                                    "content": "临时邀请"
-                                },
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__value",
-                                    "content": str(total_temp_invites)
-                                }
-                            ]
-                        },
-                        {
-                            "type": "div",
-                            "class": "dashboard-stats__item",
-                            "content": [
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__title text-warning",
-                                    "content": "低分享率"
-                                },
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__value text-warning",
-                                    "content": str(total_low_ratio)
-                                }
-                            ]
-                        },
-                        {
-                            "type": "div",
-                            "class": "dashboard-stats__item",
-                            "content": [
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__title text-error",
-                                    "content": "已禁用"
-                                },
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__value text-error",
-                                    "content": str(total_banned)
-                                }
-                            ]
-                        },
-                        {
-                            "type": "div",
-                            "class": "dashboard-stats__item",
-                            "content": [
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__title text-grey",
-                                    "content": "无数据"
-                                },
-                                {
-                                    "type": "div",
-                                    "class": "dashboard-stats__value text-grey",
-                                    "content": str(total_no_data)
-                                }
-                            ]
-                        }
-                    ]
-                }
-            ])
+            # 后宫总览：每个数字都可以点开看明细
+            page_content.extend(self._build_stat_filters(cached_data))
 
-            # 添加样式，优化表格
-            page_content.extend([
-                {
-                    "type": "style",
-                    "content": """
-                        .dashboard-stats {
-                            display: flex;
-                            flex-wrap: wrap;
-                            gap: 1rem;
-                            margin-bottom: 2rem;
-                        }
-                        .dashboard-stats__item {
-                            flex: 1;
-                            min-width: 120px;
-                            padding: 1rem;
-                            background: var(--v-surface-variant);
-                            border-radius: 8px;
-                            text-align: center;
-                        }
-                        .dashboard-stats__title {
-                            font-size: 0.875rem;
-                            margin-bottom: 0.5rem;
-                            opacity: 0.7;
-                        }
-                        .dashboard-stats__value {
-                            font-size: 1.5rem;
-                            font-weight: bold;
-                        }
-                        .text-warning {
-                            color: var(--v-warning);
-                        }
-                        .text-error {
-                            color: var(--v-error);
-                        }
-                        .text-grey {
-                            color: var(--v-grey);
-                        }
-                    """
-                }
-            ])
-
-            # 站点总览表 + 按状态筛选的成员表，放在最前面
-            page_content.extend(self._build_overview_tables(cached_data))
 
             # 添加头部信息和提示
             page_content.append({
@@ -2272,7 +2189,7 @@ class NexusInviteePlus(_PluginBase):
 
                 # 获取站点信息
                 site_info = None
-                for site in self.sites.get_indexers():
+                for site in self._all_site_configs():
                     if site.get("name") == site_name:
                         site_info = site
                         break
@@ -3679,7 +3596,10 @@ class NexusInviteePlus(_PluginBase):
             drug_component = self.presc.getComponent()
             if drug_component:
                 page_content.append(drug_component)
-            
+
+            # 站点卡片上方：导出、失效站点、可排序的站点总览表、最近变化
+            page_content.extend(self._build_overview_tables(cached_data))
+
             # 将站点卡片添加到页面
             page_content.extend(cards)
 
