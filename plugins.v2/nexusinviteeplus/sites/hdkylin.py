@@ -79,7 +79,7 @@ class HdkylinHandler(_ISiteHandler):
                     # 从邀请链接提取用户ID
                     invite_link_tag = info_block.select_one('a[href*="invite.php?id="]')
                     if invite_link_tag and invite_link_tag.get('href'):
-                       match_id = re.search(r'id=(\d+)', invite_link_tag['href'])
+                       match_id = re.search(r'[?&]id=(\d+)(?![\da-zA-Z-])', invite_link_tag['href'])
                        if match_id:
                            user_id = match_id.group(1)
                            logger.info(f"站点 {site_name} 从 info_block 提取到用户ID: {user_id}")

@@ -21,6 +21,157 @@ class NexusPhpHandler(_ISiteHandler):
     # 站点类型标识
     site_schema = "nexusphp"
 
+    # 邀请名额的权威来源，按可靠性从高到低排。
+    # 前两条是发送页顶部那句「邀请其他人加入XXX (35个剩余邀请 + 0个临时邀请)」，
+    # 后两条是每页顶栏的「邀请 [ 发送 ]: 1(0)」/「[ 邀請 : 7 發送 ]」。
+    # 原来的解析要先在页面里找到 invite 链接再读它父节点的文本，皇后(open.cd)
+    # 这种魔改皮肤找不到就直接算 0 个名额，可它顶栏明明写着「邀請 : 7」。
+    _QUOTA_PATTERNS = (
+        r"[（(]\s*(\d+)\s*个剩余邀请\s*(?:\+\s*(\d+)\s*个临时邀请)?\s*[）)]",
+        r"[（(]\s*(\d+)\s*個剩餘邀請\s*(?:\+\s*(\d+)\s*個臨時邀請)?\s*[）)]",
+        r"邀[请請]\s*\[[^\]]{0,12}\]\s*[:：]\s*(\d+)(?:\s*[（(]\s*(\d+)\s*[）)])?",
+        r"\[\s*邀[请請]\s*[:：]\s*(\d+)(?:\s*[（(]\s*(\d+)\s*[）)])?[^\]]{0,12}\]",
+    )
+
+    # 站点主动关闭邀请系统，和「你等级不够」是两回事，得分开说
+    _CLOSED_RE = re.compile(
+        r"邀[请請]系[统統]已[关關][闭閉]|邀[请請]功能已[关關][闭閉]|"
+        r"邀[请請]已[关關][闭閉]|invites?\s+(?:are\s+)?(?:currently\s+)?closed",
+        re.IGNORECASE)
+
+    @classmethod
+    def _extract_quota(cls, text: str):
+        """从页面文本里抠出 (永久, 临时) 邀请数；抠不到返回 None。"""
+        if not text:
+            return None
+        for pattern in cls._QUOTA_PATTERNS:
+            m = re.search(pattern, text)
+            if m:
+                permanent = int(m.group(1))
+                temporary = int(m.group(2)) if m.lastindex and m.group(2) else 0
+                return permanent, temporary
+        return None
+
+    def _apply_authoritative_invite_status(self, site_name: str, result: Dict[str, Any],
+                                           send_html: str = "", list_html: str = "") -> None:
+        """
+        拿发送页和列表页上的硬信号，覆盖前面那套按页面元素猜出来的结论。
+
+        判定优先级（从高到低）：
+          1. 站点写明「邀请系统已关闭」——这时候有名额也发不出去
+          2. 发送页上有可提交的 takeinvite 表单——那就是真能发
+          3. 名额数字：发送页的「(N个剩余邀请 + M个临时邀请)」最准，
+             其次是任意页面顶栏的「邀请 [ 发送 ]: N(M)」
+        """
+        status = result["invite_status"]
+
+        send_text = re.sub(r"\s+", " ", BeautifulSoup(send_html, 'html.parser').get_text(" ")) if send_html else ""
+        list_text = re.sub(r"\s+", " ", BeautifulSoup(list_html, 'html.parser').get_text(" ")) if list_html else ""
+
+        # 名额：发送页优先，其次列表页顶栏
+        quota = self._extract_quota(send_text) or self._extract_quota(list_text)
+        if quota:
+            permanent, temporary = quota
+            if (permanent, temporary) != (status.get("permanent_count"), status.get("temporary_count")):
+                logger.debug(f"站点 {site_name} 邀请名额按页面实际值校正为 永久={permanent}, 临时={temporary}")
+            status["permanent_count"] = permanent
+            status["temporary_count"] = temporary
+
+        # 站点关了邀请系统：名额留着展示，但明确不能发
+        if self._CLOSED_RE.search(send_text) or self._CLOSED_RE.search(list_text):
+            status["can_invite"] = False
+            status["reason"] = "站点已关闭邀请系统"
+            return
+
+        if self._has_send_form(send_html):
+            status["can_invite"] = True
+            total = status.get("permanent_count", 0) + status.get("temporary_count", 0)
+            if total > 0:
+                status["reason"] = (f"可用邀请数: 永久={status.get('permanent_count', 0)}, "
+                                    f"临时={status.get('temporary_count', 0)}")
+            else:
+                status["reason"] = "可以进入发送页，但当前没有邀请名额"
+            return
+
+        # 发送页明确回「邀请数量不足 / 没有剩余邀请名额」：说明权限是有的，
+        # 只是名额用完了。这和「等级不够进不去」是两码事，得分开讲。
+        if re.search(r"邀[请請]数量不足|邀[请請]數量不足|没有剩余邀[请請]名[额額]|"
+                     r"沒有剩餘邀[请請]名[额額]|no\s+invites?\s+left", send_text, re.IGNORECASE):
+            status["can_invite"] = True
+            status["reason"] = "可以发送邀请，但当前邀请数量不足"
+            return
+
+        # 发送页打不开或压根没有表单，但顶栏确实有名额：多半是站点自己的页面出了问题
+        # （皇后 open.cd 的发送页直接抛 PHP Fatal error）。
+        # 注意只在原本没给出具体原因时才这么说——HDVIDEO 那种站点已经明确写了
+        # 「VIP(贵宾) 或以上等级才可以发送邀请」，那个才是真原因，别给盖掉。
+        has_quota = status.get("permanent_count", 0) or status.get("temporary_count", 0)
+        if not status.get("can_invite") and has_quota and send_html \
+                and not self._has_send_form(send_html) and self._is_vague_reason(status.get("reason")):
+            status["reason"] = (f"有 {status.get('permanent_count', 0)} 个邀请名额，"
+                                f"但发送页打不开或没有渲染出邀请表单")
+
+        # 没名额、发送页也没给出任何限制说明时，别再猜「等级或权限未达到」——
+        # 高清视界(hdarea.club)的发送页压根不认 type=new，回的还是列表页，
+        # 这时唯一能确定的事实就是没有名额。
+        if not status.get("can_invite") and not has_quota and self._is_vague_reason(status.get("reason")):
+            status["reason"] = "当前没有邀请名额"
+
+        status["reason"] = self._tidy_reason(status.get("reason"))
+
+    # 这几句是解析不出具体原因时的兜底话术，可以被更准的说法覆盖
+    _VAGUE_REASONS = ("页面上没有邀请表单", "无法发送邀请", "初始化失败", "")
+
+    @classmethod
+    def _is_vague_reason(cls, reason) -> bool:
+        text = (reason or "").strip()
+        return any(text.startswith(v) for v in cls._VAGUE_REASONS if v) or not text
+
+    @staticmethod
+    def _tidy_reason(reason) -> str:
+        """
+        把原因收拾成一句人话。
+
+        原来的做法是把匹配到的整段页面文本原样塞进 reason，观众(audiences.me)
+        那条就变成了「wwff7097的邀请系统邀请志同道合的好友加入 Audiences，
+        共建优质分享社区剩余邀请0只有(金玉满堂)VIP及以上的用户才能发送邀请」这样一长串。
+        """
+        text = re.sub(r"\s+", " ", (reason or "")).strip()
+        if not text:
+            return text
+
+        # 「没有该权限」是站点的通用错误页文案，不带任何邀请信息，
+        # 原样抄过来会让人以为是等级问题，实际多半是 Cookie 失效或用户ID取错了
+        if re.search(r"没有该[权權]限|沒有該[权權]限|no\s+permission", text, re.IGNORECASE):
+            return "站点返回「没有该权限」，通常是 Cookie 已失效或该账号无权访问邀请页"
+
+        # 太长就从里面挑出真正说明限制的那一句
+        if len(text) > 60:
+            # 直接从关键词开头匹配。带 [^，。,.]*? 前缀的话 re.search 会从更靠前的
+            # 位置起匹，把「共建优质分享社区剩余邀请0」这种无关内容一起captured 进来。
+            for pattern in (r"[只需][有要][^，。,.]{0,40}?才(?:能|可以)[发發][送]?邀[请請][^，。,.]{0,10}",
+                            r"\S{0,20}?或以上等[级級][^，。,.]{0,20}",
+                            r"需要\S{0,30}?才[^，。,.]{0,20}",
+                            r"\S{0,20}?及以上[^，。,.]{0,30}"):
+                m = re.search(pattern, text)
+                if m:
+                    return m.group(0).strip("；;，,。. ")
+            return text[:60].rstrip() + "…"
+        return text
+
+    @staticmethod
+    def _has_send_form(html: str) -> bool:
+        """发送页上有没有真的能提交的邀请表单。"""
+        if not html:
+            return False
+        soup = BeautifulSoup(html, 'html.parser')
+        for form in soup.select('form[action*="takeinvite.php"]'):
+            submit = form.select_one('input[type="submit"], button[type="submit"]')
+            if submit is not None and submit.has_attr("disabled"):
+                continue
+            return True
+        return False
+
     @staticmethod
     def _diagnose_no_user_id(session: requests.Session, site_url: str) -> str:
         """
@@ -321,9 +472,11 @@ class NexusPhpHandler(_ISiteHandler):
 
                 # --- Original Send Invite Page Check Logic --- (kept exactly as before)
                 send_invite_url = urljoin(site_url, f"invite.php?id={user_id}&type=new")
+                send_html = ""
                 try:
-                    send_response = session.get(send_invite_url, timeout=(10, 30))
+                    send_response = request(session, send_invite_url)
                     send_response.raise_for_status()
+                    send_html = send_response.text
                     send_page_result = self._parse_nexusphp_invite_page(site_name, send_response.text)
                     send_reason = send_page_result["invite_status"].get("reason")
                     send_can_invite = send_page_result["invite_status"].get("can_invite")
@@ -353,6 +506,17 @@ class NexusPhpHandler(_ISiteHandler):
                         logger.debug(f"站点 {site_name} 从发送页面确认可以发送邀请")
                 except requests.exceptions.RequestException as e:
                     logger.warning(f"访问站点发送邀请页面失败: {str(e)}")
+
+                # --- 用发送页的硬信号覆盖上面那堆启发式判断 ---
+                # 上面的逻辑是拿「已邀请列表页」(invite.php?id=X) 去猜能不能邀请，
+                # 可发送表单根本不在那一页上，它在 invite.php?id=X&type=new。
+                # 于是青蛙、萝莉这些明明能进发送页的站点被判成「页面上没有邀请表单」。
+                self._apply_authoritative_invite_status(
+                    site_name, result, send_html=send_html, list_html=html_content)
+                logger.info(f"站点 {site_name} 邀请判定: 可邀请={result['invite_status']['can_invite']}, "
+                            f"永久={result['invite_status']['permanent_count']}, "
+                            f"临时={result['invite_status']['temporary_count']}, "
+                            f"原因={result['invite_status']['reason']}")
 
                 if result["invitees"]:
                     logger.info(f"站点 {site_name} 共解析到 {len(result['invitees'])} 个后宫成员")
@@ -813,7 +977,11 @@ class NexusPhpHandler(_ISiteHandler):
                 # 不能邀请
                 result["invite_status"]["can_invite"] = False
                 result["invite_status"]["reason"] = invite_reason
-                logger.info(f"站点 {site_name} 最终不可邀请原因: {invite_reason}")
+                # 这个函数会被列表页和发送页各调一次，还会被每一页后宫列表调用，
+                # 打成 INFO 的「最终不可邀请原因」会在日志里留下一串自相矛盾的中间结论
+                # （青蛙就是这样：这里说没有邀请表单，最后实际判定是可以邀请）。
+                # 真正的定论由 _apply_authoritative_invite_status 给出，这里降成 debug。
+                logger.debug(f"站点 {site_name} 本页解析到的不可邀请原因: {invite_reason}")
         
         # 优先查找带有border属性的表格，这通常是用户列表表格
         invitee_tables = soup.select('table[border="1"]')

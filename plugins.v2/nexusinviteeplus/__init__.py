@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 import traceback
 
 import requests
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -27,7 +27,7 @@ from app.helper.sites import SitesHelper
 
 from . import sitehttp
 from .data import DataManager
-from .parsing import sanitize_invitees
+from .parsing import sanitize_invitees, tidy_reason
 from .utils import NotificationHelper, SiteHelper
 from .module_loader import ModuleLoader
 
@@ -407,7 +407,7 @@ class NexusInviteePlus(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/NexusInviteePlus_A.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -3312,18 +3312,50 @@ class NexusInviteePlus(_PluginBase):
         from .sites.nexusphp import NexusPhpHandler
         return NexusPhpHandler()
 
-    def _get_site_invite_data(self, site_name):
+    @staticmethod
+    def _resolve_display_names(sites: List[Dict[str, Any]]) -> Dict[Any, str]:
+        """
+        给每个站点算一个唯一的展示名。
+
+        MP 允许两个站点重名（比如都叫「萝莉」），而后宫数据是按名字存的，
+        重名就会互相覆盖。这里只给真正重名的那几个加上域名后缀，
+        没重名的保持原样，免得所有站点的名字都变长。
+        """
+        counts: Dict[str, int] = {}
+        for site in sites:
+            name = site.get("name", "")
+            counts[name] = counts.get(name, 0) + 1
+
+        resolved: Dict[Any, str] = {}
+        for site in sites:
+            name = site.get("name", "")
+            if counts.get(name, 0) > 1:
+                host = urlparse(site.get("url") or "").netloc or str(site.get("id"))
+                resolved[site.get("id")] = f"{name} ({host})"
+            else:
+                resolved[site.get("id")] = name
+        return resolved
+
+    def _get_site_invite_data(self, site, display_name: str = None):
         """
         获取站点邀请页面数据
+
+        :param site: 站点配置字典；为兼容旧调用也接受站点名字符串
+        :param display_name: 用于日志和存储的展示名（重名站点会带域名后缀）
         """
         try:
-            # 获取站点信息
-            site_info = None
-            for indexer in self.sites.get_indexers():
-                if indexer.get("name") == site_name:
-                    site_info = indexer
-                    break
-                    
+            # 兼容按名字调用的老路子（API 接口那边还在用）
+            if isinstance(site, str):
+                site_info = None
+                for indexer in self.sites.get_indexers():
+                    if indexer.get("name") == site:
+                        site_info = indexer
+                        break
+                site_name = display_name or site
+            else:
+                site_info = site
+                site_name = display_name or (site or {}).get("name", "")
+
             if not site_info:
                 logger.error(f"站点 {site_name} 信息不存在")
                 return {
@@ -3335,7 +3367,8 @@ class NexusInviteePlus(_PluginBase):
                         "reason": "站点信息不存在"
                     }
                 }
-                
+
+
             # 站点表里这些字段可能是 NULL 而不是缺 key，.get(k, "") 会原样返回 None，
             # 再 .strip() 就是「'NoneType' object has no attribute 'strip'」——
             # 馒头（只配了 apikey、token 为空）每次刷新都栽在这里。
@@ -3460,6 +3493,11 @@ class NexusInviteePlus(_PluginBase):
             # 丢掉被当成成员的表头行，修掉落进分享率列的流量值
             if isinstance(site_data, dict):
                 site_data["invitees"] = sanitize_invitees(site_name, site_data.get("invitees") or [])
+                # 各 handler 的原因文案都是从页面上抠的，末尾常粘着「這裏返回。」
+                # 这类跳转提示，统一在这里擦掉
+                status = site_data.get("invite_status")
+                if isinstance(status, dict):
+                    status["reason"] = tidy_reason(status.get("reason"))
 
 
             # 检查站点数据结构是否正确
@@ -3583,7 +3621,7 @@ class NexusInviteePlus(_PluginBase):
                 user_link = welcome_text.select_one('a[href*="userdetails.php"]')
                 if user_link:
                     href = user_link.get('href', '')
-                    id_match = re.search(r'id=(\d+)', href)
+                    id_match = re.search(r'[?&]id=(\d+)(?![\da-zA-Z-])', href)
                     if id_match:
                         return id_match.group(1)
             
@@ -3594,8 +3632,8 @@ class NexusInviteePlus(_PluginBase):
                 r'<input[^>]*name=["\']passkey["\'][^>]*value=["\']([a-zA-Z0-9]+)["\']',
                 r'passkey=([a-zA-Z0-9]+)',
                 r'usercp\.php\?action=personal&userid=(\d+)',
-                r'id=(\d+)',
-                r'uid=(\d+)'
+                r'[?&]id=(\d+)(?![\da-zA-Z-])',
+                r'[?&]uid=(\d+)(?![\da-zA-Z-])'
             ]:
                 matches = re.search(pattern, html_content)
                 if matches:
@@ -3613,7 +3651,7 @@ class NexusInviteePlus(_PluginBase):
                 if user_link:
                     href = user_link.get('href', '')
                     if 'id=' in href:
-                        id_match = re.search(r'id=(\d+)', href)
+                        id_match = re.search(r'[?&]id=(\d+)(?![\da-zA-Z-])', href)
                         if id_match:
                             return id_match.group(1)
                     
@@ -3623,7 +3661,7 @@ class NexusInviteePlus(_PluginBase):
                     user_content = user_response.text
                     
                     # 在返回的内容中搜索用户ID
-                    for pattern in [r'userdetails\.php\?id=(\d+)', r'passkey=([a-zA-Z0-9]+)', r'id=(\d+)', r'uid=(\d+)']:
+                    for pattern in [r'userdetails\.php\?id=(\d+)', r'passkey=([a-zA-Z0-9]+)', r'[?&]id=(\d+)(?![\da-zA-Z-])', r'[?&]uid=(\d+)(?![\da-zA-Z-])']:
                         matches = re.search(pattern, user_content)
                         if matches:
                             return matches.group(1)
@@ -3638,7 +3676,7 @@ class NexusInviteePlus(_PluginBase):
                 invite_content = invite_response.text
                 
                 # 搜索邀请页面中的用户ID
-                for pattern in [r'id=(\d+)', r'uid=(\d+)', r'user(?:id|_id)=(\d+)']:
+                for pattern in [r'[?&]id=(\d+)(?![\da-zA-Z-])', r'[?&]uid=(\d+)(?![\da-zA-Z-])', r'user(?:id|_id)=(\d+)']:
                     matches = re.search(pattern, invite_content)
                     if matches:
                         return matches.group(1)
@@ -3711,12 +3749,18 @@ class NexusInviteePlus(_PluginBase):
             existing_data = self.data_manager.get_site_data()
             
             # 逐个刷新站点数据
+            # 站点名在 MP 里并不唯一（比如两个站都叫「萝莉」：share.ilolicon.com 和
+            # mua.xloli.cc）。原来按名字去 indexers 里找站点，重名时永远只命中第一个，
+            # 于是一个站被抓两遍、另一个从来没被抓过，存数据时还互相覆盖。
+            # 这里改成把站点配置整个传下去，并给重名的站点加上域名后缀区分。
+            display_names = self._resolve_display_names(selected_sites)
+
             for site in selected_sites:
-                site_name = site.get("name", "")
-                
+                site_name = display_names.get(site.get("id"), site.get("name", ""))
+
                 logger.debug(f"开始获取站点 {site_name} 的后宫数据...")
-                
-                site_data = self._get_site_invite_data(site_name)
+
+                site_data = self._get_site_invite_data(site, display_name=site_name)
                 
                 # --- 修改开始: 增强失败判断逻辑 ---
                 is_successful = True

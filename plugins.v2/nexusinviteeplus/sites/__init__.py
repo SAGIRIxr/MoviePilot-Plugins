@@ -51,13 +51,13 @@ class _ISiteHandler(metaclass=ABCMeta):
 
         # 个人资料链接最直接
         for link in soup.select('a[href*="userdetails.php"]'):
-            m = re.search(r'id=(\d+)', link.get('href', ''))
+            m = re.search(r'[?&]id=(\d+)(?![\da-zA-Z-])', link.get('href', ''))
             if m:
                 return m.group(1)
 
         # 其次是带 id 的邀请页链接
         for link in soup.select('a[href*="invite.php"]'):
-            m = re.search(r'id=(\d+)', link.get('href', ''))
+            m = re.search(r'[?&]id=(\d+)(?![\da-zA-Z-])', link.get('href', ''))
             if m:
                 return m.group(1)
 

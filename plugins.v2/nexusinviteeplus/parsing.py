@@ -147,3 +147,29 @@ def sanitize_invitees(site_name: str, invitees: List[Dict[str, Any]]) -> List[Di
     if dropped:
         logger.debug(f"站点 {site_name} 清洗掉 {dropped} 行表头误抓的「成员」")
     return cleaned
+
+
+# 站点提示里常跟着的「点击这里返回」之类的尾巴，对用户没有任何信息量
+_TAIL_RE = re.compile(
+    r"\s*[（(]?\s*(?:点击|點擊)?\s*(?:这里|這裏|這裡|here)\s*(?:返回|back)\s*[。.！!]?\s*[）)]?\s*$",
+    re.IGNORECASE)
+
+
+def tidy_reason(reason: Optional[str]) -> str:
+    """
+    收拾邀请状态的原因文案。
+
+    handler 是直接从页面文本里抠这句话的，末尾常粘着「這裏返回。」这种
+    跳转提示（蝶粉就是这样）。这里统一擦掉，顺便压平空白。
+    """
+    text = re.sub(r"\s+", " ", (reason or "")).strip()
+    if not text:
+        return text
+    # 「這裏返回」可能重复出现，多擦几遍
+    for _ in range(3):
+        cleaned = _TAIL_RE.sub("", text)
+        if cleaned == text:
+            break
+        text = cleaned
+    # 顺手扫掉被截断的颜文字残渣（「:( 点击这里返回」擦完会剩个孤零零的冒号）
+    return text.strip(" ；;，,:：(（")
