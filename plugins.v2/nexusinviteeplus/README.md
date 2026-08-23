@@ -1,0 +1,78 @@
+# 后宫管理系统（自用版）
+
+管理 MoviePilot 里各个 PT 站点的邀请系统：剩余邀请名额、已邀请用户的状态和分享率健康度。
+
+基于 [madrays/MoviePilot-Plugins](https://github.com/madrays/MoviePilot-Plugins) 的「后宫管理系统」v1.2.7 重做，
+针对 MoviePilot v2.14 的实机环境做了适配和修复。
+
+## 相比原版改了什么
+
+### 支持的站点体系
+
+原版只认 NexusPHP，碰到别的体系会去请求根本不存在的 `usercp.php`，然后统一报「无法获取用户ID」。
+现在按**页面指纹**识别体系（而不是硬编码域名，站点换域名也不会失配）：
+
+| 体系 | 处理器 | 说明 |
+|---|---|---|
+| NexusPHP | `sites/nexusphp.py` | 原版逻辑，另有憨憨、蝶粉、香岛、麒麟等专用处理器 |
+| UNIT3D | `sites/unit3d.py` | **新增**。Aither、Blutopia 这一挂，邀请页在 `/users/{用户名}/invites` |
+| Gazelle | `sites/gazelle.py` | **新增**。海豹 GPW 这一挂，邀请页在 `user.php?action=invite` |
+| TTG | `sites/ttg.py` | **新增**。totheglory.im，名额在顶栏 `[ 邀请：N ]` |
+| M-Team | `sites/mteam.py` | API 方式，见下 |
+
+### 修的 bug
+
+- **M-Team 只配 apikey 会崩**。原版把 Authorization token 当必填，且 `site_info.get("token", "")`
+  在字段为 NULL 时返回 `None`，`.strip()` 直接抛
+  `'NoneType' object has no attribute 'strip'`。现在 token 可选，取值一律 `or ""` 兜底。
+- **取用户ID 死磕 `usercp.php`**。像葡萄（pt.sjtu.edu.cn）的 `usercp.php` 挂着二次验证会跳登录页，
+  明明登录着也被判成 Cookie 失效。现在按 首页 → 控制面板 → 索引页 依次找。
+- **连通性预检被首页一票否决**。UBits 首页挂 CF 盾、内页却完全正常，原版拿首页的 403 判整站失败。
+  现在任一入口能打开就算活着。
+- **憨憨后宫列表恒为 0 人**。站点改版后，原版选表头用的
+  `div[class*="grid-cols-"][class*="bg-"]` 第一个命中的是左侧导航菜单，子元素为空直接返回；
+  且数据行和表头并非同一父容器下的兄弟节点。现在按表头内容定位、按共享的 `grid-cols-[...]` 类名收数据行。
+- **分享率解析脏数据**。日志里的 `分享率转换失败: 分享率` 是整行表头被当成了成员，
+  `分享率转换失败: 7.529 TB (2.791 TB)` 是流量列串进了分享率列。现在所有处理器的输出统一过一遍
+  `parsing.sanitize_invitees`，丢表头行、串列时用上传/下载回算。
+- **失败原因全是一句话**。原版无论 Cookie 过期、CF 拦截、域名没了、证书链不全，都报
+  「无法获取用户ID，请检查Cookie或站点是否可访问」。现在分类上报，见下。
+- 移除了原版对不存在的 `sites/hdchina.py` 的导入（含 `hdchina` 的站点必然 ImportError）。
+
+### 新增能力
+
+- **CloakBrowser 过 Cloudflare**。MoviePilot 2.14 起站点访问换成了 CloakBrowser 内核，
+  但插件这边一直是裸 requests，挂 CF 盾的站点永远拿 403。现在撞上挑战页会开一次无头浏览器取
+  `cf_clearance`（连同配套 UA 一起，通行证和 UA 是绑定的）再重试，结果按域名缓存 6 小时，
+  失败也缓存 30 分钟以免一轮刷新里反复开浏览器。配置页可关。
+- **站点代理**。站点在 MP 里勾了代理就走 `settings.PROXY`，原版完全没读这个字段。
+- **SSL 证书降级**。证书链不全的站点（如 rousi.zip）自动降级重试并记 warning，不再整站失败。
+- **编码纠正**。TTG 这类不发 charset 头的站点，requests 会拍脑袋定成 ISO-8859-1 导致整页乱码。
+
+### 失败原因分类
+
+| 提示 | 该怎么办 |
+|---|---|
+| Cookie 已失效，请重新登录站点更新 Cookie | 去站点重新登录，更新 MP 里的 Cookie |
+| 被 Cloudflare 盾拦截 | 确认配置页开了浏览器仿真；仍不行需升级容器内的 cloakbrowser |
+| 域名无法解析，站点可能已更换域名或关闭 | 站点换域名了或已关站，改 MP 里的站点地址 |
+| 站点无响应或已关闭 | 站点挂了，等或删站点 |
+| 站点返回了跳转/校验中间页 | 站点上了反爬中间页，requests 拿不到真实内容 |
+| 该站点未开放邀请页面 | 站点自己关掉了邀请功能（如 HUNO），不是故障 |
+
+## 已知限制
+
+- **UBits 这类 CF 配置较严的站点**：需要容器内 `cloakbrowser` 版本足够新。
+  实测 0.4.8 在 UBits 上 60 秒都拿不到 `cf_clearance`，升级到 0.5.8+ 可解。
+- **UNIT3D 的后宫成员没有上传/下载数据**。该体系的邀请页记的是邀请码本身
+  （寄件者/邮箱/创建于/接受者），拿不到被邀请人的流量，所以只给接受状态。
+- **HUNO** 的 UNIT3D 定制版本移除了 `/invites`，只能报「未开放邀请页面」。
+
+## 配置
+
+| 项 | 说明 |
+|---|---|
+| 启用插件 / 发送通知 / 立即运行一次 | 同原版 |
+| 执行周期 | cron 表达式，默认每天 9 点 |
+| 选择站点 | 多选，不选则全部站点；增量刷新，失败时保留旧数据 |
+| 浏览器仿真过 Cloudflare | 默认开。关掉后遇到 CF 盾直接报错，不开浏览器 |
