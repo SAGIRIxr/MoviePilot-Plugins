@@ -89,12 +89,12 @@
     "level": 2,
     "name": "后宫管理系统(自用版)",
     "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/NexusInviteePlus_A.png",
-    "description": "管理 MP 站点的邀请系统：除 NexusPHP 外额外支持 UNIT3D / Gazelle / TTG 体系，Cookie 失效与站点故障分类上报，撞 CF 盾时用 CloakBrowser 过盾。",
+    "description": "管理 MP 站点的邀请系统，支持 NexusPHP / UNIT3D / Gazelle / TTG 等体系。",
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
-      "v2.1.0": "修正邀请状态判定：发送表单在 invite.php?id=X&type=new 而不是已邀请列表页，改从发送页取「(N个剩余邀请 + M个临时邀请)」和 takeinvite 表单定判；识别「站点已关闭邀请系统」；用户ID正则加查询参数边界（xloli 用 uuid=，旧正则在 uuid=1be5… 里误匹配出 id=1，导致请求打到别人的邀请页拿回「没有该权限」）；MP 允许站点重名（两个「萝莉」），改按站点配置逐个抓取并给重名站点加域名后缀；原因文案去掉「這裏返回。」这类页面残留、过长时提取限制句；中间解析结论降为 debug，只打一条最终判定。",
-      "v2.0.0": "基于 madrays 版重做。新增 UNIT3D / Gazelle / TTG 三套体系的处理器，站点体系改按页面指纹识别而不是硬编码域名；新增 CloakBrowser 过 Cloudflare 盾；M-Team 的 Authorization token 改为可选（只配 apikey 不再崩）；取用户ID 不再死磕 usercp.php；连通性预检不再被首页的 CF 盾一票否决；支持站点代理与 SSL 证书降级；修复憨憨后宫列表解析（改版后一直是 0 人）；统一清洗被误抓成成员的表头行和串列的分享率；Cookie 失效 / 域名失效 / 站点关闭 / CF 拦截分类上报。"
+      "v2.1.0": "修正邀请状态与名额的判定；站点重名不再互相覆盖；失败原因文案精简。",
+      "v2.0.0": "新增 UNIT3D / Gazelle / TTG 体系支持；支持浏览器仿真过 Cloudflare、站点代理；失败原因分类展示。"
     }
   }
 }
