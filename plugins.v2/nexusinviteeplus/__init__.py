@@ -27,6 +27,7 @@ from app.helper.sites import SitesHelper
 
 from . import sitehttp
 from .data import DataManager
+from . import changes as changes_mod
 from .parsing import sanitize_invitees, tidy_reason
 from .utils import NotificationHelper, SiteHelper
 from .module_loader import ModuleLoader
@@ -407,7 +408,7 @@ class NexusInviteePlus(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/NexusInviteePlus_A.png"
     # 插件版本
-    plugin_version = "2.2.0"
+    plugin_version = "2.3.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -468,6 +469,8 @@ class NexusInviteePlus(_PluginBase):
         
         # 初始化数据管理器（仅保留数据存储，移除配置存储）
         self.data_manager = DataManager(data_path)
+        # 变化记录和站点数据放同一个目录
+        self.change_store = changes_mod.ChangeStore(data_path)
         
         # 初始化通知助手
         self.notify_helper = NotificationHelper(self)
@@ -604,6 +607,85 @@ class NexusInviteePlus(_PluginBase):
         """
         return []
 
+    def export_csv(self, apikey: str = None):
+        """
+        把全部后宫成员导出成 CSV。
+
+        走的是 VBtn 的 href 直链而不是事件按钮：MP 前端的事件按钮是用 axios 发的请求，
+        拿到响应体也存不成文件，只有直链才能触发浏览器下载。
+        """
+        from fastapi.responses import Response as FastAPIResponse
+
+        if apikey != settings.API_TOKEN:
+            return FastAPIResponse(content="API令牌错误!", status_code=403)
+
+        import csv
+        import io
+
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(["站点", "用户名", "邮箱", "上传", "下载", "分享率",
+                         "状态", "是否启用", "健康度"])
+
+        cached = self.data_manager.get_site_data()
+        for site_name, site_cache in cached.items():
+            data = self._unwrap(site_cache)
+            for invitee in data.get("invitees") or []:
+                writer.writerow([
+                    site_name,
+                    invitee.get("username", ""),
+                    invitee.get("email", ""),
+                    invitee.get("uploaded", ""),
+                    invitee.get("downloaded", ""),
+                    invitee.get("ratio", ""),
+                    invitee.get("status", ""),
+                    invitee.get("enabled", ""),
+                    (invitee.get("ratio_label") or [""])[0],
+                ])
+
+        # Excel 默认按 GBK 打开 CSV，加 BOM 才不会中文乱码
+        content = "﻿" + buffer.getvalue()
+        filename = f"houhong-{time.strftime('%Y%m%d-%H%M%S')}.csv"
+        return FastAPIResponse(
+            content=content.encode("utf-8"),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    def disable_site(self, apikey: str = None, site_id: int = None) -> dict:
+        """
+        把站点在 MP 里置为停用。
+
+        故意不做「删除」：删掉是不可逆的，而且站点还挂着订阅、下载历史、
+        其他插件的配置。停用同样能让这个站点不再被刷新，改错了也能在
+        MP 的站点管理里一键点回来。
+        """
+        if apikey != settings.API_TOKEN:
+            return {"code": 1, "message": "API令牌错误!"}
+        if not site_id:
+            return {"code": 1, "message": "缺少 site_id"}
+        try:
+            site = self.siteoper.get(int(site_id))
+            if not site:
+                return {"code": 1, "message": "站点不存在"}
+            self.siteoper.update(int(site_id), {"is_active": False})
+            logger.info(f"站点 {site.name} 已在 MoviePilot 中停用")
+            return {"code": 0, "message": f"已停用站点 {site.name}，可在站点管理里恢复"}
+        except Exception as e:
+            logger.error(f"停用站点失败: {str(e)}")
+            return {"code": 1, "message": f"停用失败: {str(e)}"}
+
+    def purge_site(self, apikey: str = None, site_name: str = None) -> dict:
+        """清掉某个站点在插件里的缓存记录（站点已从 MP 删除时用）。"""
+        if apikey != settings.API_TOKEN:
+            return {"code": 1, "message": "API令牌错误!"}
+        if not site_name:
+            return {"code": 1, "message": "缺少 site_name"}
+        if self.data_manager.remove_site_data(site_name):
+            logger.info(f"已清理站点 {site_name} 的缓存数据")
+            return {"code": 0, "message": f"已清理 {site_name} 的残留数据"}
+        return {"code": 1, "message": f"没有找到 {site_name} 的数据"}
+
     def get_api(self) -> List[Dict[str, Any]]:
         """
         获取插件API
@@ -632,6 +714,24 @@ class NexusInviteePlus(_PluginBase):
             "methods": ["GET"],
             "summary": "刷新数据",
             "description": "强制刷新所有站点数据",
+        }, {
+            "path": "/export_csv",
+            "endpoint": self.export_csv,
+            "methods": ["GET"],
+            "summary": "导出后宫成员",
+            "description": "把全部后宫成员导出为 CSV 文件",
+        }, {
+            "path": "/disable_site",
+            "endpoint": self.disable_site,
+            "methods": ["GET"],
+            "summary": "停用站点",
+            "description": "把指定站点在 MoviePilot 里置为停用",
+        }, {
+            "path": "/purge_site",
+            "endpoint": self.purge_site,
+            "methods": ["GET"],
+            "summary": "清理站点缓存",
+            "description": "清掉已从 MoviePilot 删除的站点在插件里的残留数据",
         }]
 
     def get_dashboard_meta(self) -> Optional[List[Dict[str, str]]]:
@@ -1278,6 +1378,179 @@ class NexusInviteePlus(_PluginBase):
             }
         }
 
+    # 这些原因说明站点本身出了问题，不是权限或名额问题
+    _DEAD_REASON_MARKS = ("域名无法解析", "站点无响应或已关闭", "站点返回了跳转")
+    # 连挂这么多轮才算「疑似失效」。只失败一轮多半是 502 或超时这种抖动，
+    # 直接标红会让人白跑一趟去查一个其实没事的站点。
+    _DEAD_STREAK = 3
+
+    def _site_id_map(self, cached_data: Dict[str, Any]) -> Dict[str, Any]:
+        """展示名 → 站点 id。重名站点在存数据时带了域名后缀，这里按同样规则还原。"""
+        indexers = []
+        try:
+            indexers = self.sites.get_indexers() or []
+        except Exception as e:
+            logger.debug(f"从 SitesHelper 取站点列表失败: {str(e)}")
+
+        if not indexers:
+            # SitesHelper 依赖 MP 的认证态，取不到时退回直接读站点库
+            try:
+                indexers = [{"id": site.id, "name": site.name, "url": site.url}
+                            for site in (self.siteoper.list() or [])]
+            except Exception as e:
+                logger.debug(f"从 SiteOper 取站点列表失败: {str(e)}")
+                return {}
+
+        names = self._resolve_display_names(indexers)
+        return {display: sid for sid, display in names.items() if display in cached_data}
+
+    def _build_toolbar(self) -> dict:
+        """页面顶部的操作条。"""
+        return {
+            "component": "VCard",
+            "props": {"variant": "flat", "class": "mb-3"},
+            "content": [{
+                "component": "VCardText",
+                "props": {"class": "d-flex align-center flex-wrap ga-2 py-2"},
+                "content": [{
+                    "component": "VBtn",
+                    "props": {
+                        # 下载必须走 href 直链：事件按钮是 axios 发的请求，
+                        # 拿到响应体也存不成文件
+                        "href": f"/api/v1/plugin/NexusInviteePlus/export_csv?apikey={settings.API_TOKEN}",
+                        "target": "_blank",
+                        "size": "small",
+                        "color": "primary",
+                        "variant": "tonal",
+                        "prepend-icon": "mdi-download",
+                    },
+                    "text": "导出后宫成员 CSV"
+                }]
+            }]
+        }
+
+    def _build_changes_card(self) -> Optional[dict]:
+        """最近的变化记录。没有记录就不占地方。"""
+        try:
+            records = self.change_store.recent(200)
+        except Exception as e:
+            logger.error(f"读取变化记录失败: {str(e)}")
+            return None
+        if not records:
+            return None
+
+        rows = []
+        for record in records:
+            label, icon = changes_mod.LABELS.get(record.get("kind", ""), (record.get("kind", ""), "•"))
+            rows.append({
+                "time": time.strftime("%m-%d %H:%M", time.localtime(record.get("ts", 0))),
+                "site": record.get("site", ""),
+                "kind": f"{icon} {label}",
+                "detail": record.get("detail", ""),
+            })
+
+        headers = [
+            {"title": "时间", "key": "time", "sortable": True},
+            {"title": "站点", "key": "site", "sortable": True},
+            {"title": "类型", "key": "kind", "sortable": True},
+            {"title": "详情", "key": "detail", "sortable": False},
+        ]
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                 "text": f"最近变化（{len(rows)} 条，保留 30 天）"},
+                {"component": "VCardText", "props": {"class": "pa-0"},
+                 "content": [self._data_table(headers, rows, per_page=20)]}
+            ]
+        }
+
+    def _build_dead_sites_card(self, cached_data: Dict[str, Any]) -> Optional[dict]:
+        """
+        列出看着已经没了的站点，每个带一个停用按钮。
+
+        只做停用不做删除：删除不可逆，而且站点还挂着订阅和下载历史；
+        停用同样能让它不再被刷新，点错了也能在站点管理里恢复。
+        """
+        id_map = self._site_id_map(cached_data)
+        # 页面渲染不能因为一次可选的取数失败就整个挂掉
+        try:
+            streaks = self.get_data("fail_streak") or {}
+        except Exception as e:
+            logger.debug(f"读取连续失败计数失败: {str(e)}")
+            streaks = {}
+        entries = []
+        for site_name, site_cache in cached_data.items():
+            data = self._unwrap(site_cache)
+            reason = (data.get("invite_status") or {}).get("reason", "") or data.get("error", "") or ""
+            site_id = id_map.get(site_name)
+
+            # 站点已经从 MP 里删掉了，但插件这边的缓存不会自己消失，
+            # 页面上会一直挂着一份再也不会更新的旧记录
+            if site_id is None and id_map:
+                entries.append((site_name, "已从 MoviePilot 中删除，此处为残留数据", None))
+                continue
+
+            if (any(mark in reason for mark in self._DEAD_REASON_MARKS)
+                    and int(streaks.get(site_name, 0)) >= self._DEAD_STREAK):
+                entries.append((site_name, f"{reason}（已连续 {streaks.get(site_name)} 轮失败）", site_id))
+
+        if not entries:
+            return None
+
+        rows = []
+        for site_name, reason, site_id in entries:
+            children = [
+                {"component": "VChip", "props": {"size": "small", "color": "error",
+                                                 "variant": "tonal", "class": "mr-2"},
+                 "text": site_name},
+                {"component": "span", "props": {"class": "text-caption"}, "text": reason},
+            ]
+            if site_id is not None:
+                children.append({
+                    "component": "VBtn",
+                    "props": {"size": "x-small", "color": "warning",
+                              "variant": "tonal", "class": "ml-auto"},
+                    "text": "在 MP 中停用",
+                    "events": {
+                        "click": {
+                            "api": "plugin/NexusInviteePlus/disable_site",
+                            "method": "get",
+                            "params": {"apikey": settings.API_TOKEN, "site_id": site_id},
+                        }
+                    }
+                })
+            else:
+                children.append({
+                    "component": "VBtn",
+                    "props": {"size": "x-small", "color": "grey",
+                              "variant": "tonal", "class": "ml-auto"},
+                    "text": "清理残留数据",
+                    "events": {
+                        "click": {
+                            "api": "plugin/NexusInviteePlus/purge_site",
+                            "method": "get",
+                            "params": {"apikey": settings.API_TOKEN, "site_name": site_name},
+                        }
+                    }
+                })
+            rows.append({
+                "component": "div",
+                "props": {"class": "d-flex align-center py-1"},
+                "content": children
+            })
+
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-4"},
+            "content": [
+                {"component": "VCardTitle", "props": {"class": "text-subtitle-1 text-error"},
+                 "text": f"疑似失效站点（{len(rows)}）"},
+                {"component": "VCardText", "content": rows}
+            ]
+        }
+
     def _build_overview_tables(self, cached_data: Dict[str, Any]) -> List[dict]:
         """
         总览区：一张可排序的站点表 + 按状态分好的成员表。
@@ -1341,7 +1614,12 @@ class NexusInviteePlus(_PluginBase):
                 ]
             })
 
-        return [
+        blocks = [self._build_toolbar()]
+        dead_card = self._build_dead_sites_card(cached_data)
+        if dead_card:
+            blocks.append(dead_card)
+
+        blocks += [
             {
                 "component": "VCard",
                 "props": {"variant": "outlined", "class": "mb-4"},
@@ -1367,6 +1645,11 @@ class NexusInviteePlus(_PluginBase):
                 ]
             },
         ]
+
+        changes_card = self._build_changes_card()
+        if changes_card:
+            blocks.append(changes_card)
+        return blocks
 
     def get_page(self) -> List[dict]:
         """
@@ -3926,6 +4209,11 @@ class NexusInviteePlus(_PluginBase):
             
             # 获取现有数据
             existing_data = self.data_manager.get_site_data()
+            # 这一轮的变化事件，写新数据前逐站点 diff 出来
+            round_events = []
+            # 连续失败次数。偶发的 502、超时不该被当成站点没了，
+            # 连挂几轮才有资格进「疑似失效」名单。
+            fail_streak = dict(self.get_data("fail_streak") or {})
             
             # 逐个刷新站点数据
             # 站点名在 MP 里并不唯一（比如两个站都叫「萝莉」：share.ilolicon.com 和
@@ -3990,6 +4278,7 @@ class NexusInviteePlus(_PluginBase):
                     if not error_msg: # 确保总有一个错误消息
                         error_msg = "未知原因导致刷新失败"
                     logger.error(f"站点 {site_name} 数据刷新失败: {error_msg}")
+                    fail_streak[site_name] = int(fail_streak.get(site_name, 0)) + 1
                     error_count += 1
                     error_details.append({"site_name": site_name, "msg": error_msg})
                     
@@ -4035,12 +4324,30 @@ class NexusInviteePlus(_PluginBase):
                             logger.info(f"站点 {site_name} 不可邀请原因: {reason}")
 
                     # 保存站点数据 (保持不变)
+                    # 和上一轮比一次再落盘。注意只有刷新成功的站点才 diff：
+                    # 失败的站点保留的是旧数据，拿去比会误报成「成员集体消失」。
+                    previous = existing_data.get(site_name)
+                    previous_data = previous.get("data") if isinstance(previous, dict) else None
+                    try:
+                        round_events.extend(
+                            changes_mod.diff_site(site_name, previous_data, site_data))
+                    except Exception as e:
+                        logger.error(f"站点 {site_name} 比对变化失败: {str(e)}")
+
+                    fail_streak.pop(site_name, None)
                     self.data_manager.update_site_data(site_name, site_data)
                     success_count += 1
             
             # 发送通知
+            self.save_data("fail_streak", fail_streak)
+
+            if round_events:
+                self.change_store.append(round_events)
+                logger.info(f"本轮记录到 {len(round_events)} 条变化")
+
             if self._notify:
-                self._send_refresh_notification(success_count, error_count, error_details)
+                self._send_refresh_notification(success_count, error_count, error_details,
+                                                events=round_events)
             
             logger.info(f"增量刷新完成: 成功 {success_count} 个站点, 失败 {error_count} 个站点")
             
@@ -4050,85 +4357,65 @@ class NexusInviteePlus(_PluginBase):
             # 清除刷新标志
             self._refreshing = False
     
-    def _send_refresh_notification(self, success_count, error_count,error_details:List=None):
+    def _send_refresh_notification(self, success_count, error_count,
+                                   error_details: List = None, events: List = None):
         """
-        发送刷新结果通知
+        发送刷新结果通知。
+
+        原来是每轮必推，内容永远是「成功 35 失败 12」加同一串失败详情，
+        看两次就麻木了。改成只在有事发生时才推：成员或名额有变化、
+        或者冒出了上一轮没有的新失败。一切照旧就安静待着。
         """
         try:
-            # 从data_manager获取站点数据
-            cached_data = {}
-            site_data = self.data_manager.get_site_data()
-            for site_name, site_info in site_data.items():
-                cached_data[site_name] = site_info
-                
-            # 计算所有站点统计信息
-            total_invitees = 0
-            total_low_ratio = 0
-            total_banned = 0
-            total_no_data = 0
+            events = events or []
+            error_details = error_details or []
 
-            for site_name, cache in cached_data.items():
-                site_cache_data = cache.get("data", {})
-                invitees = []
-                
-                # 尝试不同的数据结构路径获取邀请列表
-                possible_paths = [
-                    ["invitees"],
-                    ["data", "invitees"],
-                    ["data", "data", "invitees"]
-                ]
-                
-                for path in possible_paths:
-                    result = get_nested_value(site_cache_data, path, [])
-                    if result:
-                        invitees = result
-                        break
+            # 失败站点只报「新出现的」。Cookie 失效这种要人工处理的问题会连着好几天
+            # 都失败，每轮都推一遍毫无意义。
+            previous_failures = set(self.get_data("failed_sites") or [])
+            current_failures = {item.get("site_name", "") for item in error_details}
+            new_failures = [item for item in error_details
+                            if item.get("site_name", "") not in previous_failures]
+            recovered = sorted(previous_failures - current_failures)
+            self.save_data("failed_sites", sorted(current_failures))
 
-                # 统计各项数据
-                total_invitees += len(invitees)
+            if not events and not new_failures and not recovered:
+                logger.info(f"本轮无变化（成功 {success_count} / 失败 {error_count}），不发通知")
+                return
 
-                # 统计用户状态 - 使用ratio_health字段
-                banned_count = sum(1 for i in invitees if i.get('enabled', '').lower() == 'no')
-                low_ratio_count = sum(1 for i in invitees if i.get('ratio_health') in ['warning', 'danger'])
-                no_data_count = sum(1 for i in invitees if i.get('ratio_health') == 'neutral')
+            sections = []
 
-                # 累加到总数
-                total_banned += banned_count
-                total_low_ratio += low_ratio_count
-                total_no_data += no_data_count
+            change_text = changes_mod.summarize(events)
+            if change_text:
+                sections.append(change_text)
 
-                logger.info(f"站点 {site_name} 统计结果: 总人数={len(invitees)}, 低分享率={low_ratio_count}, 已禁用={banned_count}, 无数据={no_data_count}")
-            
-            title = "后宫管理系统 - 增量刷新结果"
-            if success_count > 0 or error_count > 0:
-                # --- 修改开始: 添加图标美化通知文本 ---
-                text = f"刷新完成: ✅ 成功 {success_count} 个，❌ 失败 {error_count} 个站点\n"
-                if error_details is not None and len(error_details) > 0:
-                    text += "\n🔻失败详情🔻:\n"
-                    for item in error_details:
-                        # 使用 🔻 标记失败项
-                        text += f"🔻 [{item['site_name']}]: {item['msg']}\n"
-                    text += "\n"
-                # 保持原有统计信息的图标
-                text += f"👨‍👩‍👧‍👦 总邀请人数: {total_invitees}人\n"
-                text += f"⚠️ 分享率低于1.0: {total_low_ratio}人\n"
-                text += f"🚫 已禁用用户: {total_banned}人\n"
-                text += f"🔄 无数据用户: {total_no_data}人\n\n"
-                # --- 修改结束 ---
-                
-                # 添加刷新时间
-                text += f"🕙 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}"
-                
-                # 使用post_message发送通知
-                self.post_message(
-                    mtype=NotificationType.SiteMessage,
-                    title=title,
-                    text=text
-                )
-                logger.info(f"发送通知: {title} - {text}")
+            if new_failures:
+                lines = ["❌ 新增失败站点"]
+                for item in new_failures:
+                    lines.append(f"  [{item.get('site_name', '')}] {item.get('msg', '')}")
+                sections.append("\n".join(lines))
+
+            if recovered:
+                sections.append("🟢 恢复正常：" + "、".join(recovered))
+
+            sections.append(f"📊 本轮 成功 {success_count} / 失败 {error_count}")
+            sections.append(f"🕙 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))}")
+
+            title = "后宫管理系统 - 后宫有变动"
+            if not change_text:
+                title = "后宫管理系统 - 站点状态变化"
+
+            text = "\n\n".join(sections)
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=title,
+                text=text
+            )
+            logger.info(f"发送通知: {title}（变化 {len(events)} 条，新失败 {len(new_failures)} 个）")
         except Exception as e:
             logger.error(f"发送通知失败: {str(e)}")
-            
+            logger.debug(traceback.format_exc())
+
     def get_service(self) -> List[Dict[str, Any]]:
         """
         注册插件公共服务

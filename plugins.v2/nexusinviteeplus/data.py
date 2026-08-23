@@ -71,6 +71,19 @@ class DataManager:
         
         return self.save_data(all_data)
     
+    def remove_site_data(self, site_name: str) -> bool:
+        """
+        删掉某个站点的缓存。
+
+        站点从 MoviePilot 里删掉之后，这里的数据不会自己消失，
+        页面上会一直挂着一份再也不会更新的旧记录。
+        """
+        all_data = self.load_data()
+        if site_name not in all_data:
+            return False
+        all_data.pop(site_name, None)
+        return self.save_data(all_data)
+
     def get_site_data(self, site_name: Optional[str] = None) -> Dict[str, Any]:
         """
         获取站点数据
