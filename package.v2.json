@@ -82,5 +82,18 @@
       "v1.0.0": "首个版本：hhanclub 幸运大转盘自动抽奖，Cookie 支持手动填写 / CookieCloud / 站点管理。"
     },
     "labels": "站点"
+  },
+  "NexusInviteePlus": {
+    "version": "2.0.0",
+    "system_version": ">=2.12.0",
+    "level": 2,
+    "name": "后宫管理系统(自用版)",
+    "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/NexusInviteePlus_A.png",
+    "description": "管理 MP 站点的邀请系统：除 NexusPHP 外额外支持 UNIT3D / Gazelle / TTG 体系，Cookie 失效与站点故障分类上报，撞 CF 盾时用 CloakBrowser 过盾。",
+    "author": "SAGIRIxr",
+    "authorUrl": "https://github.com/SAGIRIxr",
+    "history": {
+      "v2.0.0": "基于 madrays 版重做。新增 UNIT3D / Gazelle / TTG 三套体系的处理器，站点体系改按页面指纹识别而不是硬编码域名；新增 CloakBrowser 过 Cloudflare 盾；M-Team 的 Authorization token 改为可选（只配 apikey 不再崩）；取用户ID 不再死磕 usercp.php；连通性预检不再被首页的 CF 盾一票否决；支持站点代理与 SSL 证书降级；修复憨憨后宫列表解析（改版后一直是 0 人）；统一清洗被误抓成成员的表头行和串列的分享率；Cookie 失效 / 域名失效 / 站点关闭 / CF 拦截分类上报。"
+    }
   }
 }
