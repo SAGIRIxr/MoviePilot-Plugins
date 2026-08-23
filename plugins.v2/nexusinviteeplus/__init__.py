@@ -407,7 +407,7 @@ class NexusInviteePlus(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/NexusInviteePlus_A.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "2.2.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -1192,6 +1192,182 @@ class NexusInviteePlus(_PluginBase):
         # 简单判断，后续可以添加更多特征
         return "php" in site_url.lower()
 
+    # --- 总览表格 ---------------------------------------------------------
+
+    @staticmethod
+    def _unwrap(site_cache: Dict[str, Any]) -> Dict[str, Any]:
+        """缓存里有的站点包了一层 data，有的没包，统一剥开。"""
+        if not isinstance(site_cache, dict):
+            return {}
+        return site_cache.get("data", site_cache) if "data" in site_cache else site_cache
+
+    @staticmethod
+    def _sortable_ratio(invitee: Dict[str, Any]):
+        """
+        给表格用的分享率。
+
+        直接放文本的话 "9.5" 会排在 "10.2" 后面（按字符串比），所以数值型的
+        就放数值；无限大保留 ∞ 这个符号——JS 里它和数字比较结果恒为 false，
+        排序时会原地不动，不会把整张表排乱。
+        """
+        value = invitee.get("ratio_value")
+        if value is not None:
+            return value
+        text = str(invitee.get("ratio") or "").strip()
+        return "∞" if text in ("∞", "inf", "Inf.", "无限") else (text or "-")
+
+    def _collect_rows(self, cached_data: Dict[str, Any]):
+        """把缓存摊平成「站点行」和「成员行」两张表的数据。"""
+        site_rows = []
+        member_rows = []
+
+        for site_name, site_cache in cached_data.items():
+            data = self._unwrap(site_cache)
+            invitees = data.get("invitees") or []
+            status = data.get("invite_status") or {}
+
+            banned = sum(1 for i in invitees if str(i.get("enabled", "")).lower() == "no")
+            low_ratio = sum(1 for i in invitees if i.get("ratio_health") in ("warning", "danger"))
+            no_data = sum(1 for i in invitees if i.get("ratio_health") == "neutral")
+
+            site_rows.append({
+                "site": site_name,
+                "can_invite": "是" if status.get("can_invite") else "否",
+                "perm": status.get("permanent_count", 0) or 0,
+                "temp": status.get("temporary_count", 0) or 0,
+                "members": len(invitees),
+                "low_ratio": low_ratio,
+                "banned": banned,
+                "no_data": no_data,
+                "reason": status.get("reason", "") or "",
+            })
+
+            for invitee in invitees:
+                member_rows.append({
+                    "site": site_name,
+                    "username": invitee.get("username", ""),
+                    "email": invitee.get("email", ""),
+                    "uploaded": invitee.get("uploaded", ""),
+                    "downloaded": invitee.get("downloaded", ""),
+                    "ratio": self._sortable_ratio(invitee),
+                    "status": invitee.get("status", ""),
+                    "_banned": str(invitee.get("enabled", "")).lower() == "no",
+                    "_health": invitee.get("ratio_health"),
+                })
+
+        return site_rows, member_rows
+
+    @staticmethod
+    def _data_table(headers, items, per_page: int = 25) -> dict:
+        """
+        包一个 VDataTable。
+
+        MP 前端用 resolveDynamicComponent 渲染组件树，Vuetify 组件可以直接写，
+        VDataTable 自带的列头排序和分页都是纯前端行为，不用回插件取数。
+        """
+        return {
+            "component": "VDataTable",
+            "props": {
+                "headers": headers,
+                "items": items,
+                "items-per-page": per_page,
+                "density": "compact",
+                "hover": True,
+                "class": "text-caption",
+                "no-data-text": "没有数据",
+            }
+        }
+
+    def _build_overview_tables(self, cached_data: Dict[str, Any]) -> List[dict]:
+        """
+        总览区：一张可排序的站点表 + 按状态分好的成员表。
+
+        原版只有一堆静态卡片，想知道「哪个站后宫最多」「哪些人被 ban 了」
+        只能一张张卡片翻。站点表点列头就能按后宫人数、邀请名额排序；
+        成员按「已禁用 / 分享率偏低 / 无数据」分成折叠面板，展开即是筛选结果。
+        """
+        site_rows, member_rows = self._collect_rows(cached_data)
+        if not site_rows:
+            return []
+
+        site_headers = [
+            {"title": "站点", "key": "site", "sortable": True},
+            {"title": "可邀请", "key": "can_invite", "sortable": True, "align": "center"},
+            {"title": "永久", "key": "perm", "sortable": True, "align": "end"},
+            {"title": "临时", "key": "temp", "sortable": True, "align": "end"},
+            {"title": "后宫人数", "key": "members", "sortable": True, "align": "end"},
+            {"title": "低分享率", "key": "low_ratio", "sortable": True, "align": "end"},
+            {"title": "已禁用", "key": "banned", "sortable": True, "align": "end"},
+            {"title": "状态", "key": "reason", "sortable": False},
+        ]
+        member_headers = [
+            {"title": "站点", "key": "site", "sortable": True},
+            {"title": "用户名", "key": "username", "sortable": True},
+            {"title": "邮箱", "key": "email", "sortable": True},
+            {"title": "上传", "key": "uploaded", "sortable": True, "align": "end"},
+            {"title": "下载", "key": "downloaded", "sortable": True, "align": "end"},
+            {"title": "分享率", "key": "ratio", "sortable": True, "align": "end"},
+            {"title": "状态", "key": "status", "sortable": True, "align": "center"},
+        ]
+
+        def strip_private(rows):
+            return [{k: v for k, v in row.items() if not k.startswith("_")} for row in rows]
+
+        groups = (
+            ("已禁用", [r for r in member_rows if r["_banned"]], "error"),
+            ("分享率偏低", [r for r in member_rows if r["_health"] in ("warning", "danger")], "warning"),
+            ("无数据", [r for r in member_rows if r["_health"] == "neutral"], "grey"),
+            ("全部成员", member_rows, "primary"),
+        )
+
+        panels = []
+        for title, rows, color in groups:
+            clean = strip_private(rows)
+            panels.append({
+                "component": "VExpansionPanel",
+                "content": [
+                    {
+                        "component": "VExpansionPanelTitle",
+                        "content": [{
+                            "component": "span",
+                            "props": {"class": f"text-{color}"},
+                            "text": f"{title}（{len(clean)} 人）"
+                        }]
+                    },
+                    {
+                        "component": "VExpansionPanelText",
+                        "content": [self._data_table(member_headers, clean)]
+                    }
+                ]
+            })
+
+        return [
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-4"},
+                "content": [
+                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                     "text": "站点总览（点击列头排序）"},
+                    {"component": "VCardText", "props": {"class": "pa-0"},
+                     "content": [self._data_table(site_headers, site_rows, per_page=50)]}
+                ]
+            },
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-4"},
+                "content": [
+                    {"component": "VCardTitle", "props": {"class": "text-subtitle-1"},
+                     "text": "后宫成员（展开即筛选，列头可排序）"},
+                    {"component": "VCardText", "props": {"class": "pa-0"},
+                     "content": [{
+                         "component": "VExpansionPanels",
+                         "props": {"variant": "accordion", "multiple": True},
+                         "content": panels
+                     }]}
+                ]
+            },
+        ]
+
     def get_page(self) -> List[dict]:
         """
         详情页面
@@ -1425,6 +1601,9 @@ class NexusInviteePlus(_PluginBase):
                     """
                 }
             ])
+
+            # 站点总览表 + 按状态筛选的成员表，放在最前面
+            page_content.extend(self._build_overview_tables(cached_data))
 
             # 添加头部信息和提示
             page_content.append({

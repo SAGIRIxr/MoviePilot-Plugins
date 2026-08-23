@@ -84,7 +84,7 @@
     "labels": "站点"
   },
   "NexusInviteePlus": {
-    "version": "2.1.0",
+    "version": "2.2.0",
     "system_version": ">=2.12.0",
     "level": 2,
     "name": "后宫管理系统(自用版)",
@@ -93,6 +93,7 @@
     "author": "SAGIRIxr",
     "authorUrl": "https://github.com/SAGIRIxr",
     "history": {
+      "v2.2.0": "详情页新增站点总览表和按状态筛选的成员表，列头可排序；还原被 Cloudflare 混淆的邮箱。",
       "v2.1.0": "修正邀请状态与名额的判定；站点重名不再互相覆盖；失败原因文案精简。",
       "v2.0.0": "新增 UNIT3D / Gazelle / TTG 体系支持；支持浏览器仿真过 Cloudflare、站点代理；失败原因分类展示。"
     }

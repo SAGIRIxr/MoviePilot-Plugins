@@ -100,6 +100,49 @@ def _site_info_of(session: requests.Session) -> Optional[dict]:
     return getattr(session, "_nexusinvitee_site", None)
 
 
+# Cloudflare 的「邮箱地址混淆」会把页面上的邮箱换成
+# <a class="__cf_email__" data-cfemail="84b7b1...">[email&#160;protected]</a>，
+# 真地址 XOR 编码在 data-cfemail 里（首字节是密钥）。不还原的话后宫列表里
+# 每个人的邮箱都显示成 [email protected]。
+_CF_EMAIL_TAG_RE = re.compile(
+    r'<(?P<tag>a|span)[^>]*?data-cfemail="(?P<hex>[0-9a-fA-F]{4,})"[^>]*?>.*?</(?P=tag)>',
+    re.IGNORECASE | re.DOTALL)
+
+
+def _decode_cf_email(hex_text: str) -> str:
+    """按 Cloudflare 的算法还原邮箱：首字节当密钥，其余逐字节异或。"""
+    try:
+        raw = bytes.fromhex(hex_text)
+    except ValueError:
+        return ""
+    if len(raw) < 2:
+        return ""
+    key = raw[0]
+    try:
+        return "".join(chr(b ^ key) for b in raw[1:])
+    except Exception:
+        return ""
+
+
+def _deobfuscate_emails(response: requests.Response) -> None:
+    """把响应里被 Cloudflare 藏起来的邮箱就地还原，让各 handler 无感。"""
+    try:
+        body = response.text
+    except Exception:
+        return
+    if "__cf_email__" not in body and "data-cfemail" not in body:
+        return
+
+    def replace(match):
+        return _decode_cf_email(match.group("hex")) or match.group(0)
+
+    restored = _CF_EMAIL_TAG_RE.sub(replace, body)
+    if restored != body:
+        # response.text 是按 encoding 解 _content 得来的，改内容要连编码一起对齐
+        response._content = restored.encode("utf-8")
+        response.encoding = "utf-8"
+
+
 def request(session: requests.Session, url: str, method: str = "get",
             timeout=(10, 30), _cf_retried: bool = False, **kwargs) -> requests.Response:
     """
@@ -130,6 +173,7 @@ def request(session: requests.Session, url: str, method: str = "get",
         raise SiteAccessError("请求超时，站点响应过慢或被墙")
 
     _fix_encoding(response)
+    _deobfuscate_emails(response)
 
     # 撞上 CF 挑战页：拿一次通行证重试。只重试一次，拿不到就把 403 原样交回去，
     # 让上层报「被 Cloudflare 盾拦截」而不是在这里空转
