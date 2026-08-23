@@ -90,6 +90,22 @@ class _ISiteHandler(metaclass=ABCMeta):
         logger.error(f"获取用户ID失败: {site_url} 的 {'/'.join(_ISiteHandler._USER_ID_PAGES)} 都没解析出用户ID")
         return None
 
+    # NexusPHP 系站点统一在用户名后面挂一个 <img class="disabled" alt="Disabled">
+    # 来标记被封禁的用户，页面上并没有单独的「启用」列可看。
+    _BANNED_SELECTOR = ('img.disabled, img[alt="Disabled"], img[alt="disabled"], '
+                        'img[src*="disabled"], s, strike, del')
+    _BANNED_ROW_CLASSES = ("rowbanned", "banned", "disabled")
+
+    @classmethod
+    def _is_banned_row(cls, node) -> bool:
+        """判断一行（或一个用户名单元格）对应的用户是不是被封禁了。"""
+        if node is None:
+            return False
+        classes = node.get("class") or []
+        if any(c in cls._BANNED_ROW_CLASSES for c in classes):
+            return True
+        return node.select_one(cls._BANNED_SELECTOR) is not None
+
     @staticmethod
     def _convert_size_to_bytes(size_str: str) -> float:
         """

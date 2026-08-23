@@ -479,7 +479,14 @@ class HHClubHandler(_ISiteHandler):
                 if text in self._STATUS_WORDS:
                     status = text
                     break
-            banned = bool(status) and status not in ("已确认", "待确认", "未确认")
+
+            # 憨憨的「状态」列对所有人都写「已确认」，被封禁与否是靠用户名后面
+            # 那个 <img class="disabled" alt="Disabled"> 标出来的，只看状态列会漏掉。
+            banned = self._is_banned_row(cells[0]) or self._is_banned_row(row)
+            if not banned and status:
+                banned = status not in ("已确认", "待确认", "未确认")
+            if banned and status in ("", "已确认"):
+                status = "已禁用"
 
             invitee = {
                 "username": username,

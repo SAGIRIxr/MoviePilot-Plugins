@@ -408,7 +408,7 @@ class NexusInviteePlus(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/NexusInviteePlus_A.png"
     # 插件版本
-    plugin_version = "2.5.0"
+    plugin_version = "2.6.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -427,6 +427,8 @@ class NexusInviteePlus(_PluginBase):
     _onlyonce = False
     _nexus_sites = []  # 支持多选的站点列表
     _browser_emulation = True  # 撞上 CF 盾时是否用 CloakBrowser 取通行证
+    _card_sort = "name"        # 站点卡片排序方式
+    _collapse_cards = False    # 站点卡片是否默认折叠
     
     # 站点助手
     sites: SitesHelper = None
@@ -489,6 +491,8 @@ class NexusInviteePlus(_PluginBase):
             self._cron = config.get("cron", "0 9 * * *")
             self._onlyonce = config.get("onlyonce", False)
             self._browser_emulation = config.get("browser_emulation", True)
+            self._card_sort = config.get("card_sort") or "name"
+            self._collapse_cards = config.get("collapse_cards", False)
 
             # 处理站点ID
             self._nexus_sites = []
@@ -590,6 +594,8 @@ class NexusInviteePlus(_PluginBase):
             "cron": self._cron,
             "onlyonce": self._onlyonce,
             "browser_emulation": self._browser_emulation,
+            "card_sort": self._card_sort,
+            "collapse_cards": self._collapse_cards,
             "site_ids": self._nexus_sites
         }
         # 使用父类的update_config方法而不是自己的方法，避免递归
@@ -1256,6 +1262,44 @@ class NexusInviteePlus(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'card_sort',
+                                            'label': '站点卡片排序',
+                                            'items': [{'title': v, 'value': k}
+                                                      for k, v in NexusInviteePlus.CARD_SORTS.items()],
+                                            'persistent-hint': True,
+                                            'hint': '详情页里那一堆站点卡片的排列顺序。'
+                                                    '页面本身做不了「点一下就重排」，顺序在这里选好，保存后生效。'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'collapse_cards',
+                                            'label': '折叠站点卡片',
+                                            'persistent-hint': True,
+                                            'hint': '每个站点只占一行摘要，点开才展开详情，省得一路往下滚。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
                                 'props': {
                                     'cols': 12
                                 },
@@ -1282,6 +1326,8 @@ class NexusInviteePlus(_PluginBase):
             "cron": "0 9 * * *",
             "onlyonce": False,
             "browser_emulation": self._browser_emulation,
+            "card_sort": self._card_sort,
+            "collapse_cards": self._collapse_cards,
             "site_ids": self._nexus_sites
         }
 
@@ -1360,6 +1406,85 @@ class NexusInviteePlus(_PluginBase):
             return {}
         names = self._resolve_display_names(indexers)
         return {display: sid for sid, display in names.items() if display in cached_data}
+
+    # --- 站点卡片的排序与折叠 ---------------------------------------------
+
+    # 排序方式。MP 的组件树渲染器没有双向绑定，页面上做不出「点一下就重排」的交互，
+    # 所以顺序在服务端定好，配置页选一次就行。
+    CARD_SORTS = {
+        "name": "站点名称",
+        "members": "后宫人数（多的在前）",
+        "invites": "剩余邀请（多的在前）",
+        "problem": "待处理优先（失败、可邀请、有后宫）",
+    }
+
+    def _card_sort_key(self, site_name: str, cached_data: Dict[str, Any]):
+        """按当前排序方式算一个排序键。"""
+        data = self._unwrap(cached_data.get(site_name) or {})
+        status = data.get("invite_status") or {}
+        invitees = data.get("invitees") or []
+        quota = (status.get("permanent_count", 0) or 0) + (status.get("temporary_count", 0) or 0)
+
+        mode = self._card_sort
+        if mode == "members":
+            return (-len(invitees), site_name)
+        if mode == "invites":
+            return (-quota, site_name)
+        if mode == "problem":
+            # 取数失败的排最前，其次是现在就能发邀请的，再次是有后宫要盯的
+            failed = 0 if (data.get("error") or data.get("fetch_failed")) else 1
+            can_invite = 0 if status.get("can_invite") else 1
+            return (failed, can_invite, -len(invitees), site_name)
+        return (site_name,)
+
+    def _card_summary(self, site_name: str, cached_data: Dict[str, Any]) -> str:
+        """折叠状态下显示的一行摘要。"""
+        data = self._unwrap(cached_data.get(site_name) or {})
+        status = data.get("invite_status") or {}
+        invitees = data.get("invitees") or []
+        banned = sum(1 for i in invitees if str(i.get("enabled", "")).lower() == "no")
+        perm = status.get("permanent_count", 0) or 0
+        temp = status.get("temporary_count", 0) or 0
+
+        parts = [f"后宫 {len(invitees)}"]
+        if perm or temp:
+            parts.append(f"邀请 {perm}" + (f"+{temp}临" if temp else ""))
+        if banned:
+            parts.append(f"禁用 {banned}")
+        parts.append("可邀请" if status.get("can_invite") else "不可邀请")
+        if data.get("error") or data.get("fetch_failed"):
+            parts.append("取数失败")
+        return f"{site_name}　·　" + "　".join(parts)
+
+    def _arrange_cards(self, cards: List[Any], cached_data: Dict[str, Any]) -> List[dict]:
+        """
+        把站点卡片排好序，需要的话再折叠起来。
+
+        站点一多，详情页就是几十张展开的大卡片，找一个站点得一路滚。
+        折叠之后每个站点只占一行摘要，点开才展开原来的卡片内容。
+        """
+        ordered = sorted(cards, key=lambda item: self._card_sort_key(item[0], cached_data))
+
+        if not self._collapse_cards:
+            return [card for _, card in ordered]
+
+        panels = []
+        for site_name, card in ordered:
+            panels.append({
+                "component": "VExpansionPanel",
+                "content": [
+                    {"component": "VExpansionPanelTitle",
+                     "content": [{"component": "span",
+                                  "props": {"class": "text-body-2"},
+                                  "text": self._card_summary(site_name, cached_data)}]},
+                    {"component": "VExpansionPanelText", "content": [card]},
+                ]
+            })
+        return [{
+            "component": "VExpansionPanels",
+            "props": {"variant": "accordion", "multiple": True, "class": "mb-4"},
+            "content": panels
+        }]
 
     def _build_toolbar(self) -> dict:
         """页面顶部的操作条。"""
@@ -3542,7 +3667,8 @@ class NexusInviteePlus(_PluginBase):
                             }]
                         })
                     
-                    cards.append(site_card)
+                    # 带上站点名，后面排序和折叠摘要都要用
+                    cards.append((site_name, site_card))
                                 # 添加药单组件到总览下方
             drug_component = self.presc.getComponent()
             if drug_component:
@@ -3551,8 +3677,8 @@ class NexusInviteePlus(_PluginBase):
             # 站点卡片上方：导出、失效站点、可排序的站点总览表、最近变化
             page_content.extend(self._build_overview_tables(cached_data))
 
-            # 将站点卡片添加到页面
-            page_content.extend(cards)
+            # 将站点卡片添加到页面（先按配置排序，需要的话折叠起来）
+            page_content.extend(self._arrange_cards(cards, cached_data))
 
             # 添加说明提示
             if not cards:

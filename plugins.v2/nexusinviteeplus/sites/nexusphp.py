@@ -583,6 +583,27 @@ class NexusPhpHandler(_ISiteHandler):
         # If parsing was successful (not early_check_failed and no parsing error)
         return result
     
+    @staticmethod
+    def _find_header_row(table):
+        """
+        找出表格的表头行，以及它的列名。
+
+        只取表头行的**直接**子单元格：用 select('td, th') 会连嵌套表格里的
+        单元格一起收进来，列名列表一多头，后面按下标取值就全错位了。
+        """
+        best = (None, [])
+        for row in table.select('tr'):
+            cells = row.select(':scope > td, :scope > th')
+            if len(cells) < 3:
+                continue
+            names = [c.get_text(strip=True) for c in cells]
+            joined = ' '.join(names).lower()
+            if any(k in joined for k in ('用户名', '邮箱', 'email', 'username', '分享率', 'ratio')):
+                return row, names
+            if not best[0]:
+                best = (row, names)
+        return best
+
     def _parse_nexusphp_invite_page(self, site_name: str, html_content: str, is_next_page: bool = False) -> Dict[str, Any]:
         """
         解析NexusPHP邀请页面HTML内容
@@ -997,18 +1018,19 @@ class NexusPhpHandler(_ISiteHandler):
                 invitee_tables = [table for table in all_tables 
                                  if len(table.select('tr')) > 2]
         
+        # 有的站点（观众 audiences.me）把后宫表整个套在一张外层包装表里，
+        # 外层表的第一个单元格装着整张内表。挑表时先把这种壳排掉，
+        # 否则表头会多解析出一个「整张表的文本」，后面每一列都跟着错位一格。
+        inner_tables = [t for t in invitee_tables if not t.select_one("table")]
+        if inner_tables:
+            invitee_tables = inner_tables
+
         # 处理找到的表格
         for table in invitee_tables:
-            # 获取表头
-            header_row = table.select_one('tr')
+            header_row, headers = self._find_header_row(table)
             if not header_row:
                 continue
-                
-            headers = []
-            header_cells = header_row.select('td.colhead, th.colhead, td, th')
-            for cell in header_cells:
-                headers.append(cell.get_text(strip=True))
-                
+
             # 检查是否是用户表格 - 查找关键列头
             if not any(keyword in ' '.join(headers).lower() for keyword in 
                       ['用户名', '邮箱', 'email', '分享率', 'ratio', 'username']):
@@ -1016,8 +1038,10 @@ class NexusPhpHandler(_ISiteHandler):
                 
             logger.debug(f"站点 {site_name} 找到后宫用户表，表头: {headers}")
             
-            # 解析表格行
-            rows = table.select('tr:not(:first-child)')
+            # 解析表格行。不能用 tr:not(:first-child)：表格一旦分了 thead/tbody，
+            # 第一个数据行也是它所在 tbody 的首子元素，会被这个选择器一并排除掉，
+            # 于是每个站点的后宫都少算一个人。
+            rows = [tr for tr in table.select('tr') if tr is not header_row]
             for row in rows:
                 cells = row.select('td')
                 if not cells or len(cells) < 3:  # 至少需要3列才可能是有效数据
