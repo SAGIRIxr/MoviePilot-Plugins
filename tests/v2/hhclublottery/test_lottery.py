@@ -774,3 +774,62 @@ def test_deadline_cap_is_three_days():
     check("留空 = 不限制", L.LotteryOptions(max_minutes="").max_minutes, 0.0)
     check("0 也是不限制", L.LotteryOptions(max_minutes=0).max_minutes, 0.0)
     check("填太小收敛到 1 分钟", L.LotteryOptions(max_minutes=0.2).max_minutes, 1.0)
+# ---------------- 平均每抽用时 ----------------
+
+def _paced_runner(draws_done=4, elapsed=120.0, **opts):
+    """造一个「已经跑了 elapsed 秒、出了 draws_done 抽」的 runner。"""
+    runner, _, notices = make_runner("127.0.0.1:1", draws=0, **opts)
+    runner.current["draws"] = draws_done
+    runner.total["draws"] = draws_done
+    runner.started_at = L.time.time() - elapsed
+    return runner, notices
+
+
+def test_pace_is_none_before_the_first_draw():
+    """一抽都没出的时候不能给 0.0 —— 除以 0 没法算，
+    摆个「平均每抽 0.0 秒」出来更像在吹牛。"""
+    runner, _, _ = make_runner("127.0.0.1:1", draws=1)
+    check("没抽过 算不出", runner.pace_seconds(), None)
+    check("没抽过 没文案", runner.pace_text(), None)
+
+
+def test_pace_is_wall_clock_over_draws():
+    """报实际速度，不是配置里的间隔 —— 限流退避、清站内信都摊在里面。"""
+    runner, _ = _paced_runner(draws_done=4, elapsed=120.0, interval=6.8)
+    check("120 秒 4 抽", round(runner.pace_seconds(), 1), 30.0)
+    check("文案带单位", runner.pace_text(), "30.0 秒")
+
+
+def test_periodic_report_shows_pace():
+    runner, notices = _paced_runner(periodic_minutes=10, notify_periodic=True)
+    runner.interval_stats["draws"] = 5
+    runner.interval_stats["cost"] = 10000
+    runner.push_periodic_report()
+    check_true("战报带速度", "│ 平均每抽：30.0 秒" in notices[0][1])
+
+
+def test_summary_shows_pace():
+    runner, _ = _paced_runner()
+    check_true("结算带速度", "│ 平均每抽：30.0 秒" in runner.summary_notice())
+
+
+def test_summary_without_a_single_draw():
+    """一抽没出就收工（余额不够之类），这一栏直接不摆。"""
+    runner, _, _ = make_runner("127.0.0.1:1", draws=1)
+    check_true("没抽过 不摆这一栏", "平均每抽" not in runner.summary_notice("余额不足"))
+
+
+def test_big_prize_notice_shows_pace():
+    runner, notices = _paced_runner(big_prize_kinds=["vip"])
+    runner.push_big_prize({"type": "vip", "value": 0, "label": "7 天"}, "VIP 7 天")
+    check_true("大奖通知带速度", "⏱️ 平均每抽：30.0 秒" in notices[0][1])
+
+
+def test_invite_is_off_by_default():
+    """邀请出得密，默认不勾；勾了照推。"""
+    check("默认那两样", L.DEFAULT_BIG_PRIZE_KINDS, ["vip", "beans"])
+    check("没指定就用默认", L.LotteryOptions().big_prize_kinds, {"vip", "beans"})
+    check("勾上就有", L.LotteryOptions(big_prize_kinds=["vip", "invite"]).big_prize_kinds,
+          {"vip", "invite"})
+    check("明明白白给个空的 = 一条不推", L.LotteryOptions(big_prize_kinds=[]).big_prize_kinds, set())
+

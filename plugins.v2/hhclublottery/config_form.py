@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Tuple
 
 from app.core.config import settings
 
-from .lottery import BIG_PRIZE_KINDS, MAX_DEADLINE_MINUTES
+from .lottery import BIG_PRIZE_KINDS, DEFAULT_BIG_PRIZE_KINDS, MAX_DEADLINE_MINUTES
 
 
 def build_form() -> Tuple[List[dict], Dict[str, Any]]:
@@ -137,7 +137,7 @@ def build_form() -> Tuple[List[dict], Dict[str, Any]]:
                             "multiple": True, "chips": True, "clearable": True,
                             "items": [{"title": title, "value": value}
                                       for value, title in BIG_PRIZE_KINDS.items()],
-                            "hint": "勾中的当场推一条，一样都不勾 = 不推",
+                            "hint": "勾中的当场推一条，一样都不勾 = 不推；邀请出得密，默认没勾",
                             "persistent-hint": True}}),
                         col(3, {"component": "VSwitch", "props": {
                             "model": "notify_periodic", "label": "定时战报", "color": "info",
@@ -271,7 +271,7 @@ def build_form() -> Tuple[List[dict], Dict[str, Any]]:
         "clean_mail": False,
         "stop_on_vip": False,
         "stop_on_780k": False,
-        "big_prize_kinds": list(BIG_PRIZE_KINDS),
+        "big_prize_kinds": list(DEFAULT_BIG_PRIZE_KINDS),
         "notify_periodic": False,
         "periodic_minutes": 30,
         "use_proxy": False,

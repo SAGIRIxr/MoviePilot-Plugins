@@ -196,6 +196,10 @@ BIG_PRIZE_KINDS: Dict[str, str] = {
     "invite": "📧 邀请",
 }
 
+# 默认不勾邀请。邀请出得比前两样密，挂机一晚能推出十几条 ——
+# 想要的人自己勾上，比让所有人先被刷屏一晚再去找开关强
+DEFAULT_BIG_PRIZE_KINDS: List[str] = ["vip", "beans"]
+
 
 def parse_prize_text(text) -> Dict:
     compact = re.sub(r"\s+", " ", str(text or "").strip())
@@ -759,11 +763,11 @@ class LotteryOptions:
         self.duration_buffer_ms: int = int(kwargs.get("duration_buffer_ms") or 0)
         self.max_minutes: float = float(kwargs.get("max_minutes") or 0)
         self.clean_mail: bool = bool(kwargs.get("clean_mail"))
-        # 没指定就三样都推 —— 和从前「中大奖即时推送」默认开着是一个意思。
-        # 明明白白给个空的才是一条都不推
+        # 没指定就走默认那几样。明明白白给个空的才是一条都不推
         picked = kwargs.get("big_prize_kinds")
-        self.big_prize_kinds = {kind for kind in (BIG_PRIZE_KINDS if picked is None else picked)
-                                if kind in BIG_PRIZE_KINDS}
+        if picked is None:
+            picked = DEFAULT_BIG_PRIZE_KINDS
+        self.big_prize_kinds = {kind for kind in picked if kind in BIG_PRIZE_KINDS}
         # 两个停止条件独立开关，都默认关。和上面挑的通知项互不影响 ——
         # 通知想宽松点、停机想严格点，本来就是两回事。
         self.stop_on_vip: bool = bool(kwargs.get("stop_on_vip"))
@@ -1031,6 +1035,7 @@ class LotteryRunner:
                 "draws_target": self.options.draws,
                 "started_at": self.started_at,
                 "remaining": self.remaining_seconds(),
+                "pace": self.pace_seconds(),
                 "mail_cleaned": self.mail_cleaned,
             }
 
@@ -1164,6 +1169,7 @@ class LotteryRunner:
             "━━━━━━━━━━━━━━━━━━━",
             "📊 本次运行数据",
             f"  🎲 已抽：{fmt(self.current['draws'])} 抽",
+            *([f"  ⏱️ 平均每抽：{self.pace_text()}"] if self.pace_seconds() else []),
             f"  🔥 消耗：{fmt(self.current['cost'])} 憨豆",
             f"  🎁 获得：{fmt(self.current['gains']['beans'])} 憨豆",
             f"  🚀 净盈亏：{_signed(profit)}（{'+' if rate >= 0 else ''}{rate:.1f}%）",
@@ -1203,6 +1209,7 @@ class LotteryRunner:
             "╭─ ⏰ 播报概览",
             f"│ 统计区间：近 {elapsed_minutes} 分钟",
             f"│ 持续运行：{format_duration((time.time() - self.started_at) * 1000)}",
+            *([f"│ 平均每抽：{self.pace_text()}"] if self.pace_seconds() else []),
             *([f"│ 定时结束：还有 {self.remaining_text()}"] if self.deadline else []),
             f"╰─ 播报时间：{self.now_text()}",
             "━━━━━━━━━━━━━━━━━━━",
@@ -1257,6 +1264,21 @@ class LotteryRunner:
     def remaining_text(self) -> Optional[str]:
         left = self.remaining_seconds()
         return None if left is None else format_duration(left * 1000)
+
+    def pace_seconds(self) -> Optional[float]:
+        """平均每抽用时。一抽都没出的时候是 None —— 除以 0 没法算，
+        而且刚起步那几秒摆个数字出来也只是噪声。
+
+        用的是「跑了多久 / 抽了多少」，不是配置里的间隔：限流退避、站内信
+        清理、重试都摊在里面，这才是实际速度。"""
+        draws = self.current["draws"]
+        if not draws:
+            return None
+        return (time.time() - self.started_at) / draws
+
+    def pace_text(self) -> Optional[str]:
+        pace = self.pace_seconds()
+        return None if pace is None else f"{pace:.1f} 秒"
 
     def should_continue(self) -> bool:
         if self.stopping():
@@ -1564,6 +1586,7 @@ class LotteryRunner:
             "╭─ 🎯 任务结算",
             f"│ 运行状态：{status_text}",
             f"│ 运行时长：{format_duration((time.time() - self.started_at) * 1000)}",
+            *([f"│ 平均每抽：{self.pace_text()}"] if self.pace_seconds() else []),
             f"│ 最终余额：{fmt(self.balance)} 憨豆",
             f"╰─ 结束时间：{self.now_text()}",
             "━━━━━━━━━━━━━━━━━━━",

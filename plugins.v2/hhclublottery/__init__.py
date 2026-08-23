@@ -21,6 +21,7 @@ from .config_form import build_form
 from .lottery import (
     BIG_PRIZE_KINDS,
     CookieInvalid,
+    DEFAULT_BIG_PRIZE_KINDS,
     _num,
     first_number,
     JACKPOT_BEANS,
@@ -122,7 +123,7 @@ class HHClubLottery(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png"
     # 插件版本
-    plugin_version = "1.14.0"
+    plugin_version = "1.15.0"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -159,7 +160,7 @@ class HHClubLottery(_PluginBase):
     _stop_on_780k = False
 
     # 通知
-    _big_prize_kinds = list(BIG_PRIZE_KINDS)
+    _big_prize_kinds = list(DEFAULT_BIG_PRIZE_KINDS)
     _notify_periodic = False
     _periodic_minutes = 30
 
@@ -316,7 +317,7 @@ class HHClubLottery(_PluginBase):
 
         老配置里是「中大奖即时推送」开关 + 一个憨豆门槛，得照着原来的意思翻一遍 ——
         不然升级完通知会悄悄变样：关掉推送的人突然开始收通知，或者把门槛调到 100
-        的人一夜之间收几百条。翻不出来就按全新安装算（三样都推）。"""
+        的人一夜之间收几百条。翻不出来就按全新安装算（默认那几样）。"""
         picked = config.get("big_prize_kinds")
         if picked is not None:
             if isinstance(picked, str):
@@ -325,7 +326,7 @@ class HHClubLottery(_PluginBase):
             return [kind for kind in BIG_PRIZE_KINDS if kind in chosen]
 
         if "notify_big_prize" not in config and "big_prize_min_beans" not in config:
-            return list(BIG_PRIZE_KINDS)
+            return list(DEFAULT_BIG_PRIZE_KINDS)
         if not (config.get("notify_big_prize")
                 if config.get("notify_big_prize") is not None else True):
             return []
@@ -815,6 +816,8 @@ class HHClubLottery(_PluginBase):
                 "elapsed": format_duration((time.time() - runner.started_at) * 1000),
                 # 没设定时结束就是 null，外部轮询时好判断
                 "remaining": runner.remaining_text(),
+                # 还没出第一抽时是 null，同理
+                "pace": runner.pace_text(),
             })
         return {"code": 0, "message": "ok", "data": status}
 
@@ -913,13 +916,16 @@ class HHClubLottery(_PluginBase):
                                f"盈亏 {profit_text} · 余额 {fmt(live['balance'])} 憨豆")})
 
         timing = f"已跑 {format_duration(elapsed * 1000)}"
+        # 速度是判断「今晚跑不跑得完、是不是被限流拖住了」的那个数，
+        # 有没有目标抽数都得摆出来 —— 从前只在一抽到底时才显示
+        pace = live.get("pace")
+        if pace:
+            timing += f" · 平均每抽 {pace:.1f} 秒"
         eta = None
         if target and draws:
             # 按已经抽出来的速度估，比拿配置里的间隔算准 —— 限流、退避都算在里面了
             eta = max(0, target - draws) * (elapsed / draws)
             timing += f" · 预计还要 {format_duration(eta * 1000)}"
-        elif draws:
-            timing += f" · 平均每抽 {round(elapsed / draws, 1)} 秒"
         # 定时结束留空时是 None —— 不限时就不摆这一栏，摆个「还有 0」更让人犯嘀咕
         left = live.get("remaining")
         if left is not None:

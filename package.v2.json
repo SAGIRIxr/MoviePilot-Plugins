@@ -49,7 +49,7 @@
     "labels": "签到"
   },
   "HHClubLottery": {
-    "version": "1.14.0",
+    "version": "1.15.0",
     "level": 2,
     "name": "HHCLUB幸运大转盘",
     "icon": "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/HHLottery_A.png",
@@ -58,6 +58,7 @@
     "authorUrl": "https://github.com/SAGIRIxr",
     "system_version": ">=2.12.0",
     "history": {
+      "v1.15.0": "换了新图标；状态卡、大奖通知、定时战报、收工结算都带上了「平均每抽用时」；邀请通知默认不勾。",
       "v1.14.0": "定时结束最多能设到 3 天（原来是 24 小时）。",
       "v1.13.0": "开了定时结束的话，状态卡和通知里会带上「距定时结束还有多久」。",
       "v1.12.0": "「单次运行上限」改名「定时结束」，默认留空不限时；「中大奖即时推送」改成勾选，可选 VIP / 780,000 以上憨豆 / 邀请。",

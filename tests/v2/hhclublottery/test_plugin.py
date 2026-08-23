@@ -2234,7 +2234,8 @@ def test_beans_pick_uses_the_roster_line(plugin, instant):
 
 
 @pytest.mark.parametrize("legacy,expected", [
-    ({}, ["vip", "beans", "invite"]),
+    # 认不出来的老配置按全新安装算：VIP + 憨豆，邀请默认不勾
+    ({}, ["vip", "beans"]),
     ({"notify_big_prize": False, "big_prize_min_beans": 780000}, []),
     ({"notify_big_prize": True, "big_prize_min_beans": 780000}, ["vip", "beans"]),
     ({"notify_big_prize": True, "big_prize_min_beans": 0}, ["vip"]),
@@ -2330,6 +2331,47 @@ def test_status_api_reports_remaining(plugin, monkeypatch):
     assert "remaining" not in plugin.api_status()["data"], "空闲时整块运行数据都不摆"
 
 
+# ============================================================
+# 平均每抽用时
+# ============================================================
+
+def test_status_card_shows_pace_with_a_target(plugin, monkeypatch):
+    """有目标抽数时也得摆速度 —— 从前只在「一抽到底」下才显示，
+    可「是不是被限流拖住了」跟有没有目标压根没关系。"""
+    page = _page_mid_run(plugin, monkeypatch, draws=100)
+    assert "平均每抽 40.0 秒" in page, "跑了 2 分钟出了 3 抽"
+    assert "预计还要" in page, "速度和预计要并排摆着，不是二选一"
+
+
+def test_status_card_shows_pace_without_a_target(plugin, monkeypatch):
+    """一抽到底也照样摆（拿定时结束把这一轮收住，免得测试没边）。"""
+    page = _page_mid_run(plugin, monkeypatch, draws=0, max_minutes=10)
+    assert "一抽到底" in page
+    assert "平均每抽 40.0 秒" in page
+    assert "预计还要" not in page, "没有分母，预计不出来"
+
+
+def test_status_api_reports_pace(plugin, monkeypatch):
+    """外部轮询也拿得到；第一抽还没出来时是 null。"""
+    site = FakeSite()
+    site.draw_queue = [win("补签卡 1") for _ in range(20)]
+    server, host = start_site(site)
+    seen = {}
+
+    def sleep_hook(self, ms):
+        seen.setdefault(self.current["draws"], plugin.api_status()["data"])
+        return self.stop_event.is_set()
+
+    monkeypatch.setattr(HH.LotteryRunner, "sleep", sleep_hook)
+    try:
+        _configure(plugin, host, draws=3)
+        plugin.run_lottery()
+    finally:
+        stop_site(server)
+
+    assert seen[1]["pace"].endswith(" 秒"), f"出了一抽就算得出来：{seen[1]['pace']!r}"
+
+
 def _find_prop(node, model, prop):
     """在配置页里找到某个控件的某个属性。"""
     if isinstance(node, dict):
@@ -2356,3 +2398,14 @@ def test_deadline_field_says_blank_means_no_limit(plugin):
     assert "留空 = 不限制" in hint
     assert "4320" in hint and "3 天" in hint, f"上限要说清楚：{hint!r}"
     assert defaults["max_minutes"] == ""
+
+
+def test_invite_is_not_checked_by_default(plugin):
+    """邀请出得比 VIP、780,000 密得多，挂机一晚能推十几条 ——
+    想要的人自己勾，别让所有人先被刷屏一晚再去找开关。"""
+    _, defaults = plugin.get_form()
+    assert defaults["big_prize_kinds"] == ["vip", "beans"]
+    assert "invite" not in defaults["big_prize_kinds"]
+    # 选项本身还得在，只是没勾上
+    items = _find_prop(plugin.get_form()[0], "big_prize_kinds", "items")
+    assert [item["value"] for item in items] == ["vip", "beans", "invite"]
