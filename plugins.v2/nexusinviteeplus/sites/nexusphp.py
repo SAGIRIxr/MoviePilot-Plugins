@@ -21,36 +21,83 @@ class NexusPhpHandler(_ISiteHandler):
     # 站点类型标识
     site_schema = "nexusphp"
 
-    # 邀请名额的权威来源，按可靠性从高到低排。
-    # 前两条是发送页顶部那句「邀请其他人加入XXX (35个剩余邀请 + 0个临时邀请)」，
-    # 后两条是每页顶栏的「邀请 [ 发送 ]: 1(0)」/「[ 邀請 : 7 發送 ]」。
-    # 原来的解析要先在页面里找到 invite 链接再读它父节点的文本，皇后(open.cd)
-    # 这种魔改皮肤找不到就直接算 0 个名额，可它顶栏明明写着「邀請 : 7」。
-    _QUOTA_PATTERNS = (
-        r"[（(]\s*(\d+)\s*个剩余邀请\s*(?:\+\s*(\d+)\s*个临时邀请)?\s*[）)]",
-        r"[（(]\s*(\d+)\s*個剩餘邀請\s*(?:\+\s*(\d+)\s*個臨時邀請)?\s*[）)]",
-        r"邀[请請]\s*\[[^\]]{0,12}\]\s*[:：]\s*(\d+)(?:\s*[（(]\s*(\d+)\s*[）)])?",
-        r"\[\s*邀[请請]\s*[:：]\s*(\d+)(?:\s*[（(]\s*(\d+)\s*[）)])?[^\]]{0,12}\]",
+    # 邀请名额的写法各站不一样，分成两档来认。
+    #
+    # 第一档：能明确分出永久和临时的写法，最可信。注意「N/M」这种斜杠格式
+    # （家园 hdhome、猫站、我堡都在用）左边是永久右边是临时，原来只认括号格式
+    # 的话，家园的「0/1」会匹配不上，退而去读发送页那句「(1个剩余邀请)」——
+    # 那是个总数，于是 1 个临时邀请被整个算成了永久。
+    _QUOTA_SPLIT_PATTERNS = (
+        # 发送页顶部：「邀请其他人加入XXX (35个剩余邀请 + 0个临时邀请)」
+        r"(\d+)\s*个剩余邀请\s*\+\s*(\d+)\s*个临时邀请",
+        r"(\d+)\s*個剩餘邀請\s*\+\s*(\d+)\s*個臨時邀請",
+        # 顶栏：「邀请 [ 发送 ]: 1(0)」，也有不带中括号直接「邀请 0(0)」的（织梦）
+        r"邀[请請](?:\s*\[[^\]]{0,12}\])?\s*[:：]?\s*(\d+)\s*[（(]\s*(\d+)\s*[）)]",
+        # 顶栏：「邀请 [ 发送 ]: 0/1」，左永久右临时
+        r"邀[请請](?:\s*\[[^\]]{0,12}\])?\s*[:：]?\s*(\d+)\s*/\s*(\d+)",
+        r"\[\s*邀[请請]\s*[:：]?\s*(\d+)\s*[（(]\s*(\d+)\s*[）)]",
+        r"\[\s*邀[请請]\s*[:：]?\s*(\d+)\s*/\s*(\d+)",
     )
+
+    # 第二档：只给一个数字，分不出永久临时，只能全算成永久。
+    # 「已邀请用户」「已生成邀请链接」这类也是「邀请+冒号+数字」，
+    # 但它们不是名额，所以兜底那条要把「已」「被」开头的排除掉。
+    _QUOTA_TOTAL_PATTERNS = (
+        r"永久邀[请請]名[额額]\s*[:：]\s*(\d+)",
+        r"(?:剩余|剩餘|私人)邀[请請]\s*[:：]\s*(\d+)",
+        r"(\d+)\s*个剩余邀请",
+        r"(\d+)\s*個剩餘邀請",
+        r"邀[请請]\s*\[[^\]]{0,12}\]\s*[:：]\s*(\d+)",
+        r"\[\s*邀[请請]\s*\]\s*[:：]\s*(\d+)",
+        r"\[\s*邀[请請]\s*[:：]\s*(\d+)[^\]]{0,12}\]",
+        r"(?<![已被])邀[请請]\s*[:：]\s*(\d+)",
+    )
+
+    @classmethod
+    def _extract_quota_split(cls, text: str):
+        """只认能分出永久/临时的写法，返回 (永久, 临时)。"""
+        if not text:
+            return None
+        for pattern in cls._QUOTA_SPLIT_PATTERNS:
+            m = re.search(pattern, text)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        return None
+
+    @classmethod
+    def _extract_quota_total(cls, text: str):
+        """只认单个数字的写法，返回总数。"""
+        if not text:
+            return None
+        for pattern in cls._QUOTA_TOTAL_PATTERNS:
+            m = re.search(pattern, text)
+            if m:
+                return int(m.group(1))
+        return None
+
+    @classmethod
+    def _extract_quota(cls, *texts):
+        """
+        从若干段页面文本里抠出 (永久, 临时)。
+
+        先在所有文本里找能分永久/临时的写法，找不到才退回只有总数的写法——
+        否则一个笼统的总数会盖掉另一页上更精确的拆分结果。
+        """
+        for text in texts:
+            split = cls._extract_quota_split(text)
+            if split:
+                return split
+        for text in texts:
+            total = cls._extract_quota_total(text)
+            if total is not None:
+                return total, 0
+        return None
 
     # 站点主动关闭邀请系统，和「你等级不够」是两回事，得分开说
     _CLOSED_RE = re.compile(
         r"邀[请請]系[统統]已[关關][闭閉]|邀[请請]功能已[关關][闭閉]|"
         r"邀[请請]已[关關][闭閉]|invites?\s+(?:are\s+)?(?:currently\s+)?closed",
         re.IGNORECASE)
-
-    @classmethod
-    def _extract_quota(cls, text: str):
-        """从页面文本里抠出 (永久, 临时) 邀请数；抠不到返回 None。"""
-        if not text:
-            return None
-        for pattern in cls._QUOTA_PATTERNS:
-            m = re.search(pattern, text)
-            if m:
-                permanent = int(m.group(1))
-                temporary = int(m.group(2)) if m.lastindex and m.group(2) else 0
-                return permanent, temporary
-        return None
 
     def _apply_authoritative_invite_status(self, site_name: str, result: Dict[str, Any],
                                            send_html: str = "", list_html: str = "") -> None:
@@ -68,8 +115,10 @@ class NexusPhpHandler(_ISiteHandler):
         send_text = re.sub(r"\s+", " ", BeautifulSoup(send_html, 'html.parser').get_text(" ")) if send_html else ""
         list_text = re.sub(r"\s+", " ", BeautifulSoup(list_html, 'html.parser').get_text(" ")) if list_html else ""
 
-        # 名额：发送页优先，其次列表页顶栏
-        quota = self._extract_quota(send_text) or self._extract_quota(list_text)
+        # 名额：两页一起送进去。发送页优先，但「能分永久/临时的写法」比
+        # 「只有一个总数的写法」优先级更高——不能让发送页一个笼统的总数，
+        # 盖掉顶栏上已经分好永久和临时的数字。
+        quota = self._extract_quota(send_text, list_text)
         if quota:
             permanent, temporary = quota
             if (permanent, temporary) != (status.get("permanent_count"), status.get("temporary_count")):
