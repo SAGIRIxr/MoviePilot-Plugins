@@ -32,7 +32,7 @@ class NodeSeekSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/SAGIRIxr/MoviePilot-Plugins/main/icons/Nodeseek_A.png"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     # 插件作者
     plugin_author = "SAGIRIxr"
     # 作者主页
@@ -399,8 +399,12 @@ class NodeSeekSignin(_PluginBase):
                 try { out.attBody = await ar.json(); } catch (e) { out.attBody = null; }
                 // 5) 收益统计（积分流水分页）
                 try {
-                    const minMs = Date.now() - statsDays * 86400 * 1000;
-                    let total = 0, cnt = 0, page = 1, stop = false;
+                    // 按北京时间自然日统计：从 (今天 - statsDays + 1) 的 0 点起算，避免跨出 statsDays+1 个日历日
+                    const DAY = 86400 * 1000, TZ = 8 * 3600 * 1000;
+                    const todayStart = Math.floor((Date.now() + TZ) / DAY) * DAY - TZ;
+                    const minMs = todayStart - (Math.max(statsDays, 1) - 1) * DAY;
+                    const signDays = new Set();
+                    let total = 0, page = 1, stop = false;
                     while (page <= 20 && !stop) {
                         const cr = await fetch('/api/account/credit/page-' + page, {credentials: 'include', headers: vh});
                         let cb = null; try { cb = await cr.json(); } catch (e) {}
@@ -409,11 +413,11 @@ class NodeSeekSignin(_PluginBase):
                             const amt = rec[0], desc = rec[2], ts = rec[3];
                             const t = new Date(ts).getTime();
                             if (t < minMs) { stop = true; continue; }
-                            if (typeof desc === 'string' && desc.indexOf('签到收益') >= 0 && desc.indexOf('鸡腿') >= 0) { total += amt; cnt++; }
+                            if (typeof desc === 'string' && desc.indexOf('签到收益') >= 0 && desc.indexOf('鸡腿') >= 0) { total += amt; signDays.add(Math.floor((t + TZ) / DAY)); }
                         }
                         page++;
                     }
-                    out.stats = {total: total, cnt: cnt};
+                    out.stats = {total: total, cnt: signDays.size};
                 } catch (e) { out.statsErr = String(e); }
                 out.phase = 'done';
                 return out;
@@ -545,7 +549,9 @@ class NodeSeekSignin(_PluginBase):
         try:
             shanghai_tz = ZoneInfo("Asia/Shanghai")
             now_shanghai = datetime.now(shanghai_tz)
-            query_start_time = now_shanghai - timedelta(days=days)
+            # 按自然日统计：从 (今天 - days + 1) 的 0 点起算，避免滚动 days*24h 跨出 days+1 个日历日
+            query_start_time = (now_shanghai.replace(hour=0, minute=0, second=0, microsecond=0)
+                                - timedelta(days=days - 1))
 
             all_records = []
             page = 1
@@ -600,7 +606,8 @@ class NodeSeekSignin(_PluginBase):
                 }, f"查询成功，但没有找到{period_desc}的签到记录"
 
             total_amount = sum(r['amount'] for r in signin_records)
-            days_count = len(signin_records)
+            # 按日期去重计天数，同一天多条签到记录只算一天
+            days_count = len({r['date'] for r in signin_records})
             average = round(total_amount / days_count, 2) if days_count > 0 else 0
             return {
                 'total_amount': total_amount, 'average': average, 'days_count': days_count,
